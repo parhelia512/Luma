@@ -18,6 +18,7 @@
 
 #include "Application/Editor.h"
 #include "Application/ProjectSettings.h"
+#include "Utils/CrashHandler.h"
 #include "Utils/Logger.h"
 #include "Utils/PathUtils.h"
 
@@ -77,7 +78,19 @@ static int EditorEntryImpl(int argc, char* argv[], const char* executablePath)
     ConfigureWorkingDirectory(executablePath);
     PathUtils::Initialize("Luma Editor");
 
-    
+    // 崩溃捕获与会话标记：先检测上一会话是否异常退出（必须在写入本次标记之前），
+    // 再安装 minidump 处理器并落下本次会话标记；正常退出时清除标记。
+    const std::filesystem::path crashDumpDir = PathUtils::GetPersistentDataDir() / "CrashDumps";
+    const std::filesystem::path sessionMarker = PathUtils::GetPersistentDataDir() / "editor_session.lock";
+    const bool lastSessionCrashed = CrashHandler::HasAbnormalExit(sessionMarker);
+    CrashHandler::Install(crashDumpDir);
+    CrashHandler::BeginSessionMarker(sessionMarker);
+    Editor::SetPreviousSessionCrashed(lastSessionCrashed);
+    if (lastSessionCrashed)
+    {
+        LogWarn("检测到上次编辑器会话异常退出，崩溃转储目录: {}", crashDumpDir.string());
+    }
+
     LogInfo("正在以编辑器模式启动...");
     ApplicationConfig config;
     config.title = "Luma Editor";
@@ -101,6 +114,8 @@ static int EditorEntryImpl(int argc, char* argv[], const char* executablePath)
         return -1;
     }
 
+    // 正常退出：清除会话标记（崩溃路径不会走到这里，标记保留给下次启动检测）
+    CrashHandler::EndSessionMarker();
     return 0;
 }
 

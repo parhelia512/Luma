@@ -151,6 +151,8 @@ void Game::Render()
     }
     if (auto activeScene = SceneManager::GetInstance().GetCurrentScene())
     {
+        // 场景数据锁：主线程系统（光照等）读写 registry，与模拟线程 tick 互斥
+        std::lock_guard<std::recursive_mutex> sceneLock(m_context.sceneDataMutex);
         activeScene->UpdateMainThread(1.f / m_context.currentFps, m_context, false);
     }
     if (!m_graphicsBackend->BeginFrame())

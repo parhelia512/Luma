@@ -17,6 +17,7 @@
 #include "Resources/AssetManager.h"
 #include "SceneManager.h"
 #include "Utils/PopupManager.h"
+#include "../Data/SceneData.h"
 #include "Resources/RuntimeAsset/RuntimeScene.h"
 #include "Resources/Managers/RuntimeMaterialManager.h"
 #include "Resources/Managers/RuntimeTextureManager.h"
@@ -287,6 +288,8 @@ void Editor::InitializeDerived()
     PreferenceSettings::GetInstance().Initialize("./LumaEditor.settings");
     m_editorContext.lastFpsUpdateTime = std::chrono::steady_clock::now();
     m_editorContext.lastUpsUpdateTime = std::chrono::steady_clock::now();
+    // 上次会话异常退出时提示从自动保存恢复（依赖项目已加载，故放在初始化末尾）
+    checkCrashRecovery();
 }
 
 void Editor::initializeEditorContext()
@@ -340,6 +343,80 @@ void Editor::registerPopups()
     {
         this->drawExitConfirmPopupContent();
     }, true, ImGuiWindowFlags_AlwaysAutoResize);
+    popupManager.Register("CrashRecovery", [this]()
+    {
+        this->drawCrashRecoveryPopupContent();
+    }, true, ImGuiWindowFlags_AlwaysAutoResize);
+}
+
+void Editor::checkCrashRecovery()
+{
+    if (!s_previousSessionCrashed) return;
+    if (!ProjectSettings::GetInstance().IsProjectLoaded()) return;
+
+    // 扫描自动保存目录，取最新一份
+    const std::filesystem::path autosaveDir =
+        ProjectSettings::GetInstance().GetProjectRoot() / "Library" / "Autosave";
+    std::error_code ec;
+    if (!std::filesystem::exists(autosaveDir, ec)) return;
+
+    std::filesystem::path latest;
+    std::filesystem::file_time_type latestTime{};
+    for (const auto& entry : std::filesystem::directory_iterator(autosaveDir, ec))
+    {
+        if (ec) break;
+        if (!entry.is_regular_file() || entry.path().extension() != ".scene") continue;
+        const auto writeTime = entry.last_write_time(ec);
+        if (ec) continue;
+        if (latest.empty() || writeTime > latestTime)
+        {
+            latest = entry.path();
+            latestTime = writeTime;
+        }
+    }
+    if (latest.empty()) return;
+
+    m_latestAutosavePath = latest;
+    PopupManager::GetInstance().Open("CrashRecovery");
+}
+
+void Editor::drawCrashRecoveryPopupContent()
+{
+    ImGui::Text("检测到上次编辑器会话异常退出。");
+    ImGui::Text("最近的自动保存：%s", m_latestAutosavePath.filename().string().c_str());
+    ImGui::TextDisabled("恢复后场景将标记为未保存，确认无误后请手动保存。");
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    if (ImGui::Button("恢复自动保存", ImVec2(130, 0)))
+    {
+        bool restored = false;
+        try
+        {
+            YAML::Node node = YAML::LoadFile(m_latestAutosavePath.string());
+            Data::SceneData sceneData = node.as<Data::SceneData>();
+            if (m_editorContext.activeScene)
+            {
+                m_editorContext.activeScene->LoadFromData(sceneData);
+                SceneManager::GetInstance().MarkCurrentSceneDirty();
+                SceneManager::GetInstance().PushUndoState(m_editorContext.activeScene);
+                restored = true;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LogError("恢复自动保存失败: {}", e.what());
+        }
+        if (restored)
+        {
+            LogInfo("已从自动保存恢复场景: {}", m_latestAutosavePath.string());
+        }
+        PopupManager::GetInstance().Close("CrashRecovery");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("忽略", ImVec2(90, 0)))
+    {
+        PopupManager::GetInstance().Close("CrashRecovery");
+    }
 }
 
 void Editor::drawExitConfirmPopupContent()
@@ -474,32 +551,36 @@ void Editor::Update(float fixedDeltaTime)
 void Editor::Render()
 {
     PROFILE_FUNCTION();
-    if (m_editorContext.activeScene)
     {
-        m_editorContext.activeScene->UpdateMainThread(1.f / m_context.currentFps, *m_editorContext.engineContext,
-                                                      m_editorContext.editorState == EditorState::Paused);
-    }
-    if (!m_graphicsBackend || !m_imguiRenderer || !m_renderSystem)
-    {
-        LogError("Editor::Render: 核心组件未初始化。");
-        return;
-    }
-    {
-        PROFILE_SCOPE("AssetManager::Update");
-        AssetManager::GetInstance().Update(1.f / m_context.currentFps);
-    }
-    {
-        PROFILE_SCOPE("UI::Update");
-        for (auto& panel : m_panels)
+        // 场景数据锁（段 A）：主线程系统与面板逻辑更新期间，与模拟线程的 tick 互斥
+        std::lock_guard<std::recursive_mutex> sceneLock(m_context.sceneDataMutex);
+        if (m_editorContext.activeScene)
         {
-            if (panel->IsVisible())
-            {
-                std::string scope = std::string("UI::Panel::Update: ") + panel->GetPanelName();
-                PROFILE_SCOPE(scope.c_str());
-                panel->Update(1.f / m_context.currentFps);
-            }
+            m_editorContext.activeScene->UpdateMainThread(1.f / m_context.currentFps, *m_editorContext.engineContext,
+                                                          m_editorContext.editorState == EditorState::Paused);
         }
-        PluginManager::GetInstance().UpdateEditorPlugins(1.f / m_context.currentFps);
+        if (!m_graphicsBackend || !m_imguiRenderer || !m_renderSystem)
+        {
+            LogError("Editor::Render: 核心组件未初始化。");
+            return;
+        }
+        {
+            PROFILE_SCOPE("AssetManager::Update");
+            AssetManager::GetInstance().Update(1.f / m_context.currentFps);
+        }
+        {
+            PROFILE_SCOPE("UI::Update");
+            for (auto& panel : m_panels)
+            {
+                if (panel->IsVisible())
+                {
+                    std::string scope = std::string("UI::Panel::Update: ") + panel->GetPanelName();
+                    PROFILE_SCOPE(scope.c_str());
+                    panel->Update(1.f / m_context.currentFps);
+                }
+            }
+            PluginManager::GetInstance().UpdateEditorPlugins(1.f / m_context.currentFps);
+        }
     }
     RenderableManager::GetInstance().SetExternalAlpha(m_context.interpolationAlpha.load(std::memory_order_relaxed));
     // 直接引用 RenderableManager 的双缓冲结果，同帧内由各面板只读消费，不再整帧深拷贝
@@ -516,28 +597,33 @@ void Editor::Render()
                                  ImGuiDockNodeFlags_PassthruCentralNode);
     Profiler::GetInstance().DrawUI();
     {
-        PROFILE_SCOPE("UI::DrawPanels");
-        for (auto& panel : m_panels)
+        // 场景数据锁（段 B）：面板绘制直接读写 registry（检查器编辑、层级操作、gizmo 拾取），
+        // 弹窗（退出确认里的保存）与撤销快照序列化同样访问场景数据
+        std::lock_guard<std::recursive_mutex> sceneLock(m_context.sceneDataMutex);
         {
-            if (panel->IsVisible())
+            PROFILE_SCOPE("UI::DrawPanels");
+            for (auto& panel : m_panels)
             {
-                std::string scope = std::string("UI::Panel::Draw: ") + panel->GetPanelName();
-                PROFILE_SCOPE(scope.c_str());
-                panel->Draw();
+                if (panel->IsVisible())
+                {
+                    std::string scope = std::string("UI::Panel::Draw: ") + panel->GetPanelName();
+                    PROFILE_SCOPE(scope.c_str());
+                    panel->Draw();
+                }
+            }
+            PluginManager::GetInstance().DrawEditorPluginPanels();
+        }
+        // 连续编辑结束（控件释放）时提交一次撤销快照，配合 onValueChanged 的合并逻辑
+        if (m_undoEditActive && !ImGui::IsAnyItemActive())
+        {
+            m_undoEditActive = false;
+            if (m_editorContext.activeScene)
+            {
+                SceneManager::GetInstance().PushUndoState(m_editorContext.activeScene);
             }
         }
-        PluginManager::GetInstance().DrawEditorPluginPanels();
+        PopupManager::GetInstance().Render();
     }
-    // 连续编辑结束（控件释放）时提交一次撤销快照，配合 onValueChanged 的合并逻辑
-    if (m_undoEditActive && !ImGui::IsAnyItemActive())
-    {
-        m_undoEditActive = false;
-        if (m_editorContext.activeScene)
-        {
-            SceneManager::GetInstance().PushUndoState(m_editorContext.activeScene);
-        }
-    }
-    PopupManager::GetInstance().Render();
     m_imguiRenderer->EndFrame(*m_graphicsBackend);
     {
         PROFILE_SCOPE("GraphicsBackend::PresentFrame");

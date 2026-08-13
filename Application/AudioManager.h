@@ -2,12 +2,16 @@
 #define AUDIOMANAGER_H
 #include <SDL3/SDL.h>
 #include <atomic>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include "../Utils/LazySingleton.h"
 #include "../Utils/Guid.h"
 #include "../Resources/RuntimeAsset/RuntimeAudio.h"
+#include "AudioStreaming.h"
 class AudioManager : public LazySingleton<AudioManager>
 {
 public:
@@ -54,6 +58,7 @@ public:
     }
 private:
     AudioManager() = default;
+    ~AudioManager() override;
     struct Voice
     {
         uint32_t id = 0;             
@@ -68,9 +73,12 @@ private:
         float rolloffFactor = 1.0f;
         int rolloffMode = 0;
         bool finished = false;       
+        std::shared_ptr<AudioStreamingVoice> stream; ///< 流式播放状态（全量 PCM voice 为空）。
     };
     static void SDLAudioCallback(void* userdata, SDL_AudioStream* stream, int additional_amount, int total_amount);
     void GetListener(float& lx, float& ly, float& lz, float& rx, float& ry, float& rz) const;
+    void DecodeThreadMain();
+    void StopDecodeThread();
 private:
     SDL_AudioDeviceID deviceId = 0; 
     int m_sampleRate = 48000;       
@@ -81,8 +89,15 @@ private:
     float masterVolume = 1.0f;      
     SDL_AudioStream* m_audioStream = nullptr; 
     std::vector<float> m_mixBuffer; ///< 回调线程复用的混音缓冲，避免实时线程内反复堆分配。
+    std::vector<float> m_streamReadBuffer;    ///< 回调线程复用：流式 voice 从环形缓冲读出的暂存区。
+    std::vector<uint32_t> m_finishedScratch;  ///< 回调线程复用：单次 Mix 中待移除 voice 的 id 列表。
     std::atomic<float> m_listenerX{0.0f};   ///< 监听者位置 X（由模拟线程更新）。
     std::atomic<float> m_listenerY{0.0f};   ///< 监听者位置 Y（由模拟线程更新）。
     std::atomic<float> m_listenerRot{0.0f}; ///< 监听者朝向（弧度，由模拟线程更新）。
+    std::thread m_decodeThread;               ///< 后台流式解码线程（AudioManager 独占持有）。
+    std::atomic<bool> m_decodeRunning{false}; ///< 解码线程运行标志（false 后线程尽快退出）。
+    std::mutex m_streamMutex;                 ///< 保护 m_streamingVoices 注册表（仅短暂持有）。
+    std::condition_variable m_streamCv;       ///< 唤醒解码线程（新 voice 加入或请求退出）。
+    std::vector<std::shared_ptr<AudioStreamingVoice>> m_streamingVoices; ///< 解码线程服务的流式 voice 注册表。
 };
 #endif

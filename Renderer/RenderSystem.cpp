@@ -18,6 +18,7 @@
 #include "include/core/SkFontMetrics.h"
 #include "Renderer/RenderComponent.h"
 #include <functional>
+#include <unordered_set>
 #include <SIMDWrapper.h>
 
 #include "Profiler.h"
@@ -85,6 +86,11 @@ public:
     };
 
     std::vector<QueuedBatch> orderedBatches;
+
+    /// @brief 当前是否处于连续 WGPU 批次段的批量提交作用域内（仅在 Flush 期间有效）。
+    bool wgpuBatchScopeActive = false;
+    /// @brief 批量作用域内自上次冲刷后已录制过渲染通道的管线集合，用于检测保留缓冲区覆写冲突。
+    std::unordered_set<const Nut::RenderPipeline*> wgpuScopePipelines;
 
     std::vector<SkPoint> positions;
     std::vector<SkPoint> texCoords;
@@ -398,33 +404,77 @@ void RenderSystem::Flush()
     SetupCanvasState(canvas);
     ApplyCamera(canvas, CameraManager::GetInstance().GetActiveCameraId());
 
+    // Skia（Graphite-on-Dawn）与 WGPU 批次共用同一 Dawn 队列，交错提交存在顺序依赖，
+    // 因此只在连续的 WGPU 批次段内合并 encoder 与 Submit：
+    // 进段时先冲刷 Skia 侧命令，出段时一次性提交本段全部 WGPU 命令，保持原有先后语义。
+    auto nutContext = pImpl->backend.GetNutContext();
+    bool inWgpuSegment = false;
+
+    // 进入连续 WGPU 批次段：结束 Skia 画布状态并冲刷 Skia 命令，再开启批量提交作用域
+    auto beginWgpuSegment = [&]()
+    {
+        canvas->restore();
+        if (hasClip) canvas->restore();
+
+        pImpl->backend.Submit();
+
+        surface.reset();
+        canvas = nullptr;
+
+        if (nutContext)
+        {
+            nutContext->BeginBatchedSubmission();
+        }
+        pImpl->wgpuBatchScopeActive = true;
+        pImpl->wgpuScopePipelines.clear();
+    };
+
+    // 结束连续 WGPU 批次段：一次性提交作用域内命令，并恢复 Skia 画布与相机状态
+    auto endWgpuSegment = [&]() -> bool
+    {
+        if (nutContext)
+        {
+            nutContext->EndBatchedSubmission();
+        }
+        pImpl->wgpuBatchScopeActive = false;
+        pImpl->wgpuScopePipelines.clear();
+
+        surface = pImpl->backend.GetSurface();
+        if (!surface)
+        {
+            LogError("Flush: 重建 Surface 失败");
+            return false;
+        }
+        canvas = surface->getCanvas();
+
+        SetupCanvasState(canvas);
+        ApplyCamera(canvas, currentCameraId);
+        return true;
+    };
+
     for (const auto& entry : pImpl->orderedBatches)
     {
         if (entry.type == RenderSystemImpl::BatchType::WGPUSprite)
         {
-            canvas->restore();
-            if (hasClip) canvas->restore();
-
-            pImpl->backend.Submit();
-
-            surface.reset();
-            canvas = nullptr;
-
-            pImpl->DrawWGPUSpriteBatch(pImpl->wgpuSpriteBatches[entry.index], pImpl->backend.GetNutContext());
-
-            surface = pImpl->backend.GetSurface();
-            if (!surface)
+            if (!inWgpuSegment)
             {
-                LogError("Flush: 重建 Surface 失败");
-                break;
+                beginWgpuSegment();
+                inWgpuSegment = true;
             }
-            canvas = surface->getCanvas();
 
-            SetupCanvasState(canvas);
-            ApplyCamera(canvas, currentCameraId);
+            pImpl->DrawWGPUSpriteBatch(pImpl->wgpuSpriteBatches[entry.index], nutContext);
         }
         else
         {
+            if (inWgpuSegment)
+            {
+                inWgpuSegment = false;
+                if (!endWgpuSegment())
+                {
+                    break;
+                }
+            }
+
             // 根据批次的渲染空间切换相机
             SwitchCamera(entry.renderSpace, entry.cameraId);
 
@@ -459,10 +509,16 @@ void RenderSystem::Flush()
         }
     }
 
-    pImpl->DrawAllCursorBatches(canvas);
+    // 末尾若仍处于 WGPU 段内，先提交本段命令并恢复画布（失败时 canvas 为空，跳过后续绘制）
+    if (inWgpuSegment)
+    {
+        endWgpuSegment();
+    }
 
     if (canvas)
     {
+        pImpl->DrawAllCursorBatches(canvas);
+
         canvas->restore();
         if (hasClip)
         {
@@ -1235,9 +1291,33 @@ void RenderSystem::RenderSystemImpl::DrawWGPUSpriteBatch(const WGPUSpriteBatch& 
         return;
     }
 
-    Nut::Sampler sampler;
-    Nut::FilterMode filter = (batch.filterQuality == 0) ? Nut::FilterMode::Nearest : Nut::FilterMode::Linear;
-    sampler.SetMagFilter(filter).SetMinFilter(filter).Build(nutContext);
+    // 采样器只有 Nearest/Linear 两种，首次创建后复用，避免每批次重建
+    static Nut::Sampler s_nearestSampler;
+    static Nut::Sampler s_linearSampler;
+    static std::once_flag samplerInit;
+    std::call_once(samplerInit, [&nutContext]()
+    {
+        s_nearestSampler.SetMagFilter(Nut::FilterMode::Nearest)
+                        .SetMinFilter(Nut::FilterMode::Nearest)
+                        .Build(nutContext);
+        s_linearSampler.SetMagFilter(Nut::FilterMode::Linear)
+                       .SetMinFilter(Nut::FilterMode::Linear)
+                       .Build(nutContext);
+    });
+    Nut::Sampler& sampler = (batch.filterQuality == 0) ? s_nearestSampler : s_linearSampler;
+
+    // 批量提交作用域内，同一管线再次录制前必须冲刷已挂起的渲染通道：
+    // 下面的 SetReservedBuffers/材质 uniform 更新会用 queue.WriteBuffer 覆写该管线的
+    // 保留缓冲区，若不先提交，先前已录制但未提交的通道会读到本批次的新数据。
+    if (wgpuBatchScopeActive)
+    {
+        if (!wgpuScopePipelines.insert(pipeline).second)
+        {
+            nutContext->FlushBatchedSubmission();
+            wgpuScopePipelines.clear();
+            wgpuScopePipelines.insert(pipeline);
+        }
+    }
 
     pipeline->SetReservedBuffers(engineData, instanceDatas, nutContext);
     if (!pipeline->SwapTexture(batch.image, &sampler, nutContext))

@@ -1,4 +1,5 @@
 #include "SIMDWrapper.h"
+#include <algorithm>
 #include <array>
 #include <cfloat>
 #include <cmath>
@@ -727,6 +728,12 @@ public:
 };
 #endif
 
+namespace
+{
+    /// @brief 小数组快速路径阈值：元素数不超过该值时直接走标量循环，省去虚函数调用开销。
+    constexpr size_t kSmallCountFastPath = 8;
+}
+
 SIMD::SIMD()
 {
 #if defined(LUMA_X64)
@@ -763,61 +770,131 @@ SIMD::SIMD()
 
 void SIMD::VectorAdd(const float* a, const float* b, float* result, size_t count)
 {
-    if (impl) impl->VectorAdd(a, b, result, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i) result[i] = a[i] + b[i];
+        return;
+    }
+    impl->VectorAdd(a, b, result, count);
 }
 
 void SIMD::VectorMultiply(const float* a, const float* b, float* result, size_t count)
 {
-    if (impl) impl->VectorMultiply(a, b, result, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i) result[i] = a[i] * b[i];
+        return;
+    }
+    impl->VectorMultiply(a, b, result, count);
 }
 
 void SIMD::VectorScalarMultiply(const float* a, float b, float* result, size_t count)
 {
-    if (impl) impl->VectorScalarMultiply(a, b, result, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i) result[i] = a[i] * b;
+        return;
+    }
+    impl->VectorScalarMultiply(a, b, result, count);
 }
 
 void SIMD::VectorMultiplyAdd(const float* a, const float* b, const float* c, float* result, size_t count)
 {
-    if (impl) impl->VectorMultiplyAdd(a, b, c, result, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i) result[i] = a[i] * b[i] + c[i];
+        return;
+    }
+    impl->VectorMultiplyAdd(a, b, c, result, count);
 }
 
 void SIMD::VectorRotatePoints(const float* points_x, const float* points_y, const float* sin_vals,
                               const float* cos_vals, float* result_x, float* result_y, size_t count)
 {
-    if (impl) impl->VectorRotatePoints(points_x, points_y, sin_vals, cos_vals, result_x, result_y, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            result_x[i] = points_x[i] * cos_vals[i] - points_y[i] * sin_vals[i];
+            result_y[i] = points_x[i] * sin_vals[i] + points_y[i] * cos_vals[i];
+        }
+        return;
+    }
+    impl->VectorRotatePoints(points_x, points_y, sin_vals, cos_vals, result_x, result_y, count);
 }
 
 float SIMD::VectorDotProduct(const float* a, const float* b, size_t count)
 {
-    if (count > 0 && impl) return impl->VectorDotProduct(a, b, count);
-    return 0.0f;
+    if (count == 0 || !impl) return 0.0f;
+    if (count <= kSmallCountFastPath)
+    {
+        float sum = 0.0f;
+        for (size_t i = 0; i < count; ++i) sum += a[i] * b[i];
+        return sum;
+    }
+    return impl->VectorDotProduct(a, b, count);
 }
 
 void SIMD::VectorSqrt(const float* input, float* result, size_t count)
 {
-    if (impl) impl->VectorSqrt(input, result, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i) result[i] = sqrtf(input[i]);
+        return;
+    }
+    impl->VectorSqrt(input, result, count);
 }
 
 void SIMD::VectorReciprocal(const float* input, float* result, size_t count)
 {
-    if (impl) impl->VectorReciprocal(input, result, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i) result[i] = 1.0f / input[i];
+        return;
+    }
+    impl->VectorReciprocal(input, result, count);
 }
 
 float SIMD::VectorMax(const float* input, size_t count)
 {
-    if (count > 0 && impl) return impl->VectorMax(input, count);
-    return -FLT_MAX;
+    if (count == 0 || !impl) return -FLT_MAX;
+    if (count <= kSmallCountFastPath)
+    {
+        float result = input[0];
+        for (size_t i = 1; i < count; ++i) result = std::max(result, input[i]);
+        return result;
+    }
+    return impl->VectorMax(input, count);
 }
 
 float SIMD::VectorMin(const float* input, size_t count)
 {
-    if (count > 0 && impl) return impl->VectorMin(input, count);
-    return FLT_MAX;
+    if (count == 0 || !impl) return FLT_MAX;
+    if (count <= kSmallCountFastPath)
+    {
+        float result = input[0];
+        for (size_t i = 1; i < count; ++i) result = std::min(result, input[i]);
+        return result;
+    }
+    return impl->VectorMin(input, count);
 }
 
 void SIMD::VectorAbs(const float* input, float* result, size_t count)
 {
-    if (impl) impl->VectorAbs(input, result, count);
+    if (!impl) return;
+    if (count <= kSmallCountFastPath)
+    {
+        for (size_t i = 0; i < count; ++i) result[i] = fabsf(input[i]);
+        return;
+    }
+    impl->VectorAbs(input, result, count);
 }
 
 const char* SIMD::GetSupportedInstructions() const

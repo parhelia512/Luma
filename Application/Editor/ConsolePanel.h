@@ -48,6 +48,26 @@ private:
     const char* getLogLevelIcon(LogLevel level) const;
     const char* getLogLevelText(LogLevel level) const;
     std::string formatTimestamp(const std::chrono::steady_clock::time_point& timestamp) const;
+
+    /**
+     * @brief 尝试从日志消息中解析可跳转的源码位置。
+     *        识别 MSVC/dotnet 诊断格式：文件路径(行[,列]): error|warning ...，
+     *        路径可包含空格与中文；仅对扩展名为 .cs 的路径启用跳转。
+     * @param message 日志消息文本（UTF-8）
+     * @param outFile 解析出的 .cs 文件路径（UTF-8）
+     * @param outLine 解析出的行号（从 1 开始）
+     * @return 消息中含有可跳转位置时返回 true
+     */
+    static bool tryParseJumpTarget(const std::string& message, std::string& outFile, int& outLine);
+
+    /**
+     * @brief 在用户偏好的 IDE 中打开指定文件并定位到行。
+     *        IDE 选择顺序：PreferenceSettings 偏好 -> 自动检测；
+     *        解决方案为项目根目录下的 LumaScripting.sln。
+     * @param filePath 目标文件路径（UTF-8；相对路径按项目根目录解析）
+     * @param line 目标行号（从 1 开始）
+     */
+    static void openInIDE(const std::string& filePath, int line);
     void scrollToBottom();
     void updateLogCounts();
     bool canCollapseWith(const LogEntry& entry1, const LogEntry& entry2) const;

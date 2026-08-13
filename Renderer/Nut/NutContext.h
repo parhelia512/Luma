@@ -120,6 +120,14 @@ namespace Nut
         std::mutex m_cmutex;
         inline static ShaderLoader* m_shaderLoader = nullptr;
 
+        /// @brief 是否处于批量提交作用域内（由 BeginBatchedSubmission/EndBatchedSubmission 控制）。
+        bool m_batchedSubmissionActive = false;
+        /// @brief 批量提交作用域内共享的命令编码器（懒创建，冲刷后置空等待重建）。
+        wgpu::CommandEncoder m_batchedCommandEncoder = nullptr;
+
+        /// @brief 冲刷批量作用域内已录制的命令：Finish 共享编码器并立即提交。调用前必须持有 m_mutex。
+        void flushBatchedLocked();
+
         // Surface reconfigure rate limiting
         std::chrono::steady_clock::time_point m_lastReconfigureTime{};
         static constexpr std::chrono::milliseconds kReconfigureCooldown{100};
@@ -164,6 +172,31 @@ namespace Nut
         wgpu::CommandBuffer EndRenderFrame(RenderPass& renderPass);
 
         void Submit(const std::vector<wgpu::CommandBuffer>& cmds);
+
+        /**
+         * @brief 开启批量提交作用域。
+         *
+         * 作用域内 BeginRenderFrame() 复用同一个命令编码器（WebGPU 允许一个编码器顺序录制多个
+         * 渲染通道），EndRenderFrame() 只结束渲染通道而不 Finish 编码器，Submit() 收到的空命令
+         * 缓冲被忽略；所有命令在 FlushBatchedSubmission()/EndBatchedSubmission() 时一次性提交。
+         * 作用域外各接口行为与原先完全一致。
+         * @note 该作用域为渲染线程内的局部概念，不支持跨线程共享录制。
+         */
+        void BeginBatchedSubmission();
+
+        /**
+         * @brief 冲刷批量作用域内已录制的命令（Finish 共享编码器并提交），作用域保持开启。
+         *
+         * 用于作用域内的写冲突消解：当接下来要通过 queue.WriteBuffer 覆写某个已被挂起
+         * 渲染通道读取的缓冲区时，先调用本函数保证先前通道按旧数据执行。
+         */
+        void FlushBatchedSubmission();
+
+        /**
+         * @brief 结束批量提交作用域：冲刷剩余命令并关闭作用域。作用域未开启时为空操作。
+         */
+        void EndBatchedSubmission();
+
         void Present();
 
         ComputePassBuilder BeginComputeFrame();

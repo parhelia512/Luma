@@ -2,10 +2,11 @@
 #define LUMAEVENT_H
 
 #include <functional>
+#include <memory>
 #include <vector>
 #include <cstdint>
-#include <map>
 #include <mutex>
+#include <utility>
 
 /**
  * @brief 监听器句柄，用于唯一标识一个事件监听器。
@@ -24,8 +25,10 @@ struct ListenerHandle
 /**
  * @brief 一个通用的事件分发器，支持添加、移除和触发监听器。
  *
- * 线程安全：内部使用互斥锁保护监听器表；Invoke 时先在锁内拷贝监听器快照，
- * 再在锁外调用，允许监听器在回调中安全地增删监听器（对本次分发不生效）。
+ * 线程安全（写时复制）：监听器表以 `shared_ptr<const vector>` 不可变快照存储，
+ * 增删监听器时在锁内复制新表原子替换；Invoke 只在锁内取一次快照引用（无表拷贝、
+ * 无堆分配），随后在锁外调用，允许回调中安全地增删监听器（对本次分发不生效）。
+ * 高频路径（每帧多次 Invoke）零分配。
  *
  * @tparam Args 事件参数的类型列表。
  */
@@ -36,6 +39,13 @@ public:
     /// 事件监听器的函数类型。
     using Listener = std::function<void(Args...)>;
 
+private:
+    /// 监听器表条目：ID + 回调。
+    using ListenerEntry = std::pair<uint64_t, Listener>;
+    /// 不可变监听器表快照类型。
+    using ListenerList = std::vector<ListenerEntry>;
+
+public:
     LumaEvent() = default;
 
     LumaEvent(const LumaEvent& other)
@@ -80,7 +90,11 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         uint64_t id = m_nextListenerId++;
-        m_listeners[id] = std::move(listener);
+        auto newList = m_listeners
+                           ? std::make_shared<ListenerList>(*m_listeners)
+                           : std::make_shared<ListenerList>();
+        newList->emplace_back(id, std::move(listener));
+        m_listeners = std::move(newList);
         return ListenerHandle{id};
     }
 
@@ -91,37 +105,57 @@ public:
      */
     bool RemoveListener(ListenerHandle handle)
     {
-        if (handle.IsValid())
+        if (!handle.IsValid())
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            return m_listeners.erase(handle.id) > 0;
+            return false;
         }
-        return false;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_listeners)
+        {
+            return false;
+        }
+        auto newList = std::make_shared<ListenerList>();
+        newList->reserve(m_listeners->size());
+        bool removed = false;
+        for (const auto& entry : *m_listeners)
+        {
+            if (entry.first == handle.id)
+            {
+                removed = true;
+                continue;
+            }
+            newList->push_back(entry);
+        }
+        if (removed)
+        {
+            m_listeners = std::move(newList);
+        }
+        return removed;
     }
 
     /**
      * @brief 触发所有已注册的监听器。
      *
-     * 先拷贝监听器快照再在锁外调用，避免回调中增删监听器或跨线程分发导致的数据竞争。
+     * 仅在锁内取一次不可变快照引用（零拷贝零分配），锁外依序调用。
      * @param args 传递给监听器函数的参数。
      */
     void Invoke(Args... args) const
     {
-        std::vector<Listener> snapshot;
+        std::shared_ptr<const ListenerList> snapshot;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            snapshot.reserve(m_listeners.size());
-            for (const auto& pair : m_listeners)
-            {
-                if (pair.second)
-                {
-                    snapshot.push_back(pair.second);
-                }
-            }
+            snapshot = m_listeners;
         }
-        for (const auto& listener : snapshot)
+        if (!snapshot)
         {
-            listener(args...);
+            return;
+        }
+        for (const auto& entry : *snapshot)
+        {
+            if (entry.second)
+            {
+                entry.second(args...);
+            }
         }
     }
 
@@ -140,7 +174,7 @@ public:
     void Clear()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_listeners.clear();
+        m_listeners.reset();
     }
 
     /**
@@ -150,7 +184,7 @@ public:
     bool IsEmpty() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return m_listeners.empty();
+        return !m_listeners || m_listeners->empty();
     }
 
     /**
@@ -204,8 +238,8 @@ public:
     }
 
 private:
-    mutable std::mutex m_mutex; ///< 保护监听器表的互斥锁。
-    std::map<uint64_t, Listener> m_listeners; ///< 存储所有监听器的映射，键为监听器ID，值为监听器函数。
+    mutable std::mutex m_mutex; ///< 保护快照指针与ID计数器的互斥锁。
+    std::shared_ptr<const ListenerList> m_listeners; ///< 不可变监听器表快照（写时复制）。
     uint64_t m_nextListenerId = 1; ///< 下一个可用的监听器ID。
 };
 

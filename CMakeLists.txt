@@ -340,6 +340,11 @@ target_compile_definitions(LumaEngine PUBLIC
 # 链接第三方库
 target_link_libraries(LumaEngine PUBLIC Luma3rd)
 
+# Windows 平台链接 DbgHelp，供 Utils/CrashHandler.cpp 写出崩溃 minidump 使用
+if (WIN32)
+    target_link_libraries(LumaEngine PRIVATE Dbghelp)
+endif ()
+
 # 应用 SIMD 编译选项
 if (LUMA_SIMD_COMPILE_OPTIONS)
     target_compile_options(LumaEngine PRIVATE ${LUMA_SIMD_COMPILE_OPTIONS})

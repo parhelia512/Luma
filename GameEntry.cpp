@@ -14,6 +14,7 @@
 
 #include "Application/Game.h"
 #include "Application/ProjectSettings.h"
+#include "Utils/CrashHandler.h"
 #include "Utils/Logger.h"
 #include "Utils/PathUtils.h"
 
@@ -68,6 +69,10 @@ static int GameEntryImpl(int argc, char* argv[], const char* executablePath)
     auto& settings = ProjectSettings::GetInstance();
     PathUtils::Initialize(settings.GetAppName());
 
+    // 崩溃捕获与会话标记（运行时无恢复 UI，仅写 minidump 供玩家上报）
+    CrashHandler::Install(PathUtils::GetPersistentDataDir() / "CrashDumps");
+    CrashHandler::BeginSessionMarker(PathUtils::GetPersistentDataDir() / "game_session.lock");
+
 #if defined(_WIN32) || defined(_WIN64)
     if (!settings.IsConsoleEnabled())
     {
@@ -97,6 +102,8 @@ static int GameEntryImpl(int argc, char* argv[], const char* executablePath)
         return -1;
     }
 
+    // 正常退出：清除会话标记
+    CrashHandler::EndSessionMarker();
     return 0;
 }
 

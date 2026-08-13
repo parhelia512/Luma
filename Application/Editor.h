@@ -32,6 +32,13 @@ public:
     IEditorPanel* GetPanelByName(const std::string& name);
     PlatformWindow* GetPlatWindow();
     EditorContext& GetEditorContext() { return m_editorContext; }
+
+    /**
+     * @brief 由入口在启动早期设置：上一编辑器会话是否异常退出（崩溃/强杀）。
+     *
+     * 必须在写入本次会话标记之前检测并注入，编辑器初始化完成后据此弹出自动保存恢复提示。
+     */
+    static void SetPreviousSessionCrashed(bool crashed) { s_previousSessionCrashed = crashed; }
 protected:
     void InitializeDerived() override;
     void Update(float deltaTime) override;
@@ -45,6 +52,8 @@ private:
     void drawAddComponentPopupContent(); 
     void drawFileConflictPopupContent(); 
     void drawExitConfirmPopupContent();
+    void drawCrashRecoveryPopupContent();
+    void checkCrashRecovery();
     void updateUps(); 
     void updateFps();
 private:
@@ -57,6 +66,8 @@ private:
     bool m_undoEditActive = false; ///< 连续编辑（拖拽/输入）进行中，撤销快照推迟到编辑结束提交。
     float m_autosaveTimer = 0.0f; ///< 自动保存计时器（秒）。
     ListenerHandle m_closeRequestListener; ///< 窗口关闭请求监听（未保存确认）。
+    std::filesystem::path m_latestAutosavePath; ///< 崩溃恢复提示中展示的最新自动保存文件。
+    inline static bool s_previousSessionCrashed = false; ///< 上一会话是否异常退出（入口注入）。
     inline static Editor* s_instance; 
 };
 #endif

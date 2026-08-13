@@ -81,9 +81,14 @@ void ApplicationBase::simulationLoop()
     auto nextFrameTime = std::chrono::high_resolution_clock::now();
     while (m_isRunning)
     {
-        m_context.commandsForSim.Execute();
-        Update(static_cast<float>(fixedDeltaTime.count()));
-        m_context.eventsForSim.clear();
+        {
+            // 整个模拟 tick（含命令队列执行）持有场景数据锁：
+            // 与主线程的主线程系统更新/编辑器面板访问 registry 互斥（entt 非线程安全）
+            std::lock_guard<std::recursive_mutex> sceneLock(m_context.sceneDataMutex);
+            m_context.commandsForSim.Execute();
+            Update(static_cast<float>(fixedDeltaTime.count()));
+            m_context.eventsForSim.clear();
+        }
         nextFrameTime += std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(fixedDeltaTime);
         std::this_thread::sleep_until(nextFrameTime);
     }

@@ -115,9 +115,11 @@ namespace Nut
         return *this;
     }
 
-    Sampler& Sampler::SetMinFilter(wgpu::FilterMode mag)
+    Sampler& Sampler::SetMinFilter(wgpu::FilterMode min)
     {
-        m_descriptor.magFilter = mag;
+        // 修复笔误：此前误写为 magFilter，导致 minFilter 恒为默认值（Nearest），
+        // 线性采样的纹理在缩小时得不到平滑过滤
+        m_descriptor.minFilter = min;
         m_isBuild = false;
         return *this;
     }
@@ -452,11 +454,10 @@ namespace Nut
 
     size_t Pipeline::ComputeBindGroupKey(size_t groupIdx, const BindGroup& group) const
     {
-        if (groupIdx != 0)
-        {
-            return 0;
-        }
-
+        // 对所有组统一按资源句柄组合计算键：
+        // 组 0 覆盖主纹理 + 采样器 + 保留缓冲区，组 1/2/3 覆盖光照/阴影/间接光等共享缓冲区。
+        // 缓存的 wgpu::BindGroup 内部持有资源引用，底层对象存活期间地址不会被复用，
+        // 因此资源重建（指针变化）会自然产生新键，旧缓存项残留但不会被错误命中。
         const auto& entries = group.GetEntries();
         if (entries.empty())
         {
@@ -470,6 +471,9 @@ namespace Nut
             hash ^= v + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
         };
 
+        // 混入组索引与绑定位置，避免不同组/不同绑定点的相同资源组合发生键碰撞
+        mix(groupIdx + 1);
+
         bool hasResource = false;
         for (const auto& e : entries)
         {
@@ -477,6 +481,7 @@ namespace Nut
             {
                 hasResource = true;
             }
+            mix(static_cast<size_t>(e.binding));
             mix(reinterpret_cast<size_t>(e.buffer.Get()));
             mix(reinterpret_cast<size_t>(e.textureView.Get()));
             mix(reinterpret_cast<size_t>(e.sampler.Get()));

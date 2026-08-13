@@ -309,7 +309,7 @@ namespace Nut
 
         Sampler& SetMagFilter(wgpu::FilterMode mag);
 
-        Sampler& SetMinFilter(wgpu::FilterMode mag);
+        Sampler& SetMinFilter(wgpu::FilterMode min);
 
         Sampler& SetMipmapFilter(MipmapFilterMode mode);
 
@@ -330,7 +330,7 @@ namespace Nut
         std::vector<std::string> m_shaderBindings;
         std::unordered_map<size_t, std::vector<std::string>> m_groupAttributes;
         std::unordered_map<size_t, BindGroup> m_groups;
-        std::unordered_map<size_t, wgpu::BindGroup> m_bindGroupCache; // 缓存特定绑定组合（主要用于组0的主纹理+采样器）
+        std::unordered_map<size_t, wgpu::BindGroup> m_bindGroupCache; // 缓存绑定组合（组0的主纹理+采样器，以及组1/2/3的光照等共享缓冲区）
         ShaderModule m_shaderModule;
         std::shared_ptr<Buffer> m_reservedFrameBuffer;
         std::shared_ptr<Buffer> m_reservedInstanceBuffer;

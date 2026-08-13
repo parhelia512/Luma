@@ -57,6 +57,50 @@ bool IDEIntegration::Open(IDE ide, const std::filesystem::path& solutionPath, co
 #endif
 }
 
+bool IDEIntegration::OpenAt(IDE ide, const std::filesystem::path& solutionPath, const std::filesystem::path& filePath,
+                            int line)
+{
+    if (line <= 0)
+    {
+        return Open(ide, solutionPath, filePath);
+    }
+
+#ifdef _WIN32
+    std::wstring idePath;
+    std::wstring args;
+
+    switch (ide)
+    {
+    case IDE::Rider:
+        idePath = L"Rider.cmd";
+        args = L"\"" + solutionPath.wstring() + L"\" --line " + std::to_wstring(line) +
+            L" \"" + filePath.wstring() + L"\"";
+        break;
+
+    case IDE::VisualStudio:
+        // devenv 的 /edit 命令行不支持指定行号，退化为仅打开文件
+        return Open(ide, solutionPath, filePath);
+
+    case IDE::VSCode:
+        idePath = L"code.exe";
+        args = L"--goto \"" + filePath.wstring() + L":" + std::to_wstring(line) + L"\" \"" +
+            solutionPath.parent_path().wstring() + L"\"";
+        break;
+
+    default:
+        LogError("Unsupported or unknown IDE specified.");
+        return false;
+    }
+
+    LogInfo("Opening IDE: {} with args: {}", idePath, args);
+    ShellExecuteW(NULL, L"open", idePath.c_str(), args.c_str(), NULL, SW_SHOWNORMAL);
+    return true;
+#else
+    LogWarn("Opening scripts in an IDE is not yet implemented on this platform.");
+    return false;
+#endif
+}
+
 #ifdef _WIN32
 std::wstring IDEIntegration::GetPathFromRegistry(const std::wstring& keyPath, const std::wstring& valueName)
 {

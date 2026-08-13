@@ -36,6 +36,19 @@ public:
      */
     static bool Open(IDE ide, const std::filesystem::path& solutionPath, const std::filesystem::path& filePath);
 
+    /**
+     * @brief 在指定 IDE 中打开解决方案和文件，并定位到指定行。
+     *        Rider 使用 --line N 参数；VSCode 使用 --goto 文件:行；
+     *        Visual Studio 的 devenv /edit 不支持行号，退化为仅打开文件。
+     * @param ide 目标 IDE 类型
+     * @param solutionPath 解决方案路径
+     * @param filePath 要打开的文件路径
+     * @param line 目标行号（从 1 开始；小于等于 0 时退化为 Open 行为）
+     * @return 打开成功返回 true，否则返回 false
+     */
+    static bool OpenAt(IDE ide, const std::filesystem::path& solutionPath, const std::filesystem::path& filePath,
+                       int line);
+
 private:
 #ifdef _WIN32
 

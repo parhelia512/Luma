@@ -499,21 +499,115 @@ namespace Nut
 
     wgpu::CommandBuffer NutContext::EndRenderFrame(RenderPass& renderPass)
     {
+        if (m_batchedSubmissionActive)
+        {
+            // 批量作用域内：只结束渲染通道，不 Finish 共享编码器，
+            // 命令保留在编码器中等待统一提交；返回空命令缓冲供 Submit() 忽略。
+            renderPass.Get().End();
+            return nullptr;
+        }
         return renderPass.End();
     }
 
     void NutContext::Submit(const std::vector<wgpu::CommandBuffer>& cmds)
 
     {
+        if (m_batchedSubmissionActive)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+
+            // 批量作用域内：EndRenderFrame 返回的空命令缓冲直接忽略（命令仍在共享编码器中）。
+            bool hasRealCommand = false;
+            for (const auto& cmd : cmds)
+            {
+                if (cmd)
+                {
+                    hasRealCommand = true;
+                    break;
+                }
+            }
+            if (!hasRealCommand)
+            {
+                return;
+            }
+
+            // 收到真实命令缓冲（非共享编码器路径）：先冲刷共享编码器再按原顺序提交，
+            // 保证队列提交顺序与录制顺序一致。
+            flushBatchedLocked();
+            for (const auto& cmd : cmds)
+            {
+                if (cmd)
+                {
+                    m_device.GetQueue().Submit(1, &cmd);
+                }
+            }
+            return;
+        }
         m_device.GetQueue().Submit(cmds.size(), cmds.data());
     }
 
     RenderPassBuilder NutContext::BeginRenderFrame()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_batchedSubmissionActive)
+        {
+            // 批量作用域内复用同一个命令编码器；每个渲染通道仍独立 Begin/End。
+            if (!m_batchedCommandEncoder)
+            {
+                m_batchedCommandEncoder = m_device.CreateCommandEncoder();
+            }
+            return RenderPassBuilder{m_batchedCommandEncoder};
+        }
         m_commandEncoders.emplace_back(m_device.CreateCommandEncoder());
 
         return RenderPassBuilder{m_commandEncoders.back()};
+    }
+
+    void NutContext::flushBatchedLocked()
+    {
+        if (!m_batchedCommandEncoder)
+        {
+            return;
+        }
+        wgpu::CommandBuffer cmd = m_batchedCommandEncoder.Finish();
+        m_batchedCommandEncoder = nullptr;
+        if (cmd)
+        {
+            m_device.GetQueue().Submit(1, &cmd);
+        }
+    }
+
+    void NutContext::BeginBatchedSubmission()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_batchedSubmissionActive)
+        {
+            LogWarn("NutContext::BeginBatchedSubmission: 批量提交作用域已开启，忽略重复调用");
+            return;
+        }
+        m_batchedSubmissionActive = true;
+        m_batchedCommandEncoder = nullptr;
+    }
+
+    void NutContext::FlushBatchedSubmission()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_batchedSubmissionActive)
+        {
+            return;
+        }
+        flushBatchedLocked();
+    }
+
+    void NutContext::EndBatchedSubmission()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_batchedSubmissionActive)
+        {
+            return;
+        }
+        flushBatchedLocked();
+        m_batchedSubmissionActive = false;
     }
 
 

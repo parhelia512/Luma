@@ -45,6 +45,17 @@ enum class ApplicationMode
  */
 struct EngineContext
 {
+    /**
+     * @brief 场景数据互斥锁（保护 entt registry 及场景对象树的跨线程访问）。
+     *
+     * entt::registry 不是线程安全的，而引擎存在三类并发访问方：
+     *  - 模拟线程：每 tick 运行模拟系统并写组件（simulationLoop 持锁整个 tick）；
+     *  - 主线程：UpdateMainThread 的主线程系统（光照等）读写组件、编辑器面板读写场景；
+     *  - 渲染消费：RenderableManager 走双缓冲快照，不直接触碰 registry（无需持锁）。
+     * 使用递归锁：主线程面板绘制中触发的回调（如撤销快照序列化）允许同线程重入。
+     */
+    std::recursive_mutex sceneDataMutex;
+
     GraphicsBackend* graphicsBackend = nullptr; ///< 图形后端接口指针。
     RenderSystem* renderSystem = nullptr; ///< 渲染系统指针。
     PlatformWindow* window = nullptr; ///< 窗口系统指针。

@@ -21,6 +21,7 @@
 #include "../Systems/ParticleSystem.h"
 #include "ProjectSettings.h"
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include "../Resources/AssetManager.h"
 #include "../Resources/Managers/RuntimeSceneManager.h"
@@ -224,27 +225,78 @@ void SceneManager::PushUndoState(sk_sp<RuntimeScene> scene)
     MarkCurrentSceneDirty();
     if (!scene) return;
     m_redoStack.clear();
-    m_undoStack.push_back(scene->SerializeToData());
-    if (m_undoStack.size() > MAX_UNDO_STEPS)
+    Data::SceneData newState = scene->SerializeToData();
+    if (m_undoStack.empty())
     {
+        // 栈底基准恒为全量 checkpoint，之后的条目才允许存增量。
+        UndoEntry entry;
+        entry.isCheckpoint = true;
+        entry.state = newState;
+        m_undoStack.push_back(std::move(entry));
+    }
+    else
+    {
+        // 距最近 checkpoint 未达间隔时存相对栈顶状态的增量；到达间隔，或
+        // 场景数据无法安全按 GUID 索引（ComputeSceneDiff 返回空）时，回退
+        // 为全量 checkpoint。
+        std::optional<Data::SceneDiff> diff;
+        if (diffsSinceLastCheckpoint() < CHECKPOINT_INTERVAL)
+        {
+            diff = Data::ComputeSceneDiff(m_undoTopState, newState);
+        }
+        UndoEntry entry;
+        if (diff.has_value())
+        {
+            entry.diff = std::move(*diff);
+        }
+        else
+        {
+            entry.isCheckpoint = true;
+            entry.state = newState;
+        }
+        m_undoStack.push_back(std::move(entry));
+    }
+    m_undoTopState = std::move(newState);
+    while (m_undoStack.size() > MAX_UNDO_STEPS)
+    {
+        // 淘汰最老条目前，若第二个条目是增量则先物化为全量 checkpoint，
+        // 维持"栈底恒为 checkpoint"的不变量，保证剩余条目始终可重放。
+        if (m_undoStack.size() >= 2 && !m_undoStack[1].isCheckpoint)
+        {
+            m_undoStack[1].state = Data::ApplySceneDiff(m_undoStack.front().state, m_undoStack[1].diff);
+            m_undoStack[1].isCheckpoint = true;
+            m_undoStack[1].diff = Data::SceneDiff{};
+        }
         m_undoStack.pop_front();
     }
 }
 void SceneManager::Undo()
 {
     if (m_undoStack.size() <= 1) return;
-    m_redoStack.push_back(m_undoStack.back());
+    // 重建弹出后新栈顶对应的完整状态（最近 checkpoint + 正向重放增量），
+    // 恢复仍沿用 LoadFromData 全场景重建，正确性与全量快照方案等同。
+    Data::SceneData prevState = reconstructUndoState(m_undoStack.size() - 2);
+    // 栈顶条目原样移入重做栈：增量条目本身就是「新栈顶状态 -> 当前状态」
+    // 的正向增量，checkpoint 条目则直接携带完整状态，Redo 均可直接使用。
+    m_redoStack.push_back(std::move(m_undoStack.back()));
     m_undoStack.pop_back();
-    const Data::SceneData& prevState = m_undoStack.back();
     m_currentScene->LoadFromData(prevState);
+    m_undoTopState = std::move(prevState);
 }
 void SceneManager::Redo()
 {
     if (m_redoStack.empty()) return;
-    Data::SceneData nextState = m_redoStack.back();
+    UndoEntry entry = std::move(m_redoStack.back());
     m_redoStack.pop_back();
+    // checkpoint 条目直接携带目标状态；增量条目以当前状态（Undo 后的栈顶
+    // 状态缓存）为基准正向重放，精确回到 Undo 前的状态。
+    Data::SceneData nextState = entry.isCheckpoint
+                                    ? entry.state
+                                    : Data::ApplySceneDiff(m_undoTopState, entry.diff);
+    // 条目原样压回撤销栈，checkpoint 的分布保持 Undo 前的结构不变。
+    m_undoStack.push_back(std::move(entry));
     m_currentScene->LoadFromData(nextState);
-    m_undoStack.push_back(std::move(nextState));
+    m_undoTopState = std::move(nextState);
 }
 bool SceneManager::CanUndo() const
 {
@@ -253,6 +305,37 @@ bool SceneManager::CanUndo() const
 bool SceneManager::CanRedo() const
 {
     return !m_redoStack.empty();
+}
+Data::SceneData SceneManager::reconstructUndoState(size_t index) const
+{
+    assert(index < m_undoStack.size() && "reconstructUndoState: 条目下标越界");
+    size_t checkpointIndex = index;
+    while (checkpointIndex > 0 && !m_undoStack[checkpointIndex].isCheckpoint)
+    {
+        --checkpointIndex;
+    }
+    // 栈底恒为 checkpoint（PushUndoState 与淘汰逻辑共同维护该不变量），
+    // 因此回溯必然停在一个 checkpoint 条目上。
+    assert(m_undoStack[checkpointIndex].isCheckpoint && "撤销栈底必须是 checkpoint 条目");
+    Data::SceneData state = m_undoStack[checkpointIndex].state;
+    for (size_t i = checkpointIndex + 1; i <= index; ++i)
+    {
+        state = Data::ApplySceneDiff(state, m_undoStack[i].diff);
+    }
+    return state;
+}
+size_t SceneManager::diffsSinceLastCheckpoint() const
+{
+    size_t count = 0;
+    for (auto it = m_undoStack.rbegin(); it != m_undoStack.rend(); ++it)
+    {
+        if (it->isCheckpoint)
+        {
+            break;
+        }
+        ++count;
+    }
+    return count;
 }
 void SceneManager::Shutdown()
 {
@@ -265,6 +348,7 @@ void SceneManager::Shutdown()
     m_currentScene.reset();
     m_undoStack.clear();
     m_redoStack.clear();
+    m_undoTopState = Data::SceneData{};
     std::lock_guard<std::mutex> queueLock(m_queueMutex);
     while (!m_completedLoads.empty())
     {

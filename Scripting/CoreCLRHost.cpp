@@ -6,7 +6,9 @@
 #include <iomanip>
 #include <sstream>
 #include <mutex>
+#include "../Utils/CrashHandler.h"
 #include "../Utils/Directory.h"
+#include "../Utils/PathUtils.h"
 #include "../Utils/PCH.h"
 #include "../Application/ProjectSettings.h"
 #ifdef __linux__
@@ -286,6 +288,10 @@ bool CoreCLRHost::Initialize(const std::filesystem::path& mainAssemblyPath, bool
 
     LogInfo("CoreCLRHost: 宿主初始化成功。");
     m_isInitialized = true;
+
+    // CoreCLR 运行时初始化会安装自己的 SEH 处理链，可能覆盖引擎的未处理异常过滤器；
+    // 这里防御性地重装崩溃捕获（Install 幂等），保证脚本宿主启动后崩溃仍能写出 minidump
+    CrashHandler::Install(PathUtils::GetPersistentDataDir() / "CrashDumps");
     return true;
 }
 

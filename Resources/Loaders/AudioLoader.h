@@ -9,6 +9,9 @@
  * @brief 音频资产加载器。
  *
  * 负责从各种源加载音频资产并将其转换为运行时可用的 RuntimeAudio 对象。
+ * 根据估算的解码后 PCM 尺寸自动选择存储模式（对调用方透明）：
+ * - 小于阈值：全量解码为 PCM 常驻内存（低延迟音效）；
+ * - 大于阈值：仅保留原始编码字节，播放时按需流式解码（BGM 等长音频）。
  */
 class AudioLoader : public IAssetLoader<RuntimeAudio>
 {
@@ -39,7 +42,7 @@ public:
 
 private:
     // 私有方法不添加 Doxygen 注释，因为任务要求只为公开函数添加。
-    sk_sp<RuntimeAudio> DecodeToPCM(const AssetMetadata& meta) const;
+    sk_sp<RuntimeAudio> LoadInternal(const AssetMetadata& meta) const;
 
 private:
     int targetSampleRate; ///< 目标采样率。

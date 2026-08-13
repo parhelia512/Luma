@@ -3,8 +3,14 @@
 #include "ConsolePanel.h"
 #include "../Utils/Logger.h"
 #include <algorithm>
+#include <charconv>
+#include <filesystem>
 #include <iomanip>
+#include <regex>
 #include <sstream>
+#include "IDEIntegration.h"
+#include "PreferenceSettings.h"
+#include "ProjectSettings.h"
 #include "Profiler.h"
 ConsolePanel::~ConsolePanel()
 {
@@ -250,12 +256,22 @@ void ConsolePanel::drawLogEntry(const LogEntry& entry, int index)
     {
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
         {
-            std::string clipboardText = entry.message;
-            if (entry.count > 1)
+            std::string jumpFile;
+            int jumpLine = 0;
+            if (tryParseJumpTarget(entry.message, jumpFile, jumpLine))
             {
-                clipboardText += std::format(" (重复 {} 次)", entry.count);
+                // 含可跳转的编译诊断位置：双击打开 IDE 并定位，不再复制到剪贴板
+                openInIDE(jumpFile, jumpLine);
             }
-            ImGui::SetClipboardText(clipboardText.c_str());
+            else
+            {
+                std::string clipboardText = entry.message;
+                if (entry.count > 1)
+                {
+                    clipboardText += std::format(" (重复 {} 次)", entry.count);
+                }
+                ImGui::SetClipboardText(clipboardText.c_str());
+            }
         }
     }
     if (bgColor.w > 0)
@@ -264,6 +280,16 @@ void ConsolePanel::drawLogEntry(const LogEntry& entry, int index)
     }
     if (ImGui::BeginPopupContextItem())
     {
+        std::string jumpFile;
+        int jumpLine = 0;
+        if (tryParseJumpTarget(entry.message, jumpFile, jumpLine))
+        {
+            if (ImGui::MenuItem("在 IDE 中打开"))
+            {
+                openInIDE(jumpFile, jumpLine);
+            }
+            ImGui::Separator();
+        }
         if (ImGui::MenuItem("复制消息"))
         {
             ImGui::SetClipboardText(entry.message.c_str());
@@ -507,4 +533,61 @@ void ConsolePanel::collapseRepeatedMessages()
     }
     logEntries = std::move(collapsedEntries);
     updateLogCounts();
+}
+bool ConsolePanel::tryParseJumpTarget(const std::string& message, std::string& outFile, int& outLine)
+{
+    // 匹配 MSVC/dotnet 诊断格式：路径(行[,列]): error|warning ...
+    // 路径 = 可选盘符 + 不含 Windows 非法字符与冒号的字节序列（空格、UTF-8 中文均可），
+    // 且以 .cs 结尾；行/列为十进制数字。按字节匹配，不使用 icase 以避免高位字节的
+    // 区域设置问题（编译器诊断中的 error/warning 恒为小写）。
+    static const std::regex kJumpPattern(
+        R"re(((?:[A-Za-z]:)?[^:*?"<>|\r\n]+\.[cC][sS])\((\d+)(?:\s*,\s*\d+)?\)\s*:\s*(?:fatal\s+)?(?:error|warning)\b)re");
+    std::smatch match;
+    if (!std::regex_search(message, match, kJumpPattern))
+    {
+        return false;
+    }
+    std::string file = match[1].str();
+    const size_t firstNonSpace = file.find_first_not_of(" \t");
+    if (firstNonSpace == std::string::npos)
+    {
+        return false;
+    }
+    file.erase(0, firstNonSpace);
+    const std::string lineText = match[2].str();
+    int line = 0;
+    const std::from_chars_result parseResult =
+        std::from_chars(lineText.data(), lineText.data() + lineText.size(), line);
+    if (parseResult.ec != std::errc() || line <= 0)
+    {
+        return false;
+    }
+    outFile = std::move(file);
+    outLine = line;
+    return true;
+}
+void ConsolePanel::openInIDE(const std::string& filePath, int line)
+{
+    IDE ide = PreferenceSettings::GetInstance().GetPreferredIDE();
+    if (ide == IDE::Unknown)
+    {
+        ide = IDEIntegration::DetectInstalledIDE();
+    }
+    if (ide == IDE::Unknown)
+    {
+        LogError("未检测到受支持的 IDE（Rider、Visual Studio、VS Code），无法跳转到 {}:{}", filePath, line);
+        return;
+    }
+    const std::filesystem::path projectRoot = ProjectSettings::GetInstance().GetProjectRoot();
+    const std::filesystem::path solutionPath = projectRoot / "LumaScripting.sln";
+    // 日志消息为 UTF-8，经 char8_t 构造以保证中文路径正确转换为原生编码
+    std::filesystem::path targetFile(reinterpret_cast<const char8_t*>(filePath.c_str()));
+    if (targetFile.is_relative())
+    {
+        targetFile = projectRoot / targetFile;
+    }
+    if (!IDEIntegration::OpenAt(ide, solutionPath, targetFile, line))
+    {
+        LogError("无法启动 IDE 打开文件: {}", targetFile.string());
+    }
 }

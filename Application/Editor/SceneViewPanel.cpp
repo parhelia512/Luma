@@ -1630,6 +1630,34 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
 }
 void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, const ImVec2& viewportSize)
 {
+    // F 键聚焦：场景视图处于聚焦或悬停状态（isSceneViewFocused 即两者之或）且未在输入文本时，
+    // 将编辑器相机位置直接设为所有选中对象世界坐标的平均值，不调整缩放
+    if (m_context->engineContext->isSceneViewFocused &&
+        !ImGui::GetIO().WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_F, false) &&
+        m_context->selectionType == SelectionType::GameObject &&
+        !m_context->selectionList.empty())
+    {
+        float sumX = 0.0f;
+        float sumY = 0.0f;
+        int validCount = 0;
+        for (const Guid& guid : m_context->selectionList)
+        {
+            RuntimeGameObject selected = m_context->activeScene->FindGameObjectByGuid(guid);
+            if (selected.IsValid() && selected.HasComponent<ECS::TransformComponent>())
+            {
+                const auto& transform = selected.GetComponent<ECS::TransformComponent>();
+                sumX += transform.position.x;
+                sumY += transform.position.y;
+                ++validCount;
+            }
+        }
+        if (validCount > 0)
+        {
+            m_editorCameraProperties.position = SkPoint::Make(sumX / static_cast<float>(validCount),
+                                                              sumY / static_cast<float>(validCount));
+        }
+    }
     const bool isHovered = ImGui::IsItemHovered(ImGuiHoveredFlags_None);
     if (!m_context->engineContext->isSceneViewFocused || !isHovered)
     {
