@@ -8,6 +8,7 @@
 #include "Utils/Logger.h"
 #include <imgui.h>
 #include <algorithm>
+#include <cmath>
 #include <string_view>
 #include <implot.h>
 #include "imgui_internal.h"
@@ -24,6 +25,106 @@ struct PairHash
         return h1 ^ (h2 << 1);
     }
 };
+namespace
+{
+    // C# 类型别名 → 完整类型名，连线校验与配色共用同一套规范化
+    std::string_view canonicalPinType(std::string_view typeName)
+    {
+        if (typeName == "float") return "System.Single";
+        if (typeName == "double") return "System.Double";
+        if (typeName == "int") return "System.Int32";
+        if (typeName == "long") return "System.Int64";
+        if (typeName == "bool") return "System.Boolean";
+        if (typeName == "string") return "System.String";
+        if (typeName == "object") return "System.Object";
+        if (typeName == "short") return "System.Int16";
+        if (typeName == "byte") return "System.Byte";
+        if (typeName == "char") return "System.Char";
+        if (typeName == "DynamicObject") return "System.Object";
+        return typeName;
+    }
+    // 输出→输入的类型连接规则：Exec 只连 Exec，System.Object 入参接受任意数据
+    bool arePinTypesCompatible(const std::string& outputType, const std::string& inputType)
+    {
+        if (outputType == "Exec" || inputType == "Exec")
+        {
+            return outputType == "Exec" && inputType == "Exec";
+        }
+        std::string_view inputCanonical = canonicalPinType(inputType);
+        if (inputCanonical == "System.Object")
+        {
+            return true;
+        }
+        return canonicalPinType(outputType) == inputCanonical;
+    }
+    // 伪类型引脚只作为节点内嵌控件（下拉、按钮等），不参与连线
+    bool isConnectablePinType(const std::string& type)
+    {
+        return type != "SelectType" && type != "TemplateType" && type != "NodeInputText" &&
+            type != "FunctionSelection" && type != "Args";
+    }
+    // 引脚类型 → 显示颜色（参考 UE 蓝图配色并降低饱和度，贴合深色主题）
+    ImVec4 getPinTypeColor(const std::string& type)
+    {
+        std::string_view typeView(type);
+        if (typeView.size() > 2 && typeView.substr(typeView.size() - 2) == "[]")
+        {
+            typeView = typeView.substr(0, typeView.size() - 2); // 数组沿用元素类型的颜色
+        }
+        std::string_view canonical = canonicalPinType(typeView);
+        if (canonical == "Exec") return ImVec4(0.86f, 0.86f, 0.86f, 1.0f);
+        if (canonical == "System.Boolean") return ImVec4(0.75f, 0.29f, 0.29f, 1.0f);
+        if (canonical == "System.Int16" || canonical == "System.Int32" || canonical == "System.Int64" ||
+            canonical == "System.Byte")
+        {
+            return ImVec4(0.33f, 0.72f, 0.70f, 1.0f);
+        }
+        if (canonical == "System.Single" || canonical == "System.Double") return ImVec4(0.45f, 0.76f, 0.42f, 1.0f);
+        if (canonical == "System.String" || canonical == "System.Char") return ImVec4(0.76f, 0.42f, 0.72f, 1.0f);
+        if (canonical == "System.Object") return ImVec4(0.58f, 0.58f, 0.58f, 1.0f); // 通配
+        return ImVec4(0.44f, 0.55f, 0.69f, 1.0f); // 其他对象类型
+    }
+    // 大小写不敏感的子串匹配（仅处理 ASCII，UTF-8 中文按字节原样比较）
+    bool containsIgnoreCase(std::string_view haystack, std::string_view needle)
+    {
+        if (needle.empty()) return true;
+        if (needle.size() > haystack.size()) return false;
+        auto toLower = [](unsigned char c) -> unsigned char
+        {
+            return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c - 'A' + 'a') : c;
+        };
+        for (size_t i = 0; i + needle.size() <= haystack.size(); ++i)
+        {
+            size_t j = 0;
+            while (j < needle.size() &&
+                toLower(static_cast<unsigned char>(haystack[i + j])) ==
+                toLower(static_cast<unsigned char>(needle[j])))
+            {
+                ++j;
+            }
+            if (j == needle.size()) return true;
+        }
+        return false;
+    }
+    // 平铺搜索结果行：左侧节点名、右侧分类灰字，返回是否被点击
+    bool drawFlatNodeMenuItem(const char* name, const char* category, bool enabled)
+    {
+        bool clicked = false;
+        if (enabled)
+        {
+            clicked = ImGui::Selectable(name, false, 0, ImVec2(260, 0));
+        }
+        else
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::Selectable(name, false, ImGuiSelectableFlags_Disabled, ImVec2(260, 0));
+            ImGui::PopStyleColor();
+        }
+        ImGui::SameLine(280);
+        ImGui::TextDisabled("%s", category);
+        return clicked;
+    }
+}
 BlueprintPanel::~BlueprintPanel()
 {
     ImPlot::DestroyContext();
@@ -89,6 +190,13 @@ void BlueprintPanel::OpenBlueprint(const Guid& blueprintGuid)
     strncpy(m_blueprintNameBuffer, m_currentBlueprintName.c_str(), sizeof(m_blueprintNameBuffer));
     m_blueprintNameBuffer[sizeof(m_blueprintNameBuffer) - 1] = '\0';
     initializeFromBlueprintData();
+    m_undoStack.clear();
+    m_redoStack.clear();
+    m_clipboardNodes.clear();
+    m_clipboardLinks.clear();
+    m_hasMoveCandidate = false;
+    m_hasPendingEditSnapshot = false;
+    m_pendingLinkPin = ed::PinId(0);
     const auto& allTypes = ScriptMetadataRegistry::GetInstance().GetAvailableTypes();
     m_sortedTypeNames = allTypes;
     std::sort(m_sortedTypeNames.begin(), m_sortedTypeNames.end(), [](const std::string& a, const std::string& b)
@@ -122,6 +230,13 @@ void BlueprintPanel::CloseCurrentBlueprint()
     if (!m_currentBlueprint) return;
     LogInfo("关闭蓝图: {}", m_currentBlueprintName);
     ClearEditorState();
+    m_undoStack.clear();
+    m_redoStack.clear();
+    m_clipboardNodes.clear();
+    m_clipboardLinks.clear();
+    m_hasMoveCandidate = false;
+    m_hasPendingEditSnapshot = false;
+    m_pendingLinkPin = ed::PinId(0);
     m_currentBlueprint = nullptr;
     m_currentBlueprintGuid = Guid();
     m_currentBlueprintName.clear();
@@ -187,6 +302,7 @@ void BlueprintPanel::Draw()
                         if (ImGui::InputText("##BlueprintName", m_blueprintNameBuffer, sizeof(m_blueprintNameBuffer),
                                              ImGuiInputTextFlags_EnterReturnsTrue))
                         {
+                            pushUndoSnapshot();
                             m_currentBlueprintName = m_blueprintNameBuffer;
                             m_currentBlueprint->GetBlueprintData().Name = m_currentBlueprintName;
                             updateSelfNodePinTypes();
@@ -273,13 +389,15 @@ void BlueprintPanel::drawSelectTypeWindows()
                 ImGui::Separator();
                 if (ImGui::BeginChild("##TypeScrollingRegion"))
                 {
-                    std::string& selectedType = sourceData->InputDefaults[window.pinName];
+                    // 压栈时 captureStateToData 可能改动 InputDefaults，取值拷贝并经 map 写回，避免引用失效
+                    std::string selectedType = sourceData->InputDefaults[window.pinName];
                     std::string_view search_sv(window.searchBuffer);
                     if (std::string_view("void").find(search_sv) != std::string_view::npos)
                     {
                         if (ImGui::Selectable("void", selectedType == "void"))
                         {
-                            selectedType = "void";
+                            pushUndoSnapshot();
+                            sourceData->InputDefaults[window.pinName] = "void";
                             window.isOpen = false;
                         }
                     }
@@ -293,7 +411,8 @@ void BlueprintPanel::drawSelectTypeWindows()
                         {
                             if (ImGui::Selectable(typeName.c_str(), selectedType == typeName))
                             {
-                                selectedType = typeName;
+                                pushUndoSnapshot();
+                                sourceData->InputDefaults[window.pinName] = typeName;
                                 window.isOpen = false;
                             }
                         }
@@ -400,6 +519,13 @@ void BlueprintPanel::drawNodeEditor()
                 createFunctionCallNode(*it, nodePosition);
             }
         }
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("BLUEPRINT_VARIABLE"))
+        {
+            // 松开后先弹 Get/Set 选择菜单，选中后再创建节点
+            m_varDropName = (const char*)payload->Data;
+            m_varDropCanvasPos = ed::ScreenToCanvas(ImGui::GetMousePos());
+            m_openVarDropMenu = true;
+        }
     }
     ImGui::EndDragDropTarget();
     for (auto& node : m_nodes)
@@ -439,7 +565,7 @@ void BlueprintPanel::drawNodeEditor()
             if (sourceData->Type == BlueprintNodeType::VariableSet && pin.name == "值")
             {
                 ed::BeginPin(pin.id, ed::PinKind::Input);
-                ImGui::Text("-> %s", pin.name.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "-> %s", pin.name.c_str());
                 ed::EndPin();
                 if (!pin.isConnected)
                 {
@@ -454,6 +580,7 @@ void BlueprintPanel::drawNodeEditor()
                     {
                         value = buffer;
                     }
+                    trackItemEditUndo();
                 }
             }
             else if (pin.type == "SelectType" || pin.type == "TemplateType")
@@ -488,7 +615,7 @@ void BlueprintPanel::drawNodeEditor()
                 if (returnType == "void") continue;
                 pin.type = returnType;
                 ed::BeginPin(pin.id, ed::PinKind::Input);
-                ImGui::Text("-> %s (%s)", pin.name.c_str(), pin.type.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "-> %s (%s)", pin.name.c_str(), pin.type.c_str());
                 ed::EndPin();
             }
             else if (pin.type == "NodeInputText")
@@ -503,11 +630,12 @@ void BlueprintPanel::drawNodeEditor()
                 {
                     value = buffer;
                 }
+                trackItemEditUndo();
             }
             else if (sourceData->TargetClassFullName == "Luma.SDK.Debug" && pin.name == "message")
             {
                 ed::BeginPin(pin.id, ed::PinKind::Input);
-                ImGui::Text("-> %s", pin.name.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "-> %s", pin.name.c_str());
                 ed::EndPin();
                 if (!pin.isConnected)
                 {
@@ -522,12 +650,13 @@ void BlueprintPanel::drawNodeEditor()
                     {
                         value = buffer;
                     }
+                    trackItemEditUndo();
                 }
             }
             else if (sourceData->TargetMemberName == "If" && pin.name == "条件")
             {
                 ed::BeginPin(pin.id, ed::PinKind::Input);
-                ImGui::Text("-> %s", pin.name.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "-> %s", pin.name.c_str());
                 ed::EndPin();
                 if (!pin.isConnected)
                 {
@@ -598,7 +727,7 @@ void BlueprintPanel::drawNodeEditor()
             {
                 ed::BeginPin(pin.id, ed::PinKind::Input);
                 std::string displayName = pin.name.substr(13);
-                ImGui::Text("-> %s (%s)", displayName.c_str(), pin.type.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "-> %s (%s)", displayName.c_str(), pin.type.c_str());
                 ed::EndPin();
                 ImGui::SameLine();
                 ImGui::PushID(pin.id.Get());
@@ -611,12 +740,13 @@ void BlueprintPanel::drawNodeEditor()
             else
             {
                 ed::BeginPin(pin.id, ed::PinKind::Input);
-                ImGui::Text("-> %s", pin.name.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "-> %s", pin.name.c_str());
                 ed::EndPin();
             }
         }
         if (requestAddParameter)
         {
+            pushUndoSnapshot();
             size_t insertPos = 0;
             size_t dynamicCount = 0;
             for (size_t i = 0; i < node.inputPins.size(); ++i)
@@ -645,6 +775,7 @@ void BlueprintPanel::drawNodeEditor()
         }
         if (pinIdToDelete.Get() != 0)
         {
+            pushUndoSnapshot();
             std::vector<ed::LinkId> linksToDelete;
             for (const auto& link : m_links)
             {
@@ -696,11 +827,11 @@ void BlueprintPanel::drawNodeEditor()
             ed::BeginPin(pin.id, ed::PinKind::Output);
             if (pin.type == "Exec")
             {
-                ImGui::Text("%s ->", pin.name.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "%s ->", pin.name.c_str());
             }
             else
             {
-                ImGui::Text("%s (%s) ->", pin.name.c_str(), pin.type.c_str());
+                ImGui::TextColored(getPinTypeColor(pin.type), "%s (%s) ->", pin.name.c_str(), pin.type.c_str());
             }
             ed::EndPin();
         }
@@ -710,7 +841,10 @@ void BlueprintPanel::drawNodeEditor()
     }
     for (const auto& link : m_links)
     {
-        ed::Link(link.id, link.startPinId, link.endPinId);
+        // 连线颜色取源输出引脚的类型色
+        const BPin* linkStartPin = findPinById(link.startPinId);
+        ImVec4 linkColor = linkStartPin ? getPinTypeColor(linkStartPin->type) : ImVec4(1, 1, 1, 1);
+        ed::Link(link.id, link.startPinId, link.endPinId, linkColor);
     }
     if (ed::BeginCreate())
     {
@@ -725,6 +859,7 @@ void BlueprintPanel::drawNodeEditor()
                 {
                     if (ed::AcceptNewItem())
                     {
+                        pushUndoSnapshot();
                         BLink newLink{getNextLinkId(), startPin->id, endPin->id};
                         if (startPin->kind == ed::PinKind::Input)
                         {
@@ -739,6 +874,20 @@ void BlueprintPanel::drawNodeEditor()
                 }
             }
         }
+        ed::PinId newNodePinId = 0;
+        if (ed::QueryNewNode(&newNodePinId))
+        {
+            // 拖线到空白处松开：记录起点引脚，弹出按类型过滤的节点创建菜单
+            BPin* draggedPin = findPinById(newNodePinId);
+            if (draggedPin && ed::AcceptNewItem())
+            {
+                m_pendingLinkPin = newNodePinId;
+                m_pinMenuSearchBuffer[0] = '\0';
+                ed::Suspend();
+                ImGui::OpenPopup("CreateNodeFromPinMenu");
+                ed::Resume();
+            }
+        }
     }
     ed::EndCreate();
     if (ed::BeginDelete())
@@ -751,10 +900,70 @@ void BlueprintPanel::drawNodeEditor()
         ed::NodeId deletedNodeId;
         while (ed::QueryDeletedNode(&deletedNodeId))
         {
+            BNode* nodeToCheck = findNodeById(deletedNodeId);
+            BlueprintNode* nodeSourceData = nodeToCheck ? findSourceDataById(nodeToCheck->sourceDataID) : nullptr;
+            if (nodeSourceData && nodeSourceData->Type == BlueprintNodeType::FunctionEntry)
+            {
+                // 函数入口节点只能随函数一起删除
+                ed::RejectDeletedItem();
+                continue;
+            }
             if (ed::AcceptDeletedItem()) { deleteNode(deletedNodeId); }
         }
     }
     ed::EndDelete();
+    // 节点/区域拖动的撤销检测：按下时记录基准与前置快照，松开且发生位移时将该快照入栈
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ed::IsActive())
+    {
+        m_moveCandidateSnapshot = makeSnapshot();
+        m_moveStartNodePositions.clear();
+        m_moveStartRegionRects.clear();
+        for (const auto& node : m_nodes)
+        {
+            m_moveStartNodePositions[node.id.Get()] = node.position;
+        }
+        for (const auto& region : m_regions)
+        {
+            m_moveStartRegionRects[region.id] = {region.position, region.size};
+        }
+        m_hasMoveCandidate = true;
+    }
+    if (m_hasMoveCandidate && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+    {
+        bool anyMoved = false;
+        for (const auto& node : m_nodes)
+        {
+            auto it = m_moveStartNodePositions.find(node.id.Get());
+            if (it == m_moveStartNodePositions.end()) continue;
+            if (std::fabs(node.position.x - it->second.x) > 0.5f ||
+                std::fabs(node.position.y - it->second.y) > 0.5f)
+            {
+                anyMoved = true;
+                break;
+            }
+        }
+        if (!anyMoved)
+        {
+            for (const auto& region : m_regions)
+            {
+                auto it = m_moveStartRegionRects.find(region.id);
+                if (it == m_moveStartRegionRects.end()) continue;
+                if (std::fabs(region.position.x - it->second.first.x) > 0.5f ||
+                    std::fabs(region.position.y - it->second.first.y) > 0.5f ||
+                    std::fabs(region.size.x - it->second.second.x) > 0.5f ||
+                    std::fabs(region.size.y - it->second.second.y) > 0.5f)
+                {
+                    anyMoved = true;
+                    break;
+                }
+            }
+        }
+        if (anyMoved)
+        {
+            pushUndoSnapshotDirect(std::move(m_moveCandidateSnapshot));
+        }
+        m_hasMoveCandidate = false;
+    }
     ed::Suspend();
     ed::NodeId contextNodeId;
     ed::LinkId contextLinkId;
@@ -793,10 +1002,17 @@ void BlueprintPanel::drawNodeEditor()
             ImGui::OpenPopup("RegionContextMenu");
         }
     }
+    if (m_openVarDropMenu)
+    {
+        ImGui::OpenPopup("VariableDropMenu");
+        m_openVarDropMenu = false;
+    }
     drawNodeContextMenu();
     drawLinkContextMenu();
     drawRegionContextMenu();
     drawBackgroundContextMenu();
+    drawCreateNodeFromPinMenu();
+    drawVariableDropMenu();
     ed::Resume();
     ed::End();
 }
@@ -851,6 +1067,7 @@ void BlueprintPanel::drawVariablesPanel()
         ImGui::GetStyle().FramePadding.x * 2);
     if (ImGui::Button("添加变量"))
     {
+        pushUndoSnapshot();
         BlueprintVariable newVar;
         newVar.Name = "NewVar" + std::to_string(m_currentBlueprint->GetBlueprintData().Variables.size());
         newVar.Type = "System.Single";
@@ -864,6 +1081,15 @@ void BlueprintPanel::drawVariablesPanel()
         {
             ImGui::PushID(static_cast<int>(i));
             auto& var = variables[i];
+            // 拖拽手柄：拖到画布空白处松开可生成 Get/Set 节点
+            ImGui::Selectable("::", false, 0, ImVec2(14, 0));
+            if (ImGui::BeginDragDropSource())
+            {
+                ImGui::SetDragDropPayload("BLUEPRINT_VARIABLE", var.Name.c_str(), var.Name.length() + 1);
+                ImGui::Text("变量 %s", var.Name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            ImGui::SameLine();
             char nameBuffer[256];
             strncpy(nameBuffer, var.Name.c_str(), sizeof(nameBuffer) - 1);
             nameBuffer[sizeof(nameBuffer) - 1] = '\0';
@@ -872,6 +1098,7 @@ void BlueprintPanel::drawVariablesPanel()
             {
                 var.Name = nameBuffer;
             }
+            trackItemEditUndo();
             ImGui::SameLine();
             ImGui::SetNextItemWidth(150);
             if (ImGui::BeginCombo("##VarType", var.Type.c_str()))
@@ -887,6 +1114,7 @@ void BlueprintPanel::drawVariablesPanel()
                     {
                         if (ImGui::Selectable(typeName.c_str(), var.Type == typeName))
                         {
+                            pushUndoSnapshot();
                             var.Type = typeName;
                         }
                     }
@@ -896,6 +1124,7 @@ void BlueprintPanel::drawVariablesPanel()
             ImGui::SameLine();
             if (ImGui::Button("X"))
             {
+                pushUndoSnapshot();
                 variables.erase(variables.begin() + i);
                 ImGui::PopID();
                 break;
@@ -968,6 +1197,7 @@ void BlueprintPanel::drawFunctionsPanel()
 void BlueprintPanel::deleteFunction(const std::string& functionName)
 {
     LogInfo("删除函数: {}", functionName);
+    pushUndoSnapshot();
     auto& functions = m_currentBlueprint->GetBlueprintData().Functions;
     uint32_t funcIdToDelete = 0;
     auto funcIt = std::find_if(functions.begin(), functions.end(),
@@ -990,7 +1220,7 @@ void BlueprintPanel::deleteFunction(const std::string& functionName)
     }
     for (auto nodeId : nodesToDelete)
     {
-        deleteNode(nodeId);
+        deleteNode(nodeId, true);
     }
     if (funcIdToDelete != 0)
     {
@@ -1176,6 +1406,7 @@ void BlueprintPanel::drawCreateFunctionPopup()
         const char* buttonText = m_isEditingFunction ? "应用修改" : "创建";
         if (ImGui::Button(buttonText, ImVec2(120, 0)))
         {
+            pushUndoSnapshot();
             if (m_isEditingFunction)
             {
                 auto& funcs = m_currentBlueprint->GetBlueprintData().Functions;
@@ -1293,6 +1524,7 @@ void BlueprintPanel::drawCreateRegionPopup()
         ImGui::Separator();
         if (ImGui::Button("创建", ImVec2(120, 0)))
         {
+            pushUndoSnapshot();
             BlueprintCommentRegion regionData;
             regionData.ID = getNextRegionId();
             regionData.Title = m_newRegionTitleBuffer;
@@ -1346,18 +1578,37 @@ void BlueprintPanel::handleShortcutInput()
     {
         CloseCurrentBlueprint();
     }
-    if (Keyboard::Delete.IsPressed())
+    if (!m_currentBlueprint) return;
+    // 文本输入期间不响应编辑类快捷键，避免与输入框冲突
+    if (ImGui::GetIO().WantTextInput) return;
+    const bool ctrlDown = Keyboard::LeftCtrl.IsPressed() || Keyboard::RightCtrl.IsPressed();
+    const bool shiftDown = Keyboard::LeftShift.IsPressed() || Keyboard::RightShift.IsPressed();
+    if (ctrlDown && Keyboard::Z.IsDown())
     {
-        if (m_contextNodeId.Get() != 0)
+        if (shiftDown)
         {
-            deleteNode(m_contextNodeId);
-            m_contextNodeId = ed::NodeId(0);
+            performRedo();
         }
-        if (m_contextLinkId.Get() != 0)
+        else
         {
-            deleteLink(m_contextLinkId);
-            m_contextLinkId = ed::LinkId(0);
+            performUndo();
         }
+    }
+    if (ctrlDown && Keyboard::C.IsDown())
+    {
+        copySelectionToClipboard();
+    }
+    if (ctrlDown && Keyboard::V.IsDown())
+    {
+        pasteClipboardAtMouse();
+    }
+    if (ctrlDown && Keyboard::D.IsDown())
+    {
+        duplicateSelection();
+    }
+    if (Keyboard::Delete.IsDown())
+    {
+        deleteSelectedObjects();
     }
 }
 void BlueprintPanel::drawSelectFunctionWindows()
@@ -1383,11 +1634,13 @@ void BlueprintPanel::drawSelectFunctionWindows()
                 ImGui::Separator();
                 if (ImGui::BeginChild("##FunctionScrollingRegion"))
                 {
-                    std::string& selectedFunction = sourceData->InputDefaults[window.pinName];
+                    // 压栈时 captureStateToData 可能改动 InputDefaults，取值拷贝并经 map 写回，避免引用失效
+                    std::string selectedFunction = sourceData->InputDefaults[window.pinName];
                     std::string_view search_sv(window.searchBuffer);
                     if (ImGui::Selectable("(无)", selectedFunction.empty()))
                     {
-                        selectedFunction.clear();
+                        pushUndoSnapshot();
+                        sourceData->InputDefaults[window.pinName].clear();
                         window.isOpen = false;
                     }
                     const auto& functions = m_currentBlueprint->GetBlueprintData().Functions;
@@ -1397,7 +1650,8 @@ void BlueprintPanel::drawSelectFunctionWindows()
                         {
                             if (ImGui::Selectable(func.Name.c_str(), selectedFunction == func.Name))
                             {
-                                selectedFunction = func.Name;
+                                pushUndoSnapshot();
+                                sourceData->InputDefaults[window.pinName] = func.Name;
                                 window.isOpen = false;
                             }
                         }
@@ -1525,73 +1779,146 @@ void BlueprintPanel::drawBackgroundContextMenu()
     if (ImGui::BeginPopup("CreateNodeMenu"))
     {
         ImVec2 open_position_canvas = ed::ScreenToCanvas(open_position);
-        if (m_currentBlueprint && !m_currentBlueprint->GetBlueprintData().Functions.empty())
+        const auto& categorizedNodes = BlueprintNodeRegistry::GetInstance().GetCategorizedDefinitions();
+        static char searchBuffer[128] = "";
+        if (ImGui::IsWindowAppearing())
         {
-            if (ImGui::BeginMenu("函数调用"))
+            searchBuffer[0] = '\0';
+            ImGui::SetKeyboardFocusHere(0);
+        }
+        ImGui::InputText("搜索", searchBuffer, sizeof(searchBuffer));
+        ImGui::Separator();
+        std::string_view search_sv(searchBuffer);
+        if (!search_sv.empty())
+        {
+            // 有搜索词时跳过分类层级，平铺显示所有匹配项（匹配名称或分类名）
+            if (ImGui::BeginChild("##FlatSearchResults", ImVec2(420, 320)))
             {
-                for (const auto& func : m_currentBlueprint->GetBlueprintData().Functions)
+                int rowId = 0;
+                if (m_currentBlueprint)
                 {
-                    if (ImGui::MenuItem(func.Name.c_str()))
+                    for (const auto& func : m_currentBlueprint->GetBlueprintData().Functions)
                     {
-                        createFunctionCallNode(func, open_position_canvas);
+                        if (!containsIgnoreCase(func.Name, search_sv) &&
+                            !containsIgnoreCase("函数调用", search_sv))
+                        {
+                            continue;
+                        }
+                        ImGui::PushID(rowId++);
+                        if (drawFlatNodeMenuItem(func.Name.c_str(), "函数调用", true))
+                        {
+                            createFunctionCallNode(func, open_position_canvas);
+                        }
+                        ImGui::PopID();
+                    }
+                    for (const auto& var : m_currentBlueprint->GetBlueprintData().Variables)
+                    {
+                        std::string getLabel = "获取 " + var.Name;
+                        std::string setLabel = "设置 " + var.Name;
+                        if (containsIgnoreCase(getLabel, search_sv) || containsIgnoreCase("变量", search_sv))
+                        {
+                            ImGui::PushID(rowId++);
+                            if (drawFlatNodeMenuItem(getLabel.c_str(), "变量", true))
+                            {
+                                createVariableNode(var, BlueprintNodeType::VariableGet, open_position_canvas);
+                            }
+                            ImGui::PopID();
+                        }
+                        if (containsIgnoreCase(setLabel, search_sv) || containsIgnoreCase("变量", search_sv))
+                        {
+                            ImGui::PushID(rowId++);
+                            if (drawFlatNodeMenuItem(setLabel.c_str(), "变量", true))
+                            {
+                                createVariableNode(var, BlueprintNodeType::VariableSet, open_position_canvas);
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                }
+                for (const auto& [category, definitions] : categorizedNodes)
+                {
+                    for (const auto* def : definitions)
+                    {
+                        if (!containsIgnoreCase(def->DisplayName, search_sv) &&
+                            !containsIgnoreCase(category, search_sv))
+                        {
+                            continue;
+                        }
+                        bool eventExists = (def->NodeType == BlueprintNodeType::Event && doesEventNodeExist(
+                            def->FullName));
+                        ImGui::PushID(rowId++);
+                        if (drawFlatNodeMenuItem(def->DisplayName.c_str(), category.c_str(), !eventExists))
+                        {
+                            createNodeFromDefinition(def, open_position_canvas);
+                        }
+                        ImGui::PopID();
+                    }
+                }
+            }
+            ImGui::EndChild();
+        }
+        else
+        {
+            if (m_currentBlueprint && !m_currentBlueprint->GetBlueprintData().Functions.empty())
+            {
+                if (ImGui::BeginMenu("函数调用"))
+                {
+                    for (const auto& func : m_currentBlueprint->GetBlueprintData().Functions)
+                    {
+                        if (ImGui::MenuItem(func.Name.c_str()))
+                        {
+                            createFunctionCallNode(func, open_position_canvas);
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+                ImGui::Separator();
+            }
+            if (ImGui::BeginMenu("变量"))
+            {
+                if (m_currentBlueprint)
+                {
+                    auto& variables = m_currentBlueprint->GetBlueprintData().Variables;
+                    if (variables.empty())
+                    {
+                        ImGui::MenuItem("(无可用变量)", nullptr, false, false);
+                    }
+                    else
+                    {
+                        if (ImGui::BeginMenu("获取"))
+                        {
+                            for (const auto& var : variables)
+                            {
+                                if (ImGui::MenuItem(var.Name.c_str()))
+                                {
+                                    createVariableNode(var, BlueprintNodeType::VariableGet,
+                                                       ed::ScreenToCanvas(open_position));
+                                }
+                            }
+                            ImGui::EndMenu();
+                        }
+                        if (ImGui::BeginMenu("设置"))
+                        {
+                            for (const auto& var : variables)
+                            {
+                                if (ImGui::MenuItem(var.Name.c_str()))
+                                {
+                                    createVariableNode(var, BlueprintNodeType::VariableSet,
+                                                       ed::ScreenToCanvas(open_position));
+                                }
+                            }
+                            ImGui::EndMenu();
+                        }
                     }
                 }
                 ImGui::EndMenu();
             }
             ImGui::Separator();
-        }
-        if (ImGui::BeginMenu("变量"))
-        {
-            if (m_currentBlueprint)
+            for (const auto& [category, definitions] : categorizedNodes)
             {
-                auto& variables = m_currentBlueprint->GetBlueprintData().Variables;
-                if (variables.empty())
+                if (ImGui::BeginMenu(category.c_str()))
                 {
-                    ImGui::MenuItem("(无可用变量)", nullptr, false, false);
-                }
-                else
-                {
-                    if (ImGui::BeginMenu("获取"))
-                    {
-                        for (const auto& var : variables)
-                        {
-                            if (ImGui::MenuItem(var.Name.c_str()))
-                            {
-                                createVariableNode(var, BlueprintNodeType::VariableGet,
-                                                   ed::ScreenToCanvas(open_position));
-                            }
-                        }
-                        ImGui::EndMenu();
-                    }
-                    if (ImGui::BeginMenu("设置"))
-                    {
-                        for (const auto& var : variables)
-                        {
-                            if (ImGui::MenuItem(var.Name.c_str()))
-                            {
-                                createVariableNode(var, BlueprintNodeType::VariableSet,
-                                                   ed::ScreenToCanvas(open_position));
-                            }
-                        }
-                        ImGui::EndMenu();
-                    }
-                }
-            }
-            ImGui::EndMenu();
-        }
-        ImGui::Separator();
-        const auto& categorizedNodes = BlueprintNodeRegistry::GetInstance().GetCategorizedDefinitions();
-        static char searchBuffer[128] = "";
-        ImGui::InputText("搜索", searchBuffer, sizeof(searchBuffer));
-        ImGui::Separator();
-        for (const auto& [category, definitions] : categorizedNodes)
-        {
-            if (ImGui::BeginMenu(category.c_str()))
-            {
-                for (const auto* def : definitions)
-                {
-                    if (searchBuffer[0] == '\0' ||
-                        std::string_view(def->DisplayName).find(searchBuffer) != std::string_view::npos)
+                    for (const auto* def : definitions)
                     {
                         bool eventExists = (def->NodeType == BlueprintNodeType::Event && doesEventNodeExist(
                             def->FullName));
@@ -1600,8 +1927,192 @@ void BlueprintPanel::drawBackgroundContextMenu()
                             createNodeFromDefinition(def, ed::ScreenToCanvas(open_position));
                         }
                     }
+                    ImGui::EndMenu();
                 }
-                ImGui::EndMenu();
+            }
+        }
+        ImGui::EndPopup();
+    }
+}
+void BlueprintPanel::drawCreateNodeFromPinMenu()
+{
+    ImVec2 open_position = ImGui::GetMousePosOnOpeningCurrentPopup();
+    if (ImGui::BeginPopup("CreateNodeFromPinMenu"))
+    {
+        BPin* startPin = findPinById(m_pendingLinkPin);
+        if (!startPin || !m_currentBlueprint)
+        {
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+        ImVec2 open_position_canvas = ed::ScreenToCanvas(open_position);
+        ImGui::TextDisabled("从 %s 创建连接", startPin->name.empty() ? "执行" : startPin->name.c_str());
+        if (ImGui::IsWindowAppearing())
+        {
+            ImGui::SetKeyboardFocusHere(0);
+        }
+        ImGui::InputText("搜索", m_pinMenuSearchBuffer, sizeof(m_pinMenuSearchBuffer));
+        ImGui::Separator();
+        std::string_view search_sv(m_pinMenuSearchBuffer);
+        const ed::PinId startPinId = m_pendingLinkPin;
+        // 只做方向与类型的兼容判断，引脚占用等约束由 canCreateLink 在真正连线时兜底
+        auto pinCompatible = [startPin](const std::string& candidateType, ed::PinKind candidateKind)
+        {
+            if (candidateKind == startPin->kind) return false;
+            const bool startIsOutput = (startPin->kind == ed::PinKind::Output);
+            const std::string& outType = startIsOutput ? startPin->type : candidateType;
+            const std::string& inType = startIsOutput ? candidateType : startPin->type;
+            return arePinTypesCompatible(outType, inType);
+        };
+        bool created = false;
+        if (ImGui::BeginChild("##PinMenuResults", ImVec2(420, 320)))
+        {
+            int rowId = 0;
+            for (const auto& func : m_currentBlueprint->GetBlueprintData().Functions)
+            {
+                bool compatible = pinCompatible("Exec", ed::PinKind::Input) ||
+                    pinCompatible("Exec", ed::PinKind::Output);
+                if (!compatible)
+                {
+                    for (const auto& param : func.Parameters)
+                    {
+                        if (pinCompatible(param.Type, ed::PinKind::Input))
+                        {
+                            compatible = true;
+                            break;
+                        }
+                    }
+                }
+                if (!compatible && func.ReturnType != "void")
+                {
+                    compatible = pinCompatible(func.ReturnType, ed::PinKind::Output);
+                }
+                if (!compatible) continue;
+                if (!search_sv.empty() && !containsIgnoreCase(func.Name, search_sv) &&
+                    !containsIgnoreCase("函数调用", search_sv))
+                {
+                    continue;
+                }
+                ImGui::PushID(rowId++);
+                if (drawFlatNodeMenuItem(func.Name.c_str(), "函数调用", true))
+                {
+                    createFunctionCallNode(func, open_position_canvas);
+                    created = true;
+                }
+                ImGui::PopID();
+                if (created) break;
+            }
+            if (!created)
+            {
+                for (const auto& var : m_currentBlueprint->GetBlueprintData().Variables)
+                {
+                    std::string getLabel = "获取 " + var.Name;
+                    std::string setLabel = "设置 " + var.Name;
+                    bool getCompatible = pinCompatible(var.Type, ed::PinKind::Output);
+                    bool setCompatible = pinCompatible("Exec", ed::PinKind::Input) ||
+                        pinCompatible(var.Type, ed::PinKind::Input) ||
+                        pinCompatible("Exec", ed::PinKind::Output);
+                    bool searchOk = search_sv.empty() || containsIgnoreCase("变量", search_sv);
+                    if (getCompatible && (searchOk || containsIgnoreCase(getLabel, search_sv)))
+                    {
+                        ImGui::PushID(rowId++);
+                        if (drawFlatNodeMenuItem(getLabel.c_str(), "变量", true))
+                        {
+                            createVariableNode(var, BlueprintNodeType::VariableGet, open_position_canvas);
+                            created = true;
+                        }
+                        ImGui::PopID();
+                        if (created) break;
+                    }
+                    if (setCompatible && (searchOk || containsIgnoreCase(setLabel, search_sv)))
+                    {
+                        ImGui::PushID(rowId++);
+                        if (drawFlatNodeMenuItem(setLabel.c_str(), "变量", true))
+                        {
+                            createVariableNode(var, BlueprintNodeType::VariableSet, open_position_canvas);
+                            created = true;
+                        }
+                        ImGui::PopID();
+                        if (created) break;
+                    }
+                }
+            }
+            if (!created)
+            {
+                const auto& categorizedNodes = BlueprintNodeRegistry::GetInstance().GetCategorizedDefinitions();
+                for (const auto& [category, definitions] : categorizedNodes)
+                {
+                    for (const auto* def : definitions)
+                    {
+                        if (!nodeDefinitionHasCompatiblePin(def, startPin)) continue;
+                        if (!search_sv.empty() && !containsIgnoreCase(def->DisplayName, search_sv) &&
+                            !containsIgnoreCase(category, search_sv))
+                        {
+                            continue;
+                        }
+                        bool eventExists = (def->NodeType == BlueprintNodeType::Event && doesEventNodeExist(
+                            def->FullName));
+                        ImGui::PushID(rowId++);
+                        if (drawFlatNodeMenuItem(def->DisplayName.c_str(), category.c_str(), !eventExists))
+                        {
+                            createNodeFromDefinition(def, open_position_canvas);
+                            created = true;
+                        }
+                        ImGui::PopID();
+                        if (created) break;
+                    }
+                    if (created) break;
+                }
+            }
+        }
+        ImGui::EndChild();
+        if (created)
+        {
+            // 创建节点会使 m_nodes 扩容，重新查找起点引脚后再自动连线
+            BPin* freshStartPin = findPinById(startPinId);
+            if (freshStartPin && !m_nodes.empty())
+            {
+                connectPinToFirstCompatiblePin(freshStartPin, m_nodes.back());
+            }
+            m_pendingLinkPin = ed::PinId(0);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    else
+    {
+        m_pendingLinkPin = ed::PinId(0);
+    }
+}
+void BlueprintPanel::drawVariableDropMenu()
+{
+    if (ImGui::BeginPopup("VariableDropMenu"))
+    {
+        const BlueprintVariable* variable = nullptr;
+        if (m_currentBlueprint)
+        {
+            const auto& variables = m_currentBlueprint->GetBlueprintData().Variables;
+            auto it = std::find_if(variables.begin(), variables.end(),
+                                   [this](const BlueprintVariable& var) { return var.Name == m_varDropName; });
+            if (it != variables.end())
+            {
+                variable = &(*it);
+            }
+        }
+        if (!variable)
+        {
+            ImGui::CloseCurrentPopup();
+        }
+        else
+        {
+            if (ImGui::MenuItem(("获取 " + variable->Name).c_str()))
+            {
+                createVariableNode(*variable, BlueprintNodeType::VariableGet, m_varDropCanvasPos);
+            }
+            if (ImGui::MenuItem(("设置 " + variable->Name).c_str()))
+            {
+                createVariableNode(*variable, BlueprintNodeType::VariableSet, m_varDropCanvasPos);
             }
         }
         ImGui::EndPopup();
@@ -1641,6 +2152,7 @@ void BlueprintPanel::drawRegionContextMenu()
     {
         if (ImGui::MenuItem("删除区域"))
         {
+            pushUndoSnapshot();
             std::erase_if(m_regions, [&](const BRegion& region) { return region.id == m_contextRegionId; });
             std::erase_if(m_currentBlueprint->GetBlueprintData().CommentRegions,
                           [&](const BlueprintCommentRegion& region)
@@ -1711,6 +2223,7 @@ void BlueprintPanel::drawInputStringWindows()
                 {
                     value = buffer;
                 }
+                trackItemEditUndo();
                 ImGui::Separator();
                 if (ImGui::Button("完成"))
                 {
@@ -1719,7 +2232,9 @@ void BlueprintPanel::drawInputStringWindows()
                 ImGui::SameLine();
                 if (ImGui::Button("清空"))
                 {
-                    value.clear();
+                    pushUndoSnapshot();
+                    // 压栈时 captureStateToData 可能改动 InputDefaults，经 map 重新取值再清空
+                    sourceData->InputDefaults[window.pinName].clear();
                     buffer[0] = '\0';
                 }
             }
@@ -1908,6 +2423,8 @@ void BlueprintPanel::initializeFromBlueprintData()
                         dynamicPin.type = bpNodeData.InputDefaults.at("_DynamicArg_" + std::to_string(i) + "_Type");
                         dynamicPin.kind = ed::PinKind::Input;
                         dynamic_pins_to_add.push_back(dynamicPin);
+                        // 动态引脚也要注册进映射，否则其连线在重建时会丢失
+                        bpPinToEditorPinId[{bpNodeData.ID, dynamicPin.name}] = dynamicPin.id;
                     }
                     if (!dynamic_pins_to_add.empty())
                     {
@@ -1960,7 +2477,7 @@ void BlueprintPanel::initializeFromBlueprintData()
         m_nextRegionId = std::max(m_nextRegionId, region.id + 1);
     }
 }
-void BlueprintPanel::saveToBlueprintData()
+void BlueprintPanel::captureStateToData()
 {
     if (!m_currentBlueprint) return;
     auto& blueprintData = m_currentBlueprint->GetBlueprintData();
@@ -2032,15 +2549,21 @@ void BlueprintPanel::saveToBlueprintData()
         regionData.Size = {region.size.x, region.size.y};
         blueprintData.CommentRegions.push_back(regionData);
     }
+}
+void BlueprintPanel::saveToBlueprintData()
+{
+    if (!m_currentBlueprint) return;
+    captureStateToData();
     auto meta = AssetManager::GetInstance().GetMetadata(m_currentBlueprintGuid);
     auto filePath = AssetManager::GetInstance().GetAssetsRootPath() / meta->assetPath;
-    std::string content = YAML::Dump(YAML::convert<Blueprint>::encode(blueprintData));
+    std::string content = YAML::Dump(YAML::convert<Blueprint>::encode(m_currentBlueprint->GetBlueprintData()));
     Path::WriteFile(filePath.string(), content);
     LogInfo("蓝图数据已保存: {}", filePath.string());
 }
 void BlueprintPanel::createVariableNode(const BlueprintVariable& variable, BlueprintNodeType type, ImVec2 position)
 {
     if (!m_currentBlueprint) return;
+    pushUndoSnapshot();
     BlueprintNode bpNode;
     bpNode.ID = getNextNodeId();
     bpNode.Type = type;
@@ -2077,6 +2600,7 @@ void BlueprintPanel::createNodeFromDefinition(const BlueprintNodeDefinition* def
             return;
         }
     }
+    pushUndoSnapshot();
     BlueprintNode bpNode;
     bpNode.ID = getNextNodeId();
     bpNode.Type = definition->NodeType;
@@ -2119,6 +2643,7 @@ void BlueprintPanel::createNodeFromDefinition(const BlueprintNodeDefinition* def
 void BlueprintPanel::createFunctionCallNode(const BlueprintFunction& func, ImVec2 position)
 {
     if (!m_currentBlueprint) return;
+    pushUndoSnapshot();
     BlueprintNode bpNode;
     bpNode.ID = getNextNodeId();
     bpNode.Type = BlueprintNodeType::FunctionCall;
@@ -2145,10 +2670,20 @@ void BlueprintPanel::createFunctionCallNode(const BlueprintFunction& func, ImVec
     m_nodes.push_back(editorNode);
     ed::SetNodePosition(editorNode.id, position);
 }
-void BlueprintPanel::deleteNode(ed::NodeId nodeId)
+void BlueprintPanel::deleteNode(ed::NodeId nodeId, bool allowProtected)
 {
     BNode* nodeToDelete = findNodeById(nodeId);
     if (!nodeToDelete) return;
+    if (!allowProtected)
+    {
+        const BlueprintNode* protectedCheck = findSourceDataById(nodeToDelete->sourceDataID);
+        if (protectedCheck && protectedCheck->Type == BlueprintNodeType::FunctionEntry)
+        {
+            // 函数入口节点只能随函数一起删除
+            return;
+        }
+    }
+    pushUndoSnapshot();
     std::vector<ed::LinkId> linksToDelete;
     for (const auto& link : m_links)
     {
@@ -2194,6 +2729,7 @@ void BlueprintPanel::deleteLink(ed::LinkId linkId)
 {
     BLink* linkToDelete = findLinkById(linkId);
     if (!linkToDelete) return;
+    pushUndoSnapshot();
     BPin* startPin = findPinById(linkToDelete->startPinId);
     BPin* endPin = findPinById(linkToDelete->endPinId);
     std::erase_if(m_links, [linkId](const BLink& link)
@@ -2235,32 +2771,38 @@ bool BlueprintPanel::canCreateLink(const BPin* startPin, const BPin* endPin) con
     const BPin* pOut = (startPin->kind == ed::PinKind::Output) ? startPin : endPin;
     const BPin* pIn = (startPin->kind == ed::PinKind::Output) ? endPin : startPin;
     if (pIn->isConnected) return false;
-    if (pOut->type == "Exec")
+    return arePinTypesCompatible(pOut->type, pIn->type);
+}
+bool BlueprintPanel::nodeDefinitionHasCompatiblePin(const BlueprintNodeDefinition* definition,
+                                                    const BPin* startPin) const
+{
+    const bool startIsOutput = (startPin->kind == ed::PinKind::Output);
+    const auto& candidatePins = startIsOutput ? definition->InputPins : definition->OutputPins;
+    for (const auto& pinDef : candidatePins)
     {
-        return pIn->type == "Exec";
+        if (!isConnectablePinType(pinDef.Type)) continue;
+        const std::string& outType = startIsOutput ? startPin->type : pinDef.Type;
+        const std::string& inType = startIsOutput ? pinDef.Type : startPin->type;
+        if (arePinTypesCompatible(outType, inType)) return true;
     }
-    auto getCanonicalType = [](const std::string& typeName) -> std::string_view
+    return false;
+}
+void BlueprintPanel::connectPinToFirstCompatiblePin(BPin* startPin, BNode& newNode)
+{
+    auto& candidatePins = (startPin->kind == ed::PinKind::Output) ? newNode.inputPins : newNode.outputPins;
+    for (auto& pin : candidatePins)
     {
-        if (typeName == "float") return "System.Single";
-        if (typeName == "double") return "System.Double";
-        if (typeName == "int") return "System.Int32";
-        if (typeName == "long") return "System.Int64";
-        if (typeName == "bool") return "System.Boolean";
-        if (typeName == "string") return "System.String";
-        if (typeName == "object") return "System.Object";
-        if (typeName == "short") return "System.Int16";
-        if (typeName == "byte") return "System.Byte";
-        if (typeName == "char") return "System.Char";
-        if (typeName == "DynamicObject") return "System.Object";
-        return typeName;
-    };
-    std::string_view pInCanonicalType = getCanonicalType(pIn->type);
-    std::string_view pOutCanonicalType = getCanonicalType(pOut->type);
-    if (pInCanonicalType == "System.Object")
-    {
-        return pOut->type != "Exec";
+        if (!isConnectablePinType(pin.type)) continue;
+        if (!canCreateLink(startPin, &pin)) continue;
+        BLink newLink{getNextLinkId(), startPin->id, pin.id};
+        if (startPin->kind == ed::PinKind::Input)
+        {
+            std::swap(newLink.startPinId, newLink.endPinId);
+        }
+        m_links.push_back(newLink);
+        rebuildPinConnections();
+        return;
     }
-    return pOutCanonicalType == pInCanonicalType;
 }
 void BlueprintPanel::rebuildPinConnections()
 {
@@ -2342,4 +2884,225 @@ bool BlueprintPanel::doesEventNodeExist(const std::string& fullName)
         }
     }
     return false;
+}
+Blueprint BlueprintPanel::makeSnapshot()
+{
+    // 先把编辑器实况（位置、连线、动态引脚、区域）同步进数据，再取全量副本
+    captureStateToData();
+    return m_currentBlueprint->GetBlueprintData();
+}
+void BlueprintPanel::pushUndoSnapshot()
+{
+    if (!m_currentBlueprint) return;
+    // 同一帧内的批量修改（如框选删除多个节点）合并为一个撤销步骤
+    if (ImGui::GetFrameCount() == m_lastUndoPushFrame) return;
+    pushUndoSnapshotDirect(makeSnapshot());
+}
+void BlueprintPanel::pushUndoSnapshotDirect(Blueprint&& snapshot)
+{
+    if (!m_currentBlueprint) return;
+    m_undoStack.push_back(std::move(snapshot));
+    while (m_undoStack.size() > kUndoStackLimit)
+    {
+        m_undoStack.pop_front();
+    }
+    m_redoStack.clear();
+    m_lastUndoPushFrame = ImGui::GetFrameCount();
+}
+void BlueprintPanel::restoreFromSnapshot(const Blueprint& snapshot)
+{
+    m_currentBlueprint->GetBlueprintData() = snapshot;
+    m_currentBlueprintName = snapshot.Name;
+    strncpy(m_blueprintNameBuffer, m_currentBlueprintName.c_str(), sizeof(m_blueprintNameBuffer));
+    m_blueprintNameBuffer[sizeof(m_blueprintNameBuffer) - 1] = '\0';
+    // 与打开蓝图相同的重建路径，编辑器状态完全由数据再生
+    initializeFromBlueprintData();
+    m_hasMoveCandidate = false;
+    m_hasPendingEditSnapshot = false;
+}
+void BlueprintPanel::performUndo()
+{
+    if (!m_currentBlueprint || m_undoStack.empty()) return;
+    m_redoStack.push_back(makeSnapshot());
+    Blueprint snapshot = std::move(m_undoStack.back());
+    m_undoStack.pop_back();
+    restoreFromSnapshot(snapshot);
+}
+void BlueprintPanel::performRedo()
+{
+    if (!m_currentBlueprint || m_redoStack.empty()) return;
+    // 不走 pushUndoSnapshotDirect，避免清空重做栈
+    m_undoStack.push_back(makeSnapshot());
+    while (m_undoStack.size() > kUndoStackLimit)
+    {
+        m_undoStack.pop_front();
+    }
+    Blueprint snapshot = std::move(m_redoStack.back());
+    m_redoStack.pop_back();
+    restoreFromSnapshot(snapshot);
+}
+void BlueprintPanel::trackItemEditUndo()
+{
+    if (!m_currentBlueprint) return;
+    if (ImGui::IsItemActivated())
+    {
+        // 编辑开始时暂存前置状态，提交（失焦且有修改）时才真正入栈
+        m_pendingEditSnapshot = makeSnapshot();
+        m_hasPendingEditSnapshot = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit())
+    {
+        if (m_hasPendingEditSnapshot)
+        {
+            pushUndoSnapshotDirect(std::move(m_pendingEditSnapshot));
+            m_hasPendingEditSnapshot = false;
+        }
+    }
+    else if (ImGui::IsItemDeactivated())
+    {
+        m_hasPendingEditSnapshot = false;
+    }
+}
+void BlueprintPanel::deleteSelectedObjects()
+{
+    if (!m_currentBlueprint) return;
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    int selectedCount = ed::GetSelectedObjectCount();
+    if (selectedCount <= 0) return;
+    std::vector<ed::NodeId> selectedNodes(selectedCount);
+    std::vector<ed::LinkId> selectedLinks(selectedCount);
+    int nodeCount = ed::GetSelectedNodes(selectedNodes.data(), selectedCount);
+    int linkCount = ed::GetSelectedLinks(selectedLinks.data(), selectedCount);
+    selectedNodes.resize(std::max(nodeCount, 0));
+    selectedLinks.resize(std::max(linkCount, 0));
+    if (selectedNodes.empty() && selectedLinks.empty()) return;
+    for (ed::LinkId linkId : selectedLinks)
+    {
+        deleteLink(linkId);
+    }
+    for (ed::NodeId nodeId : selectedNodes)
+    {
+        deleteNode(nodeId); // 函数入口节点由 deleteNode 内部保护
+    }
+    ed::ClearSelection();
+}
+bool BlueprintPanel::collectSelectionForClipboard(std::vector<ClipboardNode>& outNodes,
+                                                  std::vector<ClipboardLink>& outLinks, ImVec2& outTopLeft)
+{
+    if (!m_currentBlueprint) return false;
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    int selectedCount = ed::GetSelectedObjectCount();
+    if (selectedCount <= 0) return false;
+    std::vector<ed::NodeId> selectedNodes(selectedCount);
+    int nodeCount = ed::GetSelectedNodes(selectedNodes.data(), selectedCount);
+    selectedNodes.resize(std::max(nodeCount, 0));
+    if (selectedNodes.empty()) return false;
+    // 同步位置与动态引脚信息，保证复制的数据副本完整
+    captureStateToData();
+    std::unordered_map<uint32_t, int> sourceIdToIndex;
+    for (ed::NodeId nodeId : selectedNodes)
+    {
+        BNode* node = findNodeById(nodeId);
+        if (!node) continue;
+        BlueprintNode* sourceData = findSourceDataById(node->sourceDataID);
+        if (!sourceData) continue;
+        if (sourceData->Type == BlueprintNodeType::FunctionEntry) continue; // 入口节点不参与复制
+        sourceIdToIndex[sourceData->ID] = static_cast<int>(outNodes.size());
+        outNodes.push_back({*sourceData, ImVec2(0, 0)});
+    }
+    if (outNodes.empty()) return false;
+    outTopLeft = ImVec2(outNodes[0].data.Position.x, outNodes[0].data.Position.y);
+    for (const auto& clipNode : outNodes)
+    {
+        outTopLeft.x = std::min(outTopLeft.x, clipNode.data.Position.x);
+        outTopLeft.y = std::min(outTopLeft.y, clipNode.data.Position.y);
+    }
+    for (auto& clipNode : outNodes)
+    {
+        clipNode.relativePosition = ImVec2(clipNode.data.Position.x - outTopLeft.x,
+                                           clipNode.data.Position.y - outTopLeft.y);
+    }
+    for (const auto& link : m_links)
+    {
+        BPin* startPin = findPinById(link.startPinId);
+        BPin* endPin = findPinById(link.endPinId);
+        if (!startPin || !endPin) continue;
+        BNode* startNode = findNodeById(startPin->nodeId);
+        BNode* endNode = findNodeById(endPin->nodeId);
+        if (!startNode || !endNode) continue;
+        auto fromIt = sourceIdToIndex.find(startNode->sourceDataID);
+        auto toIt = sourceIdToIndex.find(endNode->sourceDataID);
+        if (fromIt == sourceIdToIndex.end() || toIt == sourceIdToIndex.end()) continue;
+        outLinks.push_back({fromIt->second, startPin->name, toIt->second, endPin->name});
+    }
+    return true;
+}
+void BlueprintPanel::copySelectionToClipboard()
+{
+    std::vector<ClipboardNode> nodes;
+    std::vector<ClipboardLink> links;
+    ImVec2 topLeft;
+    if (!collectSelectionForClipboard(nodes, links, topLeft)) return;
+    m_clipboardNodes = std::move(nodes);
+    m_clipboardLinks = std::move(links);
+}
+void BlueprintPanel::pasteFromClipboard(const std::vector<ClipboardNode>& nodes,
+                                        const std::vector<ClipboardLink>& links, ImVec2 basePosition)
+{
+    if (!m_currentBlueprint || nodes.empty()) return;
+    // 先把编辑器实况落进数据再整体重建，避免重建丢失未保存的修改
+    captureStateToData();
+    pushUndoSnapshot();
+    auto& blueprintData = m_currentBlueprint->GetBlueprintData();
+    std::vector<int64_t> newNodeIds(nodes.size(), -1);
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        const auto& clipNode = nodes[i];
+        if (clipNode.data.Type == BlueprintNodeType::Event &&
+            doesEventNodeExist(clipNode.data.TargetClassFullName + "." + clipNode.data.TargetMemberName))
+        {
+            continue; // 事件节点唯一，跳过已存在的
+        }
+        BlueprintNode newNode = clipNode.data;
+        newNode.ID = getNextNodeId();
+        newNode.Position.x = basePosition.x + clipNode.relativePosition.x;
+        newNode.Position.y = basePosition.y + clipNode.relativePosition.y;
+        blueprintData.Nodes.push_back(newNode);
+        newNodeIds[i] = newNode.ID;
+    }
+    for (const auto& clipLink : links)
+    {
+        if (clipLink.fromNodeIndex < 0 || clipLink.fromNodeIndex >= static_cast<int>(newNodeIds.size())) continue;
+        if (clipLink.toNodeIndex < 0 || clipLink.toNodeIndex >= static_cast<int>(newNodeIds.size())) continue;
+        if (newNodeIds[clipLink.fromNodeIndex] < 0 || newNodeIds[clipLink.toNodeIndex] < 0) continue;
+        blueprintData.Links.push_back({
+            static_cast<uint32_t>(newNodeIds[clipLink.fromNodeIndex]), clipLink.fromPinName,
+            static_cast<uint32_t>(newNodeIds[clipLink.toNodeIndex]), clipLink.toPinName
+        });
+    }
+    initializeFromBlueprintData();
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    ed::ClearSelection();
+    for (int64_t newId : newNodeIds)
+    {
+        if (newId >= 0)
+        {
+            ed::SelectNode(ed::NodeId(static_cast<uint32_t>(newId)), true);
+        }
+    }
+}
+void BlueprintPanel::pasteClipboardAtMouse()
+{
+    if (!m_currentBlueprint || m_clipboardNodes.empty()) return;
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    ImVec2 basePosition = ed::ScreenToCanvas(ImGui::GetMousePos());
+    pasteFromClipboard(m_clipboardNodes, m_clipboardLinks, basePosition);
+}
+void BlueprintPanel::duplicateSelection()
+{
+    std::vector<ClipboardNode> nodes;
+    std::vector<ClipboardLink> links;
+    ImVec2 topLeft;
+    if (!collectSelectionForClipboard(nodes, links, topLeft)) return;
+    pasteFromClipboard(nodes, links, ImVec2(topLeft.x + 40.0f, topLeft.y + 40.0f));
 }

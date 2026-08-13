@@ -1,5 +1,6 @@
 #ifndef EDITORCONTEXT_H
 #define EDITORCONTEXT_H
+#include <atomic>
 #include <memory>
 #include <chrono>
 #include <optional>
@@ -73,6 +74,7 @@ struct EditorContext
     std::filesystem::path assetBrowserSelectionAnchor; 
     Guid currentEditingAnimationClipGuid; 
     Guid currentEditingAnimationControllerGuid; 
+    int animationEditorUndoCaptureFrame = -1000; ///< 动画编辑器最近声明接管撤销/重做快捷键的 ImGui 帧号（工具栏全局撤销据此让路；面板绘制顺序晚于工具栏，需跨帧标记）
     std::unique_ptr<DirectoryNode> assetTreeRoot; 
     DirectoryNode* currentAssetDirectory = nullptr; 
     AssetBrowserViewMode assetBrowserViewMode = AssetBrowserViewMode::Grid; 
@@ -106,5 +108,6 @@ struct EditorContext
     sk_sp<RuntimeTexture> activeBrushPreviewImage; 
     SkRect activeBrushPreviewSourceRect; 
     Guid currentEditingBlueprintGuid; 
+    std::atomic<bool> stepOneFrame{false}; ///< 暂停态单步：模拟线程消费一次后自动清位。
 };
 #endif

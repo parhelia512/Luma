@@ -891,7 +891,10 @@ namespace Systems
                 if (data.defaultTileHandle.Valid()) requiredTileGuids.insert(data.defaultTileHandle.assetGuid);
                 for (const auto& rule : data.rules)
                 {
-                    if (rule.resultTileHandle.Valid()) requiredTileGuids.insert(rule.resultTileHandle.assetGuid);
+                    for (const auto& output : rule.outputs)
+                    {
+                        if (output.tileHandle.Valid()) requiredTileGuids.insert(output.tileHandle.assetGuid);
+                    }
                 }
             }
         }
@@ -995,7 +998,9 @@ namespace Systems
                 }
                 if (ruleMatched)
                 {
-                    selectedTileHandle = rule.resultTileHandle;
+                    // 按格子坐标确定性加权取样，同一格子多次水合结果保持一致；
+                    // 与旧行为一致：规则一旦匹配即覆盖结果（空列表得到无效句柄，该格子不渲染）
+                    selectedTileHandle = PickRuleTileOutput(rule.outputs, coord.x, coord.y);
                     break;
                 }
             }

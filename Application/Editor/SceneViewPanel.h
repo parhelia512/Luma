@@ -65,6 +65,43 @@ private:
         ImVec2 screenPosition;
         float size;
     };
+    /**
+     * @brief 瓦片编辑工具。工具条持久选择，Alt/Ctrl/Shift/I 修饰键作临时覆盖，G 切换填充。
+     */
+    enum class TileTool
+    {
+        Brush,  ///< 笔刷
+        Eraser, ///< 橡皮
+        Line,   ///< 直线
+        Rect,   ///< 矩形
+        Fill,   ///< 油漆桶
+        Picker  ///< 吸管
+    };
+    // Unity 风格变换工具（Q/W/E/R）
+    enum class TransformTool
+    {
+        Select,
+        Move,
+        Rotate,
+        Scale
+    };
+    // 变换 gizmo 上当前被拖拽的手柄
+    enum class GizmoHandle
+    {
+        None,
+        Center,     ///< 中心方块：自由移动 / 等比缩放
+        AxisX,      ///< X 轴手柄
+        AxisY,      ///< Y 轴手柄
+        RotateRing  ///< 旋转圆环
+    };
+    // gizmo 拖拽开始时选中对象的世界变换快照，拖拽全程基于快照计算，避免增量误差累积
+    struct GizmoTarget
+    {
+        Guid guid;
+        ECS::Vector2f startPosition;
+        float startRotation = 0.0f;
+        ECS::Vector2f startScale = {1.0f, 1.0f};
+    };
     entt::entity findEntityByTransform(const ECS::TransformComponent& targetTransform);
     bool isPointInEmptyObject(const ECS::Vector2f& worldPoint, const ECS::TransformComponent& transform);
     void drawSelectionOutlines(const ImVec2& viewportScreenPos, const ImVec2& viewportSize);
@@ -117,6 +154,20 @@ private:
     void drawTilemapGrid(ImDrawList* drawList, const ECS::TransformComponent& tilemapTransform, const ECS::TilemapComponent& tilemap, const
                          ImVec2& viewportScreenPos, const ImVec2& viewportSize);
     void drawTileBrushPreview(ImDrawList* drawList, const ECS::TransformComponent& tilemapTransform, const ECS::TilemapComponent& tilemap);
+    TileTool effectiveTileTool() const;
+    ECS::Vector2i mouseTileCoord(const ECS::TransformComponent& tilemapTransform, const ECS::TilemapComponent& tilemap) const;
+    void tileCellScreenRect(const ECS::TransformComponent& tilemapTransform, const ECS::TilemapComponent& tilemap,
+                            const ECS::Vector2i& coord, ImVec2& outMin, ImVec2& outMax) const;
+    void drawTileCellsPreview(ImDrawList* drawList, const ECS::TransformComponent& tilemapTransform,
+                              const ECS::TilemapComponent& tilemap, const std::vector<ECS::Vector2i>& coords,
+                              ImU32 color);
+    static void collectTileLineCoords(const ECS::Vector2i& from, const ECS::Vector2i& to,
+                                      std::vector<ECS::Vector2i>& outCoords);
+    static void collectTileRectCoords(const ECS::Vector2i& from, const ECS::Vector2i& to,
+                                      std::vector<ECS::Vector2i>& outCoords);
+    void computeTileFillRegion(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& anchor,
+                               std::vector<ECS::Vector2i>& outCoords) const;
+    void drawTileToolbar(ImDrawList* drawList, const ImVec2& viewportScreenPos, const ImVec2& viewportSize);
     entt::entity handleObjectPicking(const ECS::Vector2f& worldMousePos);
     void handleObjectDragging(const ECS::Vector2f& worldMousePos);
     void initiateDragging(const ECS::Vector2f& worldMousePos);
@@ -128,6 +179,17 @@ private:
                               std::vector<UIRectHandle>& outHandles);
     bool handleUIRectHandlePicking(const ECS::Vector2f& worldMousePos);
     void handleUIRectHandleDragging(const ECS::Vector2f& worldMousePos);
+    void handleTransformToolHotkeys();
+    void drawTransformToolbar();
+    void drawTransformGizmo(ImDrawList* drawList);
+    void drawBoxSelection(ImDrawList* drawList);
+    bool handleGizmoHandlePicking(const ECS::Vector2f& worldMousePos);
+    void handleGizmoDragging(const ECS::Vector2f& worldMousePos);
+    void applyWorldTransform(RuntimeGameObject& gameObject, const ECS::Vector2f& worldPosition,
+                             float worldRotation, const ECS::Vector2f& worldScale);
+    bool computeSelectionCenter(ECS::Vector2f& outCenter);
+    bool getEntityWorldBounds(entt::entity entity, ECS::Vector2f& outMin, ECS::Vector2f& outMax);
+    void finalizeBoxSelection(const ECS::Vector2f& worldMousePos);
     void selectSingleObject(const Guid& objectGuid);
     void toggleObjectSelection(const Guid& objectGuid);
     void clearSelection();
@@ -180,6 +242,12 @@ private:
     bool m_isPainting = false; 
     ECS::Vector2i m_paintStartCoord; 
     std::unordered_set<ECS::Vector2i, ECS::Vector2iHash> m_paintedCoordsThisStroke; 
+    TileTool m_activeTileTool = TileTool::Brush; ///< 工具条选中的持久瓦片工具，修饰键仅作临时覆盖。
+    bool m_tileToolbarHovered = false; ///< 鼠标悬停在瓦片工具条上时屏蔽绘制输入。
+    std::vector<ECS::Vector2i> m_fillPreviewCoords; ///< 油漆桶填充预览的缓存区域。
+    ECS::Vector2i m_fillPreviewAnchor; ///< 生成填充预览时的锚点格子。
+    bool m_fillPreviewValid = false; ///< 填充预览缓存有效标记，锚点变化或瓦片数据修改后失效。
+    const void* m_fillPreviewTilemap = nullptr; ///< 生成填充预览时的 Tilemap 组件地址，区分不同对象。
     std::unique_ptr<Particles::ParticleRenderer> m_particleRenderer; 
     std::vector<Guid> m_lastParticleSelection; 
     float m_particlePreviewTime = 0.0f;
@@ -204,5 +272,19 @@ private:
     uint32_t m_debugLayerMask = 0xFFFFFFFF;  ///< 调试时显示的光照层掩码
     float m_snapGridSize = 16.0f;
     bool m_snapEnabled = false;
+    float m_rotationSnapDegrees = 15.0f; ///< 旋转吸附步进（度）
+    TransformTool m_activeTool = TransformTool::Move;
+    GizmoHandle m_activeGizmoHandle = GizmoHandle::None;
+    bool m_isGizmoDragging = false;
+    bool m_gizmoChanged = false; ///< 本次 gizmo 拖拽是否实际改动过变换（决定释放时是否压入撤销）
+    ECS::Vector2f m_gizmoOrigin; ///< 拖拽开始时的 gizmo 原点（选中集世界坐标平均值）
+    ECS::Vector2f m_gizmoDragStartWorld;
+    ImVec2 m_gizmoDragStartScreen;
+    std::vector<GizmoTarget> m_gizmoTargets;
+    float m_gizmoDisplayAngle = 0.0f; ///< 旋转拖拽中鼠标旁显示的角度（度）
+    ECS::Vector2f m_gizmoDisplayScale = {1.0f, 1.0f}; ///< 缩放拖拽中显示的倍数
+    bool m_isBoxSelecting = false;
+    ECS::Vector2f m_boxSelectStartWorld;
+    ImVec2 m_boxSelectStartScreen;
 };
 #endif

@@ -10,27 +10,53 @@
 #include "Profiler.h"
 #include "SceneManager.h"
 #include "Sprite.h"
-#include "Input/Keyboards.h"
 #include "Loaders/TextureLoader.h"
 void AnimationEditorPanel::Initialize(EditorContext* context)
 {
     m_context = context;
     m_textureLoader = std::make_unique<TextureLoader>(*m_context->graphicsBackend);
     m_totalFrames = 60;
+    PopupManager::GetInstance().Register("动画未保存修改", [this]() { this->drawUnsavedChangesPopup(); }, true,
+                                         ImGuiWindowFlags_AlwaysAutoResize);
 }
 void AnimationEditorPanel::Update(float deltaTime)
 {
     PROFILE_FUNCTION();
     if (!m_isVisible)
         return;
-    if (m_context->currentEditingAnimationClipGuid.Valid() &&
-        m_context->currentEditingAnimationClipGuid != m_currentClipGuid)
+    // 确认弹窗被 X 直接关闭（回调不再执行）时视作"取消"，解除挂起状态
+    if (m_pendingCloseAction != PendingCloseAction::None &&
+        ImGui::GetFrameCount() - m_confirmPopupVisibleFrame > 2)
     {
-        openAnimationClipFromContext(m_context->currentEditingAnimationClipGuid);
+        m_pendingCloseAction = PendingCloseAction::None;
+        m_pendingOpenClipGuid = Guid();
     }
-    if (!m_context->currentEditingAnimationClipGuid.Valid() && m_currentClip)
+    const Guid requestedGuid = m_context->currentEditingAnimationClipGuid;
+    if (requestedGuid.Valid() && requestedGuid != m_currentClipGuid)
     {
-        closeCurrentClipFromContext();
+        if (m_currentClip && m_isDirty && m_pendingCloseAction == PendingCloseAction::None)
+        {
+            // 外部请求切换剪辑但有未保存修改：挂起请求并弹确认
+            m_pendingOpenClipGuid = requestedGuid;
+            m_context->currentEditingAnimationClipGuid = m_currentClipGuid;
+            openUnsavedConfirmPopup(PendingCloseAction::OpenOther);
+        }
+        else if (m_pendingCloseAction == PendingCloseAction::None)
+        {
+            openAnimationClipFromContext(requestedGuid);
+        }
+    }
+    if (!requestedGuid.Valid() && m_currentClip)
+    {
+        if (m_isDirty && m_pendingCloseAction == PendingCloseAction::None)
+        {
+            m_context->currentEditingAnimationClipGuid = m_currentClipGuid;
+            openUnsavedConfirmPopup(PendingCloseAction::CloseClip);
+        }
+        else if (m_pendingCloseAction == PendingCloseAction::None)
+        {
+            closeCurrentClipFromContext();
+        }
     }
     updateTargetObject();
     if (m_currentClip)
@@ -40,6 +66,7 @@ void AnimationEditorPanel::Update(float deltaTime)
 }
 void AnimationEditorPanel::Shutdown()
 {
+    restorePreviewTargetState();
     CloseCurrentClip();
 }
 void AnimationEditorPanel::OpenAnimationClip(const Guid& clipGuid)
@@ -71,6 +98,8 @@ void AnimationEditorPanel::openAnimationClipFromContext(const Guid& clipGuid)
     m_currentClipGuid = clipGuid;
     m_currentClipName = m_currentClip->getAnimationClip().Name;
     m_targetObjectGuid = m_currentClip->getAnimationClip().TargetEntityGuid;
+    m_frameRate = m_currentClip->getAnimationClip().FrameRate;
+    m_isLooping = m_currentClip->getAnimationClip().IsLooping;
     m_currentTime = 0.0f;
     m_currentFrame = 0;
     m_totalFrames = 60;
@@ -80,12 +109,16 @@ void AnimationEditorPanel::openAnimationClipFromContext(const Guid& clipGuid)
     }
     m_multiSelectedFrames.clear();
     m_frameEditWindowOpen = false;
+    m_isDirty = false;
+    m_undoStack.clear();
+    m_redoStack.clear();
     LogInfo("打开动画切片进行编辑: {}", m_currentClipName);
 }
 void AnimationEditorPanel::closeCurrentClipFromContext()
 {
     if (!m_currentClip)
         return;
+    restorePreviewTargetState();
     LogInfo("关闭动画切片: {}", m_currentClipName);
     m_currentClip = nullptr;
     m_currentClipGuid = Guid();
@@ -98,9 +131,13 @@ void AnimationEditorPanel::closeCurrentClipFromContext()
     m_isPlaying = false;
     m_multiSelectedFrames.clear();
     m_frameEditWindowOpen = false;
+    m_isDirty = false;
+    m_undoStack.clear();
+    m_redoStack.clear();
 }
 void AnimationEditorPanel::createNewAnimation()
 {
+    closeCurrentClipFromContext();
     AnimationClip newClip;
     newClip.Name = "新动画";
     if (!m_context->selectionList.empty() && m_context->selectionType == SelectionType::GameObject)
@@ -116,10 +153,14 @@ void AnimationEditorPanel::createNewAnimation()
     m_currentClipGuid = newGuid;
     m_currentClipName = newClip.Name;
     m_targetObjectGuid = newClip.TargetEntityGuid;
+    m_frameRate = newClip.FrameRate;
+    m_isLooping = newClip.IsLooping;
     m_currentTime = 0.0f;
     m_currentFrame = 0;
     m_totalFrames = 60;
     m_selectedFrameIndex = -1;
+    // 新建剪辑尚未落盘，标记为脏以便关闭时提示
+    m_isDirty = true;
     m_context->currentEditingAnimationClipGuid = newGuid;
     LogInfo("创建新动画: {}", m_currentClipName);
 }
@@ -149,10 +190,14 @@ void AnimationEditorPanel::drawTargetObjectSelector()
     {
         if (!m_context->selectionList.empty() && m_context->selectionType == SelectionType::GameObject)
         {
+            // 切换目标前还原上一个对象被预览污染的组件状态
+            restorePreviewTargetState();
             m_targetObjectGuid = m_context->selectionList[0];
             if (m_currentClip)
             {
+                pushUndoSnapshot();
                 m_currentClip->getAnimationClip().TargetEntityGuid = m_targetObjectGuid;
+                markDirty();
             }
             LogInfo("设置目标物体为当前选中的物体");
         }
@@ -172,10 +217,17 @@ void AnimationEditorPanel::drawControlPanel()
         ImGui::Text("动画名称:");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(220.0f);
-        if (ImGui::InputText("##AnimationNameEditor", nameBuffer, sizeof(nameBuffer)))
+        const bool nameChanged = ImGui::InputText("##AnimationNameEditor", nameBuffer, sizeof(nameBuffer));
+        if (ImGui::IsItemActivated())
+        {
+            // 开始编辑名称时压栈一次，避免每个字符一条撤销记录
+            pushUndoSnapshot();
+        }
+        if (nameChanged)
         {
             m_currentClipName = nameBuffer;
             m_currentClip->getAnimationClip().Name = m_currentClipName;
+            markDirty();
         }
     }
     else
@@ -190,8 +242,7 @@ void AnimationEditorPanel::drawControlPanel()
     ImGui::SameLine();
     if (ImGui::Button("停止"))
     {
-        m_isPlaying = false;
-        seekToFrame(0);
+        stopPreviewPlayback();
     }
     ImGui::SameLine();
     if (ImGui::Button("前一帧"))
@@ -204,11 +255,35 @@ void AnimationEditorPanel::drawControlPanel()
         seekToFrame(std::min(m_totalFrames - 1, m_currentFrame + 1));
     }
     ImGui::SameLine();
-    ImGui::Checkbox("循环", &m_isLooping);
-    ImGui::SetNextItemWidth(100);
-    if (ImGui::DragFloat("帧率", &m_frameRate, 1.0f, 1.0f, 120.0f, "%.1f"))
+    bool looping = m_isLooping;
+    if (ImGui::Checkbox("循环", &looping))
     {
-        m_frameRate = std::clamp(m_frameRate, 1.0f, 120.0f);
+        if (m_currentClip)
+        {
+            pushUndoSnapshot();
+            m_currentClip->getAnimationClip().IsLooping = looping;
+            markDirty();
+        }
+        m_isLooping = looping;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("洋葱皮", &m_onionSkinEnabled);
+    ImGui::SetNextItemWidth(100);
+    float frameRate = m_frameRate;
+    const bool frameRateChanged = ImGui::DragFloat("帧率", &frameRate, 1.0f, 1.0f, 120.0f, "%.1f");
+    if (m_currentClip && ImGui::IsItemActivated())
+    {
+        // 拖拽帧率为连续操作，按下时压栈一次
+        pushUndoSnapshot();
+    }
+    if (frameRateChanged)
+    {
+        m_frameRate = std::clamp(frameRate, 1.0f, 120.0f);
+        if (m_currentClip)
+        {
+            m_currentClip->getAnimationClip().FrameRate = m_frameRate;
+            markDirty();
+        }
     }
     ImGui::SameLine();
     ImGui::Text("当前帧: %d / %d", m_currentFrame, m_totalFrames);
@@ -275,6 +350,38 @@ void AnimationEditorPanel::drawTimeline()
             ImU32 color = isSelected ? IM_COL32(255, 255, 0, 255) : IM_COL32(255, 100, 100, 255);
             drawList->AddCircleFilled(ImVec2(x, canvasPos.y + (canvasSize.y + rulerHeight) * 0.5f), keyframeRadius,
                                       color);
+        }
+    }
+    if (m_onionSkinEnabled && m_currentClip)
+    {
+        // 洋葱皮降级实现：用光圈高亮播放头前后各最多 2 个关键帧（绿=前、蓝=后，离播放头越近越亮）
+        std::vector<int> sortedKeyframes;
+        sortedKeyframes.reserve(m_currentClip->getAnimationClip().Frames.size());
+        for (const auto& [frameIndex, frameData] : m_currentClip->getAnimationClip().Frames)
+        {
+            sortedKeyframes.push_back(frameIndex);
+        }
+        std::ranges::sort(sortedKeyframes);
+        auto drawOnionRing = [&](int frameIndex, ImU32 ringColor)
+        {
+            float x = canvasPos.x + (static_cast<float>(frameIndex) * pixelsPerFrame) - m_timelineScrollX;
+            if (x < canvasPos.x - keyframeRadius || x > canvasPos.x + canvasSize.x + keyframeRadius) return;
+            drawList->AddCircle(ImVec2(x, canvasPos.y + (canvasSize.y + rulerHeight) * 0.5f),
+                                keyframeRadius + 4.0f, ringColor, 0, 2.0f);
+        };
+        auto firstAfter = std::ranges::upper_bound(sortedKeyframes, m_currentFrame);
+        int drawnAfter = 0;
+        for (auto it = firstAfter; it != sortedKeyframes.end() && drawnAfter < 2; ++it, ++drawnAfter)
+        {
+            drawOnionRing(*it, IM_COL32(100, 160, 255, drawnAfter == 0 ? 220 : 110));
+        }
+        auto firstBefore = std::ranges::lower_bound(sortedKeyframes, m_currentFrame);
+        int drawnBefore = 0;
+        for (auto it = firstBefore; it != sortedKeyframes.begin() && drawnBefore < 2;)
+        {
+            --it;
+            drawOnionRing(*it, IM_COL32(120, 255, 120, drawnBefore == 0 ? 220 : 110));
+            ++drawnBefore;
         }
     }
     ImGui::SetCursorScreenPos(canvasPos);
@@ -458,6 +565,8 @@ void AnimationEditorPanel::drawTimeline()
                 }
                 if (!collision)
                 {
+                    // 拖拽移动是连续操作：仅在松开应用时压栈一次
+                    pushUndoSnapshot();
                     auto& frames = m_currentClip->getAnimationClip().Frames;
                     std::vector<std::pair<int, AnimFrame>> framesToMove;
                     for (int oldIndex : m_dragInitialSelectionState)
@@ -471,6 +580,7 @@ void AnimationEditorPanel::drawTimeline()
                         frames[pair.first] = pair.second;
                         m_multiSelectedFrames.insert(pair.first);
                     }
+                    markDirty();
                     LogInfo("批量移动 {} 个关键帧", framesToMove.size());
                 }
                 else
@@ -502,6 +612,15 @@ void AnimationEditorPanel::drawTimeline()
             m_isBoxSelecting = false;
         }
     }
+    if (m_currentClip && isCanvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+        !m_isDraggingKeyframe && !m_isDraggingPlayhead && !m_isBoxSelecting)
+    {
+        // 记录右键落点：命中关键帧则弹帧菜单，否则弹空白处菜单
+        m_contextMenuFrame = hoveredFrame;
+        m_contextMenuKeyframe = clickedOnFrame;
+        ImGui::OpenPopup("TimelineContextMenu");
+    }
+    drawTimelineContextMenu();
     if (isCanvasHovered && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
     {
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle))
@@ -548,6 +667,7 @@ void AnimationEditorPanel::drawTimeline()
                 if (compInfo)
                 {
                     SceneManager::GetInstance().PushUndoState(scene);
+                    pushUndoSnapshot();
                     if (!targetObject.HasComponent<ECS::SpriteComponent>())
                     {
                         targetObject.AddComponent<ECS::SpriteComponent>();
@@ -569,6 +689,7 @@ void AnimationEditorPanel::drawTimeline()
                     {
                         const AssetHandle& lastHandle = handles[handleCount - 1];
                         spriteComp.textureHandle = lastHandle;
+                        markDirty();
                         LogInfo("通过批量拖拽创建了 {} 个连续的关键帧", keyframesCreated);
                     }
                 }
@@ -583,6 +704,7 @@ void AnimationEditorPanel::drawTimeline()
                 {
                     auto scene = SceneManager::GetInstance().GetCurrentScene();
                     SceneManager::GetInstance().PushUndoState(scene);
+                    pushUndoSnapshot();
                     auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
                     if (!targetObject.HasComponent<ECS::SpriteComponent>())
                     {
@@ -598,6 +720,7 @@ void AnimationEditorPanel::drawTimeline()
                             scene->GetRegistry(), targetObject.GetEntityHandle());
                         m_multiSelectedFrames.clear();
                         m_multiSelectedFrames.insert(hoveredFrame);
+                        markDirty();
                         LogInfo("拖放纹理到第 {} 帧，已记录SpriteComponent", hoveredFrame);
                     }
                 }
@@ -676,14 +799,17 @@ void AnimationEditorPanel::addKeyFrame(int frameIndex)
         LogWarn("帧 {} 已存在关键帧", frameIndex);
         return;
     }
+    pushUndoSnapshot();
     AnimFrame newFrame;
     m_currentClip->getAnimationClip().Frames[frameIndex] = newFrame;
     m_multiSelectedFrames.clear();
     m_multiSelectedFrames.insert(frameIndex);
+    markDirty();
     LogInfo("添加空关键帧: {}", frameIndex);
 }
 void AnimationEditorPanel::removeKeyFrame(int frameIndex)
 {
+    // 不在此处压撤销栈：批量删除等手势由调用方统一压栈一次
     if (!m_currentClip) return;
     auto it = m_currentClip->getAnimationClip().Frames.find(frameIndex);
     if (it == m_currentClip->getAnimationClip().Frames.end())
@@ -693,20 +819,183 @@ void AnimationEditorPanel::removeKeyFrame(int frameIndex)
     }
     m_currentClip->getAnimationClip().Frames.erase(it);
     m_multiSelectedFrames.erase(frameIndex);
+    markDirty();
     LogInfo("删除关键帧: {}", frameIndex);
 }
-void AnimationEditorPanel::copyFrameData(int fromFrame, int toFrame)
+void AnimationEditorPanel::removeSelectedKeyFrames()
 {
-    if (!m_currentClip)
-        return;
-    auto fromIt = m_currentClip->getAnimationClip().Frames.find(fromFrame);
-    if (fromIt == m_currentClip->getAnimationClip().Frames.end())
+    if (!m_currentClip || m_multiSelectedFrames.empty()) return;
+    pushUndoSnapshot();
+    // removeKeyFrame 会修改选中集合，先拷贝一份再遍历
+    std::vector<int> framesToRemove(m_multiSelectedFrames.begin(), m_multiSelectedFrames.end());
+    for (int frameIndex : framesToRemove)
     {
-        LogWarn("源帧 {} 不存在", fromFrame);
-        return;
+        removeKeyFrame(frameIndex);
     }
-    m_currentClip->getAnimationClip().Frames[toFrame] = fromIt->second;
-    LogInfo("复制帧数据: {} -> {}", fromFrame, toFrame);
+    m_multiSelectedFrames.clear();
+}
+AnimFrame AnimationEditorPanel::cloneFrameData(const AnimFrame& source)
+{
+    AnimFrame result;
+    result.eventTargets = source.eventTargets;
+    for (const auto& [componentName, componentData] : source.animationData)
+    {
+        // YAML::Node 是引用语义，必须 Clone 深拷贝，否则快照会随原数据一同被修改
+        result.animationData[componentName] = YAML::Clone(componentData);
+    }
+    return result;
+}
+AnimationClip AnimationEditorPanel::cloneClipData(const AnimationClip& source)
+{
+    AnimationClip result;
+    result.Name = source.Name;
+    result.TargetEntityGuid = source.TargetEntityGuid;
+    result.FrameRate = source.FrameRate;
+    result.IsLooping = source.IsLooping;
+    for (const auto& [frameIndex, frame] : source.Frames)
+    {
+        result.Frames[frameIndex] = cloneFrameData(frame);
+    }
+    return result;
+}
+void AnimationEditorPanel::pushUndoSnapshot()
+{
+    if (!m_currentClip) return;
+    pushUndoSnapshotFrom(cloneClipData(m_currentClip->getAnimationClip()));
+}
+void AnimationEditorPanel::pushUndoSnapshotFrom(AnimationClip snapshot)
+{
+    constexpr size_t kUndoStackLimit = 64;
+    m_undoStack.push_back(std::move(snapshot));
+    if (m_undoStack.size() > kUndoStackLimit)
+    {
+        m_undoStack.erase(m_undoStack.begin());
+    }
+    m_redoStack.clear();
+}
+void AnimationEditorPanel::performUndo()
+{
+    if (!m_currentClip || m_undoStack.empty()) return;
+    m_redoStack.push_back(cloneClipData(m_currentClip->getAnimationClip()));
+    m_currentClip->getAnimationClip() = std::move(m_undoStack.back());
+    m_undoStack.pop_back();
+    afterClipDataRestored();
+    LogInfo("动画编辑器: 撤销");
+}
+void AnimationEditorPanel::performRedo()
+{
+    if (!m_currentClip || m_redoStack.empty()) return;
+    m_undoStack.push_back(cloneClipData(m_currentClip->getAnimationClip()));
+    m_currentClip->getAnimationClip() = std::move(m_redoStack.back());
+    m_redoStack.pop_back();
+    afterClipDataRestored();
+    LogInfo("动画编辑器: 重做");
+}
+void AnimationEditorPanel::afterClipDataRestored()
+{
+    const AnimationClip& clipData = m_currentClip->getAnimationClip();
+    m_currentClipName = clipData.Name;
+    m_targetObjectGuid = clipData.TargetEntityGuid;
+    m_frameRate = clipData.FrameRate > 0.0f ? clipData.FrameRate : 60.0f;
+    m_isLooping = clipData.IsLooping;
+    m_totalFrames = 60;
+    for (const auto& [frameIndex, frame] : clipData.Frames)
+    {
+        m_totalFrames = std::max(m_totalFrames, frameIndex + 1);
+    }
+    m_currentFrame = std::clamp(m_currentFrame, 0, m_totalFrames - 1);
+    // 丢弃指向已不存在关键帧的选中项
+    for (auto it = m_multiSelectedFrames.begin(); it != m_multiSelectedFrames.end();)
+    {
+        if (!clipData.Frames.contains(*it))
+        {
+            it = m_multiSelectedFrames.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    markDirty();
+}
+void AnimationEditorPanel::markDirty()
+{
+    m_isDirty = true;
+}
+void AnimationEditorPanel::copySelectedFrames()
+{
+    if (!m_currentClip || m_multiSelectedFrames.empty()) return;
+    const auto& frames = m_currentClip->getAnimationClip().Frames;
+    // std::set 有序，首元素即最小选中帧，作为相对偏移基准
+    const int baseFrame = *m_multiSelectedFrames.begin();
+    m_copiedFrames.clear();
+    for (int frameIndex : m_multiSelectedFrames)
+    {
+        auto it = frames.find(frameIndex);
+        if (it == frames.end()) continue;
+        m_copiedFrames.emplace_back(frameIndex - baseFrame, cloneFrameData(it->second));
+    }
+    LogInfo("复制 {} 个关键帧", m_copiedFrames.size());
+}
+void AnimationEditorPanel::pasteFramesAt(int targetFrame)
+{
+    if (!m_currentClip || m_copiedFrames.empty()) return;
+    targetFrame = std::max(0, targetFrame);
+    pushUndoSnapshot();
+    auto& frames = m_currentClip->getAnimationClip().Frames;
+    m_multiSelectedFrames.clear();
+    for (const auto& [offset, frameData] : m_copiedFrames)
+    {
+        int destIndex = targetFrame + offset;
+        // 再次克隆，保证多次粘贴产生的帧互不共享节点
+        frames[destIndex] = cloneFrameData(frameData);
+        m_multiSelectedFrames.insert(destIndex);
+        m_totalFrames = std::max(m_totalFrames, destIndex + 1);
+    }
+    markDirty();
+    LogInfo("粘贴 {} 个关键帧到第 {} 帧", m_copiedFrames.size(), targetFrame);
+}
+void AnimationEditorPanel::drawTimelineContextMenu()
+{
+    if (ImGui::BeginPopup("TimelineContextMenu"))
+    {
+        if (m_contextMenuKeyframe != -1)
+        {
+            // 右键未选中的帧时改选它，使复制/删除作用范围直观
+            if (!m_multiSelectedFrames.count(m_contextMenuKeyframe))
+            {
+                m_multiSelectedFrames.clear();
+                m_multiSelectedFrames.insert(m_contextMenuKeyframe);
+            }
+            const size_t selectedCount = m_multiSelectedFrames.size();
+            std::string copyLabel = selectedCount > 1 ? std::format("复制选中的 {} 帧", selectedCount) : "复制帧";
+            std::string deleteLabel = selectedCount > 1 ? std::format("删除选中的 {} 帧", selectedCount) : "删除帧";
+            if (ImGui::MenuItem(copyLabel.c_str()))
+            {
+                copySelectedFrames();
+            }
+            if (ImGui::MenuItem(deleteLabel.c_str()))
+            {
+                removeSelectedKeyFrames();
+            }
+            if (ImGui::MenuItem("跳到该帧"))
+            {
+                seekToFrame(m_contextMenuKeyframe);
+            }
+        }
+        else
+        {
+            if (ImGui::MenuItem("粘贴到此处", nullptr, false, !m_copiedFrames.empty()))
+            {
+                pasteFramesAt(m_contextMenuFrame);
+            }
+            if (ImGui::MenuItem("在此添加关键帧", nullptr, false, hasValidTargetObject()))
+            {
+                addKeyFrameFromCurrentObject(m_contextMenuFrame);
+            }
+        }
+        ImGui::EndPopup();
+    }
 }
 void AnimationEditorPanel::saveCurrentClip()
 {
@@ -737,6 +1026,7 @@ void AnimationEditorPanel::saveCurrentClip()
     std::string content = YAML::Dump(YAML::convert<AnimationClip>::encode(clipData));
     fout << content;
     fout.close();
+    m_isDirty = false;
     LogInfo("保存动画切片: {} (包含 {} 个关键帧)", clipData.Name, clipData.Frames.size());
 }
 void AnimationEditorPanel::centerTimelineOnCurrentFrame()
@@ -767,6 +1057,8 @@ void AnimationEditorPanel::applyFrameToObject(int frameIndex)
     auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
     if (!targetObject.IsValid())
         return;
+    // 首次向对象写入预览帧前备份其组件状态，停止/关闭/切换时精确还原
+    backupPreviewTargetState();
     const AnimFrame& frame = frameIt->second;
     auto& registry = ComponentRegistry::GetInstance();
     for (const auto& [componentName, componentData] : frame.animationData)
@@ -787,6 +1079,89 @@ void AnimationEditorPanel::applyFrameToObject(int frameIndex)
             }
         }
     }
+}
+void AnimationEditorPanel::backupPreviewTargetState()
+{
+    if (m_hasPreviewBackup && m_previewBackupObjectGuid == m_targetObjectGuid)
+        return;
+    // 目标对象变了：先把上一个对象还原，再为新对象建快照
+    restorePreviewTargetState();
+    if (!m_currentClip || !hasValidTargetObject())
+        return;
+    auto scene = SceneManager::GetInstance().GetCurrentScene();
+    auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
+    // 备份范围取剪辑所有帧涉及的组件并集，保证任意帧的写入都可还原
+    std::set<std::string> affectedComponents;
+    for (const auto& [frameIndex, frame] : m_currentClip->getAnimationClip().Frames)
+    {
+        for (const auto& [componentName, componentData] : frame.animationData)
+        {
+            affectedComponents.insert(componentName);
+        }
+    }
+    if (affectedComponents.empty())
+        return;
+    auto& registry = ComponentRegistry::GetInstance();
+    auto& sceneRegistry = scene->GetRegistry();
+    auto entityHandle = targetObject.GetEntityHandle();
+    m_previewComponentBackup.clear();
+    for (const auto& componentName : affectedComponents)
+    {
+        const auto* componentInfo = registry.Get(componentName);
+        if (componentInfo && componentInfo->serialize && componentInfo->has(sceneRegistry, entityHandle))
+        {
+            m_previewComponentBackup[componentName] = componentInfo->serialize(sceneRegistry, entityHandle);
+        }
+    }
+    if (m_previewComponentBackup.empty())
+        return;
+    m_previewBackupObjectGuid = m_targetObjectGuid;
+    m_hasPreviewBackup = true;
+}
+void AnimationEditorPanel::restorePreviewTargetState()
+{
+    if (!m_hasPreviewBackup)
+        return;
+    m_hasPreviewBackup = false;
+    auto scene = SceneManager::GetInstance().GetCurrentScene();
+    if (scene)
+    {
+        auto targetObject = scene->FindGameObjectByGuid(m_previewBackupObjectGuid);
+        if (targetObject.IsValid())
+        {
+            auto& registry = ComponentRegistry::GetInstance();
+            for (const auto& [componentName, componentData] : m_previewComponentBackup)
+            {
+                const auto* componentInfo = registry.Get(componentName);
+                if (componentInfo && componentInfo->deserialize)
+                {
+                    try
+                    {
+                        componentInfo->deserialize(scene->GetRegistry(), targetObject.GetEntityHandle(),
+                                                   componentData);
+                        EventBus::GetInstance().Publish(ComponentUpdatedEvent{
+                            scene->GetRegistry(), targetObject.GetEntityHandle()
+                        });
+                    }
+                    catch (const std::exception& e)
+                    {
+                        LogError("还原预览组件状态失败 {}: {}", componentName, e.what());
+                    }
+                }
+            }
+            LogInfo("已还原预览目标对象的组件状态");
+        }
+    }
+    m_previewComponentBackup.clear();
+    m_previewBackupObjectGuid = Guid();
+}
+void AnimationEditorPanel::stopPreviewPlayback()
+{
+    // 停止预览：还原对象到进入预览前的状态，播放头归零但不再应用帧（避免重新污染）
+    m_isPlaying = false;
+    restorePreviewTargetState();
+    m_currentFrame = 0;
+    m_currentTime = 0.0f;
 }
 void AnimationEditorPanel::updateTargetObject()
 {
@@ -941,6 +1316,8 @@ void AnimationEditorPanel::createKeyFrameWithSelectedComponents()
         LogWarn("没有选择任何组件，无法创建关键帧");
         return;
     }
+    pushUndoSnapshot();
+    markDirty();
     bool frameExists = m_currentClip->getAnimationClip().Frames.find(m_pendingFrameIndex) != m_currentClip->
         getAnimationClip().Frames.end();
     AnimFrame& frame = m_currentClip->getAnimationClip().Frames[m_pendingFrameIndex];
@@ -998,6 +1375,9 @@ void AnimationEditorPanel::drawFrameEditor()
     ImGui::Text("编辑帧 %d", m_editingFrameIndex);
     ImGui::Separator();
     AnimFrame& frame = it->second;
+    // 帧编辑器里的控件原地修改数据，先克隆前置状态，本帧发生修改时统一压栈一次
+    AnimationClip preEditState = cloneClipData(m_currentClip->getAnimationClip());
+    bool clipMutated = false;
     if (ImGui::CollapsingHeader("组件数据", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Text("此帧记录了 %zu 个组件的数据:", frame.animationData.size());
@@ -1020,6 +1400,7 @@ void AnimationEditorPanel::drawFrameEditor()
                 if (ImGui::Button("删除组件数据"))
                 {
                     animDataIt = frame.animationData.erase(animDataIt);
+                    clipMutated = true;
                     ImGui::TreePop();
                     continue;
                 }
@@ -1093,6 +1474,10 @@ void AnimationEditorPanel::drawFrameEditor()
                                 refreshedCount++;
                             }
                         }
+                        if (refreshedCount > 0)
+                        {
+                            clipMutated = true;
+                        }
                         LogInfo("刷新了 {} 个组件的数据", refreshedCount);
                     }
                 }
@@ -1123,6 +1508,7 @@ void AnimationEditorPanel::drawFrameEditor()
                 {
                     target.targetComponentName = "ScriptComponent";
                     target.targetMethodName.clear();
+                    clipMutated = true;
                     m_context->uiCallbacks->onValueChanged.Invoke();
                 }
                 ImGui::Text("组件名称: ScriptComponent");
@@ -1156,6 +1542,7 @@ void AnimationEditorPanel::drawFrameEditor()
                         if (ImGui::Selectable(methodDisplay.c_str(), isSelected))
                         {
                             target.targetMethodName = methodName;
+                            clipMutated = true;
                             m_context->uiCallbacks->onValueChanged.Invoke();
                         }
                         if (isSelected) ImGui::SetItemDefaultFocus();
@@ -1174,11 +1561,18 @@ void AnimationEditorPanel::drawFrameEditor()
         for (int i = static_cast<int>(indicesToRemove.size()) - 1; i >= 0; --i)
         {
             frame.eventTargets.erase(frame.eventTargets.begin() + indicesToRemove[i]);
+            clipMutated = true;
         }
         if (ImGui::Button("添加动画事件"))
         {
             addEventTarget(frame);
+            clipMutated = true;
         }
+    }
+    if (clipMutated)
+    {
+        pushUndoSnapshotFrom(std::move(preEditState));
+        markDirty();
     }
     ImGui::Separator();
     if (ImGui::Button("确认"))
@@ -1217,24 +1611,43 @@ void AnimationEditorPanel::removeEventTarget(AnimFrame& frame, size_t index)
 void AnimationEditorPanel::handleShortcutInput()
 {
     if (!m_isFocused) return;
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::S.IsPressed())
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput)
+    {
+        return; // 正在文本输入，快捷键留给输入框
+    }
+    // 边沿触发，修复按住 Ctrl+S 每帧连发写盘
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
     {
         saveCurrentClip();
     }
-    if (Keyboard::Delete.IsPressed())
+    if (m_currentClip && !ImGui::IsAnyItemActive())
     {
-        if (m_multiSelectedFrames.size() == 1)
+        // 面板聚焦时优先处理剪辑数据撤销/重做（工具栏全局撤销已通过帧号标记让路）
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
         {
-            removeKeyFrame(*m_multiSelectedFrames.begin());
+            performUndo();
         }
-        else if (m_multiSelectedFrames.size() > 1)
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z) ||
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y))
         {
-            for (int frameIndex : m_multiSelectedFrames)
-            {
-                removeKeyFrame(frameIndex);
-            }
-            m_multiSelectedFrames.clear();
+            performRedo();
         }
+    }
+    if (m_currentClip)
+    {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C))
+        {
+            copySelectedFrames();
+        }
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_V))
+        {
+            pasteFramesAt(m_currentFrame);
+        }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+    {
+        removeSelectedKeyFrames();
     }
 }
 void AnimationEditorPanel::drawEventEditor()
@@ -1267,6 +1680,8 @@ void AnimationEditorPanel::drawEventEditor()
     ECS::SerializableEventTarget& target = frame.eventTargets[m_editingEventIndex];
     ImGui::Text("编辑帧 %d 的事件 %d", m_editingFrameIndex, m_editingEventIndex);
     ImGui::Separator();
+    // 与帧编辑器相同：先克隆前置状态，本帧发生修改时统一压栈
+    AnimationClip preEditState = cloneClipData(m_currentClip->getAnimationClip());
     bool changed = false;
     if (CustomDrawing::WidgetDrawer<Guid>::Draw("目标实体", target.targetEntityGuid, *m_context->uiCallbacks))
     {
@@ -1396,6 +1811,7 @@ void AnimationEditorPanel::drawEventEditor()
         }
     }
     ImGui::Separator();
+    bool eventDeleted = false;
     if (ImGui::Button("保存"))
     {
         if (changed)
@@ -1415,7 +1831,13 @@ void AnimationEditorPanel::drawEventEditor()
         frame.eventTargets.erase(frame.eventTargets.begin() + m_editingEventIndex);
         m_context->uiCallbacks->onValueChanged.Invoke();
         m_eventEditorOpen = false;
+        eventDeleted = true;
         LogInfo("删除动画事件目标");
+    }
+    if (changed || eventDeleted)
+    {
+        pushUndoSnapshotFrom(std::move(preEditState));
+        markDirty();
     }
     ImGui::End();
 }
@@ -1428,7 +1850,9 @@ void AnimationEditorPanel::Draw()
         ImGui::SetNextWindowFocus();
         m_requestFocus = false;
     }
-    if (ImGui::Begin(GetPanelName(), &m_isVisible, ImGuiWindowFlags_MenuBar))
+    // 脏标记显示在标题，###后缀保持窗口 ID 稳定（不破坏停靠布局）
+    std::string windowTitle = std::string(GetPanelName()) + (m_isDirty ? " *" : "") + "###动画编辑器";
+    if (ImGui::Begin(windowTitle.c_str(), &m_isVisible, ImGuiWindowFlags_MenuBar))
     {
         m_isFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         if (ImGui::BeginMenuBar())
@@ -1436,30 +1860,37 @@ void AnimationEditorPanel::Draw()
             if (ImGui::BeginMenu("文件"))
             {
                 if (ImGui::MenuItem("保存", "Ctrl+S", false, m_currentClip != nullptr)) { saveCurrentClip(); }
-                if (ImGui::MenuItem("关闭", "Ctrl+W", false, m_currentClip != nullptr)) { CloseCurrentClip(); }
-                if (ImGui::MenuItem("新建动画", "Ctrl+N")) { createNewAnimation(); }
+                if (ImGui::MenuItem("关闭", "Ctrl+W", false, m_currentClip != nullptr)) { requestCloseClip(); }
+                if (ImGui::MenuItem("新建动画", "Ctrl+N")) { requestNewAnimation(); }
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("编辑"))
             {
                 bool hasSelection = !m_multiSelectedFrames.empty();
+                if (ImGui::MenuItem("撤销", "Ctrl+Z", false, !m_undoStack.empty()))
+                {
+                    performUndo();
+                }
+                if (ImGui::MenuItem("重做", "Ctrl+Shift+Z", false, !m_redoStack.empty()))
+                {
+                    performRedo();
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem("添加关键帧", "K", false, hasValidTargetObject()))
                 {
                     addKeyFrameFromCurrentObject(m_currentFrame);
                 }
                 if (ImGui::MenuItem("删除关键帧", "Delete", false, hasSelection))
                 {
-                    for (int frameIndex : m_multiSelectedFrames) removeKeyFrame(frameIndex);
-                    m_multiSelectedFrames.clear();
+                    removeSelectedKeyFrames();
                 }
                 if (ImGui::MenuItem("复制帧数据", "Ctrl+C", false, hasSelection))
                 {
-                    m_copiedFrameIndex = *m_multiSelectedFrames.begin();
-                    m_hasFrameDataToCopy = true;
+                    copySelectedFrames();
                 }
-                if (ImGui::MenuItem("粘贴帧数据", "Ctrl+V", false, m_hasFrameDataToCopy && m_currentFrame >= 0))
+                if (ImGui::MenuItem("粘贴帧数据", "Ctrl+V", false, !m_copiedFrames.empty() && m_currentFrame >= 0))
                 {
-                    copyFrameData(m_copiedFrameIndex, m_currentFrame);
+                    pasteFramesAt(m_currentFrame);
                 }
                 ImGui::EndMenu();
             }
@@ -1468,8 +1899,7 @@ void AnimationEditorPanel::Draw()
                 if (ImGui::MenuItem(m_isPlaying ? "暂停" : "播放", "Space")) { m_isPlaying = !m_isPlaying; }
                 if (ImGui::MenuItem("停止", "Shift+Space"))
                 {
-                    m_isPlaying = false;
-                    seekToFrame(0);
+                    stopPreviewPlayback();
                 }
                 if (ImGui::MenuItem("跳到开头", "Home")) { seekToFrame(0); }
                 if (ImGui::MenuItem("跳到结尾", "End")) { seekToFrame(m_totalFrames - 1); }
@@ -1498,6 +1928,26 @@ void AnimationEditorPanel::Draw()
         }
     }
     ImGui::End();
+    if (!m_isVisible)
+    {
+        // 用户点了窗口 X：有未保存修改时先弹确认，否则直接还原预览并停止播放
+        if (m_currentClip && m_isDirty && m_pendingCloseAction == PendingCloseAction::None)
+        {
+            m_isVisible = true;
+            m_isPlaying = false;
+            openUnsavedConfirmPopup(PendingCloseAction::HidePanel);
+        }
+        else if (m_pendingCloseAction == PendingCloseAction::None)
+        {
+            m_isPlaying = false;
+            restorePreviewTargetState();
+        }
+    }
+    if (m_isVisible && m_isFocused && m_currentClip)
+    {
+        // 声明本面板接管撤销/重做快捷键（工具栏在下一帧让路）
+        m_context->animationEditorUndoCaptureFrame = ImGui::GetFrameCount();
+    }
     handleShortcutInput();
     if (m_frameEditWindowOpen) { drawFrameEditor(); }
     if (m_componentSelectorOpen) { drawComponentSelector(); }
@@ -1526,14 +1976,13 @@ void AnimationEditorPanel::drawPropertiesPanel()
             ImGui::SameLine();
             if (ImGui::Button("删除关键帧"))
             {
-                removeKeyFrame(selectedFrame);
+                removeSelectedKeyFrames();
                 return;
             }
             ImGui::SameLine();
             if (ImGui::Button("复制帧"))
             {
-                m_copiedFrameIndex = selectedFrame;
-                m_hasFrameDataToCopy = true;
+                copySelectedFrames();
             }
             ImGui::SameLine();
             if (ImGui::Button("应用到物体"))
@@ -1561,11 +2010,12 @@ void AnimationEditorPanel::drawPropertiesPanel()
         ImGui::Text("已选择 %zu 个关键帧", m_multiSelectedFrames.size());
         if (ImGui::Button("删除所有选中的关键帧"))
         {
-            for (int frameIndex : m_multiSelectedFrames)
-            {
-                removeKeyFrame(frameIndex);
-            }
-            m_multiSelectedFrames.clear();
+            removeSelectedKeyFrames();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("复制选中帧"))
+        {
+            copySelectedFrames();
         }
     }
     else
@@ -1594,12 +2044,123 @@ void AnimationEditorPanel::drawPropertiesPanel()
                 ImGui::Text("请先设置目标物体");
             }
         }
-        if (m_hasFrameDataToCopy)
+        if (!m_copiedFrames.empty())
         {
             if (ImGui::Button("粘贴帧数据"))
             {
-                copyFrameData(m_copiedFrameIndex, m_currentFrame);
+                pasteFramesAt(m_currentFrame);
             }
         }
+    }
+}
+void AnimationEditorPanel::openUnsavedConfirmPopup(PendingCloseAction action)
+{
+    m_pendingCloseAction = action;
+    m_isPlaying = false;
+    m_confirmPopupVisibleFrame = ImGui::GetFrameCount();
+    PopupManager::GetInstance().Open("动画未保存修改");
+}
+void AnimationEditorPanel::drawUnsavedChangesPopup()
+{
+    // 弹窗可见帧号持续刷新；若用户用 X 关掉弹窗，Update 里检测到帧号过期即视作取消
+    m_confirmPopupVisibleFrame = ImGui::GetFrameCount();
+    ImGui::Text("动画 \"%s\" 有未保存的修改。", m_currentClipName.c_str());
+    ImGui::Separator();
+    if (ImGui::Button("保存", ImVec2(80, 0)))
+    {
+        saveCurrentClip();
+        executePendingCloseAction();
+        PopupManager::GetInstance().Close("动画未保存修改");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("丢弃", ImVec2(80, 0)))
+    {
+        discardCurrentClipChanges();
+        executePendingCloseAction();
+        PopupManager::GetInstance().Close("动画未保存修改");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消", ImVec2(80, 0)))
+    {
+        m_pendingCloseAction = PendingCloseAction::None;
+        m_pendingOpenClipGuid = Guid();
+        PopupManager::GetInstance().Close("动画未保存修改");
+    }
+}
+void AnimationEditorPanel::discardCurrentClipChanges()
+{
+    if (!m_currentClip)
+        return;
+    // 剪辑实例被运行时缓存共享，丢弃时从资产元数据（磁盘版本）恢复数据，避免未保存修改残留
+    const AssetMetadata* meta = AssetManager::GetInstance().GetMetadata(m_currentClipGuid);
+    if (meta && meta->importerSettings.IsDefined())
+    {
+        try
+        {
+            m_currentClip->getAnimationClip() = meta->importerSettings.as<AnimationClip>();
+            // 同步面板镜像字段（名称/帧率/循环/选中集）；其内部的置脏随后被清除
+            afterClipDataRestored();
+        }
+        catch (const std::exception& e)
+        {
+            LogError("丢弃修改时恢复动画数据失败: {}", e.what());
+        }
+    }
+    m_undoStack.clear();
+    m_redoStack.clear();
+    m_isDirty = false;
+}
+void AnimationEditorPanel::executePendingCloseAction()
+{
+    const PendingCloseAction action = m_pendingCloseAction;
+    m_pendingCloseAction = PendingCloseAction::None;
+    switch (action)
+    {
+    case PendingCloseAction::HidePanel:
+        m_isPlaying = false;
+        restorePreviewTargetState();
+        m_isVisible = false;
+        break;
+    case PendingCloseAction::CloseClip:
+        m_context->currentEditingAnimationClipGuid = Guid();
+        closeCurrentClipFromContext();
+        break;
+    case PendingCloseAction::OpenOther:
+        {
+            const Guid targetGuid = m_pendingOpenClipGuid;
+            m_context->currentEditingAnimationClipGuid = targetGuid;
+            openAnimationClipFromContext(targetGuid);
+            break;
+        }
+    case PendingCloseAction::NewClip:
+        createNewAnimation();
+        break;
+    default:
+        break;
+    }
+    m_pendingOpenClipGuid = Guid();
+}
+void AnimationEditorPanel::requestCloseClip()
+{
+    if (!m_currentClip)
+        return;
+    if (m_isDirty)
+    {
+        openUnsavedConfirmPopup(PendingCloseAction::CloseClip);
+    }
+    else
+    {
+        CloseCurrentClip();
+    }
+}
+void AnimationEditorPanel::requestNewAnimation()
+{
+    if (m_currentClip && m_isDirty)
+    {
+        openUnsavedConfirmPopup(PendingCloseAction::NewClip);
+    }
+    else
+    {
+        createNewAnimation();
     }
 }

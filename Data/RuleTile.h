@@ -7,6 +7,7 @@
 #include "Tile.h"
 #include <array>
 #include <vector>
+#include <cstdint>
 
 /**
  * @brief 定义了邻居瓦片的规则类型。
@@ -18,13 +19,52 @@ enum class NeighborRule {
 };
 
 /**
- * @brief 定义了一个瓦片规则，包含满足规则时生成的结果瓦片句柄和周围邻居的规则。
+ * @brief 规则匹配后的一个候选结果瓦片及其随机权重。
+ */
+struct RuleTileOutput
+{
+    AssetHandle tileHandle; ///< 候选结果瓦片的资源句柄。
+    float weight = 1.0f;    ///< 加权随机取样的权重，非正值不参与取样。
+};
+
+/**
+ * @brief 定义了一个瓦片规则，包含满足规则时的候选结果列表和周围邻居的规则。
  */
 struct Rule
 {
-    AssetHandle resultTileHandle;           ///< 满足规则时生成的结果瓦片的资源句柄。
+    std::vector<RuleTileOutput> outputs;    ///< 满足规则时的候选结果列表（旧版单一 resultTileHandle 反序列化为单元素权重 1）。
     std::array<NeighborRule, 8> neighbors;  ///< 定义了周围8个邻居瓦片的规则。
 };
+
+/**
+ * @brief 按格子坐标从候选列表中确定性加权取样，保证同一格子每次求值结果一致。
+ */
+inline AssetHandle PickRuleTileOutput(const std::vector<RuleTileOutput>& outputs, int x, int y)
+{
+    if (outputs.empty()) return AssetHandle();
+    if (outputs.size() == 1) return outputs[0].tileHandle;
+    float totalWeight = 0.0f;
+    for (const auto& output : outputs)
+    {
+        if (output.weight > 0.0f) totalWeight += output.weight;
+    }
+    if (totalWeight <= 0.0f) return outputs[0].tileHandle;
+    // 坐标哈希后再做一次雪崩混合，避免相邻格子的取样结果出现线性条纹
+    uint32_t h = static_cast<uint32_t>(x) * 73856093u ^ static_cast<uint32_t>(y) * 19349663u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    float sample = (static_cast<float>(h & 0xFFFFFFu) / 16777216.0f) * totalWeight;
+    for (const auto& output : outputs)
+    {
+        if (output.weight <= 0.0f) continue;
+        sample -= output.weight;
+        if (sample < 0.0f) return output.tileHandle;
+    }
+    return outputs.back().tileHandle;
+}
 
 /**
  * @brief 规则瓦片资产的数据结构，用于存储默认瓦片和一系列规则。
@@ -75,6 +115,41 @@ namespace YAML
     };
 
     /**
+     * @brief YAML::Node 到 RuleTileOutput 结构体的转换特化。
+     */
+    template <>
+    struct convert<RuleTileOutput>
+    {
+        /**
+         * @brief 将 RuleTileOutput 结构体编码为 YAML::Node。
+         * @param output 要编码的 RuleTileOutput 结构体。
+         * @return 编码后的 YAML::Node。
+         */
+        static Node encode(const RuleTileOutput& output)
+        {
+            Node node;
+            node["tileHandle"] = output.tileHandle;
+            node["weight"] = output.weight;
+            return node;
+        }
+
+        /**
+         * @brief 将 YAML::Node 解码为 RuleTileOutput 结构体。
+         * @param node 要解码的 YAML::Node。
+         * @param output 解码后的 RuleTileOutput 结构体。
+         * @return 如果解码成功则返回 true，否则返回 false。
+         */
+        static bool decode(const Node& node, RuleTileOutput& output)
+        {
+            if (!node.IsMap() || !node["tileHandle"])
+                return false;
+            output.tileHandle = node["tileHandle"].as<AssetHandle>();
+            output.weight = node["weight"] ? node["weight"].as<float>() : 1.0f;
+            return true;
+        }
+    };
+
+    /**
      * @brief YAML::Node 到 Rule 结构体的转换特化。
      */
     template <>
@@ -88,7 +163,7 @@ namespace YAML
         static Node encode(const Rule& rule)
         {
             Node node;
-            node["resultTileHandle"] = rule.resultTileHandle;
+            node["outputs"] = rule.outputs;
             node["neighbors"] = rule.neighbors;
             return node;
         }
@@ -104,10 +179,26 @@ namespace YAML
             if (!node.IsMap())
                 return false;
 
-            if (!node["resultTileHandle"] || !node["neighbors"])
+            if (!node["neighbors"])
                 return false;
 
-            rule.resultTileHandle = node["resultTileHandle"].as<AssetHandle>();
+            rule.outputs.clear();
+            if (node["outputs"])
+            {
+                rule.outputs = node["outputs"].as<std::vector<RuleTileOutput>>();
+            }
+            else if (node["resultTileHandle"])
+            {
+                // 兼容旧格式：单一结果句柄读入为单元素、权重 1 的列表
+                RuleTileOutput output;
+                output.tileHandle = node["resultTileHandle"].as<AssetHandle>();
+                output.weight = 1.0f;
+                rule.outputs.push_back(output);
+            }
+            else
+            {
+                return false;
+            }
             rule.neighbors = node["neighbors"].as<std::array<NeighborRule, 8>>();
             return true;
         }

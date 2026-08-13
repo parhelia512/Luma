@@ -20,6 +20,7 @@ private:
     void saveCurrentRuleTile();
     void drawRuleList();
 private:
+    void drawRuleOutputs(int ruleIndex);
     void drawRuleGrid(int ruleIndex);
 private:
     EditorContext* m_context = nullptr;

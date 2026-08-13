@@ -5,9 +5,11 @@
 #include "ShaderData.h"
 #include "TextEditor.h"
 #include "Nut/Shader.h" 
+#include "RuntimeAsset/RuntimeWGSLMaterial.h"
 #include "imgui.h"
 #include <string>
 #include <memory>
+#include <optional>
 #include <vector>
 class EditorContext;
 class ShaderEditorPanel : public IEditorPanel
@@ -26,6 +28,14 @@ public:
     void OpenMaterial(const AssetHandle& materialHandle);
     void SaveMaterial();
 private:
+    // 单条编译诊断，editorLine 为映射回编辑器的 0-based 行号，-1 表示无法定位
+    struct CompileMessage
+    {
+        int editorLine = -1;
+        int column = 0;
+        bool isError = true;
+        std::string text;
+    };
     void RenderToolbar();
     void RenderCodeEditor();
     void RenderBindingsPanel();
@@ -33,6 +43,16 @@ private:
     void RenderSettingsPanel();
     void RenderUniformEditor();
     void CompileShader();
+    void CollectCompileDiagnostics(Nut::ShaderModule& module,
+                                   const std::shared_ptr<Nut::NutContext>& nutCtx,
+                                   const std::string& expandedCode,
+                                   const std::string& exportedModuleName);
+    std::vector<int> BuildExpandedLineMap(const std::string& expandedCode,
+                                          const std::string& exportedModuleName) const;
+    void RenderPreviewPanel();
+    void RenderPreviewImage(float width, float height);
+    bool EnsurePreviewResources(const std::shared_ptr<Nut::NutContext>& nutCtx);
+    void RebuildPreviewMaterialIfNeeded();
     void HandleAutoComplete();
     void RenderAutoCompletePopup();
     std::string GetWordUnderCursor() const;
@@ -60,6 +80,8 @@ private:
     bool m_showSettingsPanel = false;
     bool m_compileSuccess = false;
     std::string m_compileOutput;
+    std::vector<CompileMessage> m_compileMessages;
+    std::string m_lastExpandedCode;
     TextEditor m_textEditor;
     std::string m_shaderCodeBuffer;
     bool m_codeChanged = false;
@@ -93,4 +115,17 @@ private:
     int m_selectedUniformIndex = -1;
     bool m_addingUniform = false;
     Data::MaterialUniform m_newUniform;
+    // ---- 实时预览 ----
+    bool m_previewEnabled = false;
+    bool m_previewResourcesReady = false;
+    bool m_previewMaterialDirty = true;
+    std::string m_previewStatus;
+    std::string m_previewShaderCode;
+    std::unique_ptr<RuntimeWGSLMaterial> m_previewMaterial;
+    Nut::TextureAPtr m_previewWhiteTexture;
+    Nut::Buffer m_previewQuadVBO{std::nullopt};
+    Nut::Buffer m_previewQuadIBO{std::nullopt};
+    Nut::Sampler m_previewSampler;
+    float m_previewTime = 0.0f;
+    float m_previewDeltaTime = 0.0f;
 };

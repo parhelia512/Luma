@@ -173,7 +173,9 @@ void PlatformWindow::handleEvent(const SDL_Event& event)
             OnCloseRequest.Invoke();
         }
         break;
-    case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        // 用物理像素尺寸重建交换链：SDL_EVENT_WINDOW_RESIZED 携带的是逻辑尺寸，
+        // 高 DPI 缩放下会导致交换链小于实际窗口（画面被拉伸、右/下边缘内容被裁剪）
         OnResize.Invoke(event.window.data1, event.window.data2);
         break;
     case SDL_EVENT_MOUSE_MOTION:

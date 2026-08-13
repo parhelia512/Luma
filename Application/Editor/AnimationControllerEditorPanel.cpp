@@ -4,8 +4,10 @@
 #include "../Utils/PopupManager.h"
 #include <imgui.h>
 #include <algorithm>
+#include <cmath>
 #include "../Resources/RuntimeAsset/RuntimeScene.h"
 #include "AssetManager.h"
+#include "AnimationControllerComponent.h"
 #include "Path.h"
 #include "Profiler.h"
 #include "Input/Keyboards.h"
@@ -43,7 +45,10 @@ void AnimationControllerEditorPanel::Draw()
         ImGui::SetNextWindowFocus();
         m_requestFocus = false;
     }
-    if (ImGui::Begin(GetPanelName(), &m_isVisible, ImGuiWindowFlags_MenuBar))
+    // 用 ### 固定窗口ID，标题可随脏标记变化而不重置停靠状态
+    std::string windowTitle = std::string(GetPanelName()) + (m_isDirty ? " *" : "") +
+        "###AnimationControllerEditorPanel";
+    if (ImGui::Begin(windowTitle.c_str(), &m_isVisible, ImGuiWindowFlags_MenuBar))
     {
         m_isFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         if (ImGui::BeginMenuBar())
@@ -120,6 +125,14 @@ void AnimationControllerEditorPanel::Draw()
     {
         drawTransitionEditor();
     }
+    if (m_statePropertiesWindowOpen)
+    {
+        drawStatePropertiesWindow();
+    }
+    if (m_deleteVarConfirmOpen)
+    {
+        drawVariableDeleteConfirmWindow();
+    }
 }
 void AnimationControllerEditorPanel::Shutdown()
 {
@@ -147,6 +160,7 @@ void AnimationControllerEditorPanel::OpenAnimationController(const Guid& control
         AssetManager::GetInstance().GetMetadata(controllerGuid)->assetPath.string());
     m_controllerData = m_currentController->GetAnimationControllerData();
     initializeFromControllerData();
+    m_isDirty = false;
     SetVisible(true);
     m_context->currentEditingAnimationControllerGuid = controllerGuid;
     LogInfo("打开动画控制器进行编辑: {}", m_currentControllerName);
@@ -163,6 +177,14 @@ void AnimationControllerEditorPanel::CloseCurrentController()
     m_links.clear();
     m_stateToNodeIndex.clear();
     m_transitionEditWindowOpen = false;
+    m_editingLinkIndex = -1;
+    m_isDirty = false;
+    m_statePropertiesWindowOpen = false;
+    m_renamingNodeId = 0;
+    m_deleteVarConfirmOpen = false;
+    m_pendingDeleteVarIndex = -1;
+    m_pendingDeleteVarName.clear();
+    m_editingVarIndex = -1;
     m_nextNodeId = 1;
     m_nextLinkId = 1;
     m_nextPinId = 1;
@@ -186,6 +208,11 @@ void AnimationControllerEditorPanel::initializeFromControllerData()
     entryNode.color = ImVec4(0.1f, 0.6f, 0.2f, 1.0f);
     entryNode.inputPinId = 0;
     entryNode.outputPinId = getNextPinId();
+    if (auto it = m_controllerData.States.find(entryNode.stateGuid);
+        it != m_controllerData.States.end() && it->second.hasEditorPosition)
+    {
+        entryNode.position = ImVec2(it->second.editorPosX, it->second.editorPosY);
+    }
     m_stateToNodeIndex[entryNode.stateGuid] = static_cast<int>(m_nodes.size());
     m_nodes.push_back(entryNode);
     ANode anyStateNode;
@@ -197,17 +224,22 @@ void AnimationControllerEditorPanel::initializeFromControllerData()
     anyStateNode.color = ImVec4(0.7f, 0.2f, 0.7f, 1.0f);
     anyStateNode.inputPinId = 0;
     anyStateNode.outputPinId = getNextPinId();
+    if (auto it = m_controllerData.States.find(anyStateNode.stateGuid);
+        it != m_controllerData.States.end() && it->second.hasEditorPosition)
+    {
+        anyStateNode.position = ImVec2(it->second.editorPosX, it->second.editorPosY);
+    }
     m_stateToNodeIndex[anyStateNode.stateGuid] = static_cast<int>(m_nodes.size());
     m_nodes.push_back(anyStateNode);
     float nodeSpacing = 250.0f;
     float startX = 350.0f;
     float startY = 100.0f;
     int nodeIndex = 0;
-    for (const auto& [stateGuid, state] : m_controllerData.States)
+    for (auto& [stateGuid, state] : m_controllerData.States)
     {
         if (stateGuid == SpecialStateGuids::Entry() || stateGuid == SpecialStateGuids::AnyState())
             continue;
-        std::string clipName = "状态";
+        std::string clipName;
         for (const auto& [name, guid] : m_controllerData.Clips)
         {
             if (guid == stateGuid)
@@ -219,9 +251,26 @@ void AnimationControllerEditorPanel::initializeFromControllerData()
         ANode node;
         node.id = getNextNodeId();
         node.stateGuid = stateGuid;
-        node.name = clipName;
+        // 旧数据无独立状态名时以剪辑名初始化并写回，保持向后兼容
+        if (state.stateName.empty())
+        {
+            state.stateName = !clipName.empty() ? clipName : "状态";
+        }
+        node.name = state.stateName;
         node.type = NodeType::State;
-        node.position = ImVec2(startX + (nodeIndex % 3) * nodeSpacing, startY + (nodeIndex / 3) * nodeSpacing);
+        node.speed = state.speed;
+        if (state.hasEditorPosition)
+        {
+            node.position = ImVec2(state.editorPosX, state.editorPosY);
+        }
+        else
+        {
+            // 旧数据无位置字段：按网格布局兜底并写回，保存时随 YAML 持久化
+            node.position = ImVec2(startX + (nodeIndex % 3) * nodeSpacing, startY + (nodeIndex / 3) * nodeSpacing);
+            state.editorPosX = node.position.x;
+            state.editorPosY = node.position.y;
+            state.hasEditorPosition = true;
+        }
         node.color = ImVec4(0.4f, 0.4f, 0.5f, 1.0f);
         node.inputPinId = getNextPinId();
         node.outputPinId = getNextPinId();
@@ -246,6 +295,7 @@ void AnimationControllerEditorPanel::initializeFromControllerData()
             link.transitionName = transition.TransitionName;
             link.duration = transition.TransitionDuration;
             link.hasExitTime = transition.hasExitTime;
+            link.exitTime = transition.exitTime;
             link.conditions = transition.Conditions;
             link.priority = transition.priority;
             m_links.push_back(link);
@@ -260,6 +310,12 @@ void AnimationControllerEditorPanel::saveToControllerData()
     for (const ANode& node : m_nodes)
     {
         AnimationState state;
+        state.stateName = node.name;
+        state.speed = node.speed;
+        // node.position 每帧与画布同步，保存时统一读取写入数据
+        state.editorPosX = node.position.x;
+        state.editorPosY = node.position.y;
+        state.hasEditorPosition = true;
         for (const ALink& link : m_links)
         {
             if (link.fromStateGuid == node.stateGuid)
@@ -271,6 +327,7 @@ void AnimationControllerEditorPanel::saveToControllerData()
                 transition.Conditions = link.conditions;
                 transition.priority = link.priority;
                 transition.hasExitTime = link.hasExitTime;
+                transition.exitTime = link.exitTime;
                 state.Transitions.push_back(transition);
             }
         }
@@ -280,6 +337,7 @@ void AnimationControllerEditorPanel::saveToControllerData()
     auto filePath = AssetManager::GetInstance().GetAssetsRootPath() / meta->assetPath;
     std::string content = YAML::Dump(YAML::convert<AnimationControllerData>::encode(m_controllerData));
     Path::WriteFile(filePath.string(), content);
+    m_isDirty = false;
     LogInfo("动画控制器数据已保存");
 }
 void AnimationControllerEditorPanel::drawTransitionEditor()
@@ -304,17 +362,41 @@ void AnimationControllerEditorPanel::drawTransitionEditor()
     if (ImGui::InputText("过渡名称", nameBuffer, sizeof(nameBuffer)))
     {
         link.transitionName = nameBuffer;
+        markDirty();
     }
-    ImGui::DragFloat("持续时间", &link.duration, 0.01f, 0.0f, 10.0f, "%.2fs");
-    ImGui::InputInt("优先级", &link.priority);
-    ImGui::Checkbox("拥有退出时间", &link.hasExitTime);
+    if (ImGui::DragFloat("持续时间", &link.duration, 0.01f, 0.0f, 10.0f, "%.2fs"))
+    {
+        markDirty();
+    }
+    if (ImGui::InputInt("优先级", &link.priority))
+    {
+        markDirty();
+    }
+    if (ImGui::Checkbox("拥有退出时间", &link.hasExitTime))
+    {
+        markDirty();
+    }
     if (ImGui::IsItemHovered())
     {
-        ImGui::SetTooltip("如果勾选，此过渡只会在当前动画播放完毕后才会进行条件检查。\n如果不勾选，则会立即中断当前动画进行过渡。");
+        ImGui::SetTooltip("如果勾选，此过渡只会在当前动画归一化播放进度达到“退出时间”后才会进行条件检查。\n如果不勾选，则会立即中断当前动画进行过渡。");
+    }
+    if (link.hasExitTime)
+    {
+        if (ImGui::SliderFloat("退出时间", &link.exitTime, 0.0f, 1.0f, "%.2f"))
+        {
+            markDirty();
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("归一化播放进度（0-1）达到该值后才允许过渡，1.0 表示动画播放完毕。");
+        }
     }
     ImGui::Separator();
     ImGui::Text("过渡条件");
-    drawConditionEditor(link.conditions);
+    if (drawConditionEditor(link.conditions))
+    {
+        markDirty();
+    }
     if (ImGui::Button("保存"))
     {
         m_transitionEditWindowOpen = false;
@@ -333,6 +415,10 @@ void AnimationControllerEditorPanel::drawNodeContextMenu()
         ANode* contextNode = findNodeById(m_contextNodeId);
         if (contextNode && contextNode->type == NodeType::State)
         {
+            if (ImGui::MenuItem("重命名"))
+            {
+                openStatePropertiesWindow(*contextNode);
+            }
             if (ImGui::MenuItem("删除状态"))
             {
                 deleteNode(m_contextNodeId);
@@ -365,13 +451,14 @@ void AnimationControllerEditorPanel::drawLinkContextMenu()
         ImGui::EndPopup();
     }
 }
-void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>& conditions)
+bool AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>& conditions)
 {
+    bool changed = false;
     for (size_t i = 0; i < conditions.size(); ++i)
     {
         ImGui::PushID(static_cast<int>(i));
         Condition& condition = conditions[i];
-        std::visit([this, &condition, &conditions, i](auto&& arg)
+        std::visit([this, &changed](auto&& arg)
         {
             using T = std::decay_t<decltype(arg)>;
             if constexpr (std::is_same_v<T, FloatCondition>)
@@ -383,7 +470,10 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
                         if (var.Type == VariableType::VariableType_Float)
                         {
                             if (ImGui::Selectable(var.Name.c_str(), arg.VarName == var.Name))
+                            {
                                 arg.VarName = var.Name;
+                                changed = true;
+                            }
                         }
                     }
                     ImGui::EndCombo();
@@ -391,8 +481,12 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
                 const char* floatOps[] = {"大于", "小于"};
                 int currentOp = static_cast<int>(arg.op);
                 if (ImGui::Combo("比较", &currentOp, floatOps, IM_ARRAYSIZE(floatOps)))
+                {
                     arg.op = static_cast<FloatCondition::Comparison>(currentOp);
-                ImGui::DragFloat("值", &arg.Value);
+                    changed = true;
+                }
+                if (ImGui::DragFloat("值", &arg.Value))
+                    changed = true;
             }
             else if constexpr (std::is_same_v<T, BoolCondition>)
             {
@@ -403,7 +497,10 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
                         if (var.Type == VariableType::VariableType_Bool)
                         {
                             if (ImGui::Selectable(var.Name.c_str(), arg.VarName == var.Name))
+                            {
                                 arg.VarName = var.Name;
+                                changed = true;
+                            }
                         }
                     }
                     ImGui::EndCombo();
@@ -411,7 +508,10 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
                 const char* boolOps[] = {"为真", "为假"};
                 int currentOp = static_cast<int>(arg.op);
                 if (ImGui::Combo("比较", &currentOp, boolOps, IM_ARRAYSIZE(boolOps)))
+                {
                     arg.op = static_cast<BoolCondition::Comparison>(currentOp);
+                    changed = true;
+                }
             }
             else if constexpr (std::is_same_v<T, IntCondition>)
             {
@@ -422,7 +522,10 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
                         if (var.Type == VariableType::VariableType_Int)
                         {
                             if (ImGui::Selectable(var.Name.c_str(), arg.VarName == var.Name))
+                            {
                                 arg.VarName = var.Name;
+                                changed = true;
+                            }
                         }
                     }
                     ImGui::EndCombo();
@@ -430,8 +533,12 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
                 const char* intOps[] = {"大于", "小于", "等于", "不等于"};
                 int currentOp = static_cast<int>(arg.op);
                 if (ImGui::Combo("比较", &currentOp, intOps, IM_ARRAYSIZE(intOps)))
+                {
                     arg.op = static_cast<IntCondition::Comparison>(currentOp);
-                ImGui::DragInt("值", &arg.Value);
+                    changed = true;
+                }
+                if (ImGui::DragInt("值", &arg.Value))
+                    changed = true;
             }
             else if constexpr (std::is_same_v<T, TriggerCondition>)
             {
@@ -442,7 +549,10 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
                         if (var.Type == VariableType::VariableType_Trigger)
                         {
                             if (ImGui::Selectable(var.Name.c_str(), arg.VarName == var.Name))
+                            {
                                 arg.VarName = var.Name;
+                                changed = true;
+                            }
                         }
                     }
                     ImGui::EndCombo();
@@ -454,22 +564,35 @@ void AnimationControllerEditorPanel::drawConditionEditor(std::vector<Condition>&
         {
             conditions.erase(conditions.begin() + i);
             ImGui::PopID();
-            return;
+            return true;
         }
         ImGui::Separator();
         ImGui::PopID();
     }
     if (ImGui::Button("添加Float条件"))
+    {
         conditions.emplace_back(FloatCondition{FloatCondition::GreaterThan, "", 0.0f});
+        changed = true;
+    }
     ImGui::SameLine();
     if (ImGui::Button("添加Bool条件"))
+    {
         conditions.emplace_back(BoolCondition{BoolCondition::IsTrue, ""});
+        changed = true;
+    }
     ImGui::SameLine();
     if (ImGui::Button("添加Int条件"))
+    {
         conditions.emplace_back(IntCondition{IntCondition::Equal, "", 0});
+        changed = true;
+    }
     ImGui::SameLine();
     if (ImGui::Button("添加Trigger条件"))
+    {
         conditions.emplace_back(TriggerCondition{""});
+        changed = true;
+    }
+    return changed;
 }
 AnimationControllerEditorPanel::ANode* AnimationControllerEditorPanel::findNodeByStateGuid(const Guid& stateGuid)
 {
@@ -517,10 +640,12 @@ void AnimationControllerEditorPanel::createStateNode(const std::string& name, Im
     else
         newNode.color = ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
     AnimationState newState;
+    newState.stateName = name;
     m_controllerData.States[newNode.stateGuid] = newState;
     m_stateToNodeIndex[newNode.stateGuid] = static_cast<int>(m_nodes.size());
     m_nodes.push_back(newNode);
     m_forceLayoutUpdate = true;
+    markDirty();
     LogInfo("创建新状态节点: {}", name);
 }
 void AnimationControllerEditorPanel::deleteNode(ed::NodeId nodeId)
@@ -528,8 +653,19 @@ void AnimationControllerEditorPanel::deleteNode(ed::NodeId nodeId)
     ANode* nodeToDelete = findNodeById(nodeId);
     if (!nodeToDelete)
         return;
-    m_controllerData.Clips.erase(nodeToDelete->name);
     Guid stateGuidToDelete = nodeToDelete->stateGuid;
+    // 按状态唯一标识清理剪辑映射，状态名与剪辑名解耦后按名删除会误删或漏删
+    for (auto it = m_controllerData.Clips.begin(); it != m_controllerData.Clips.end();)
+    {
+        if (it->second == stateGuidToDelete)
+        {
+            it = m_controllerData.Clips.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
     std::erase_if(m_links,
                   [stateGuidToDelete](const ALink& link)
                   {
@@ -548,6 +684,7 @@ void AnimationControllerEditorPanel::deleteNode(ed::NodeId nodeId)
     {
         m_stateToNodeIndex[m_nodes[i].stateGuid] = static_cast<int>(i);
     }
+    markDirty();
     LogInfo("删除状态节点");
 }
 void AnimationControllerEditorPanel::deleteLink(ed::LinkId linkId)
@@ -557,12 +694,14 @@ void AnimationControllerEditorPanel::deleteLink(ed::LinkId linkId)
                                  {
                                      return link.id == linkId;
                                  }), m_links.end());
+    markDirty();
     LogInfo("删除过渡连接");
 }
 void AnimationControllerEditorPanel::handleShortcutInput()
 {
     if (!m_isFocused) return;
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::S.IsPressed())
+    // 边沿触发，避免按住 Ctrl+S 期间每帧写盘
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
     {
         saveToControllerData();
     }
@@ -582,6 +721,7 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
         newVar.Type = VariableType::VariableType_Float;
         newVar.Value = 0.0f;
         m_controllerData.Variables.push_back(newVar);
+        markDirty();
     }
     ImGui::SameLine();
     if (ImGui::Button("Bool"))
@@ -591,6 +731,7 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
         newVar.Type = VariableType::VariableType_Bool;
         newVar.Value = false;
         m_controllerData.Variables.push_back(newVar);
+        markDirty();
     }
     ImGui::SameLine();
     if (ImGui::Button("Int"))
@@ -600,6 +741,7 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
         newVar.Type = VariableType::VariableType_Int;
         newVar.Value = 0;
         m_controllerData.Variables.push_back(newVar);
+        markDirty();
     }
     ImGui::SameLine();
     if (ImGui::Button("Trigger"))
@@ -609,6 +751,7 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
         newVar.Type = VariableType::VariableType_Trigger;
         newVar.Value = false;
         m_controllerData.Variables.push_back(newVar);
+        markDirty();
     }
     ImGui::Separator();
     if (ImGui::BeginChild("VariablesList"))
@@ -617,13 +760,67 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
         {
             ImGui::PushID(static_cast<int>(i));
             AnimationVariable& var = m_controllerData.Variables[i];
+            // 编辑期间用成员缓冲累积输入，失焦时一次性提交改名，
+            // 避免逐字符改名导致条件引用被中间名污染
+            bool editingThisName = (m_editingVarIndex == static_cast<int>(i));
             char nameBuffer[256];
-            strncpy(nameBuffer, var.Name.c_str(), sizeof(nameBuffer) - 1);
-            nameBuffer[sizeof(nameBuffer) - 1] = '\0';
-            ImGui::SetNextItemWidth(150);
-            if (ImGui::InputText("##VarName", nameBuffer, sizeof(nameBuffer)))
+            char* inputBuffer;
+            size_t inputBufferSize;
+            if (editingThisName)
             {
-                var.Name = nameBuffer;
+                inputBuffer = m_varNameEditBuffer;
+                inputBufferSize = sizeof(m_varNameEditBuffer);
+            }
+            else
+            {
+                strncpy(nameBuffer, var.Name.c_str(), sizeof(nameBuffer) - 1);
+                nameBuffer[sizeof(nameBuffer) - 1] = '\0';
+                inputBuffer = nameBuffer;
+                inputBufferSize = sizeof(nameBuffer);
+            }
+            ImGui::SetNextItemWidth(150);
+            ImGui::InputText("##VarName", inputBuffer, inputBufferSize);
+            if (ImGui::IsItemActivated())
+            {
+                m_editingVarIndex = static_cast<int>(i);
+                strncpy(m_varNameEditBuffer, var.Name.c_str(), sizeof(m_varNameEditBuffer) - 1);
+                m_varNameEditBuffer[sizeof(m_varNameEditBuffer) - 1] = '\0';
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit())
+            {
+                if (m_editingVarIndex == static_cast<int>(i))
+                {
+                    std::string newName = m_varNameEditBuffer;
+                    bool nameTaken = false;
+                    for (size_t j = 0; j < m_controllerData.Variables.size(); ++j)
+                    {
+                        if (j != i && m_controllerData.Variables[j].Name == newName)
+                        {
+                            nameTaken = true;
+                            break;
+                        }
+                    }
+                    if (newName.empty())
+                    {
+                        LogWarn("变量名不能为空，重命名已取消");
+                    }
+                    else if (nameTaken)
+                    {
+                        LogWarn("变量名 {} 已存在，重命名已取消", newName);
+                    }
+                    else if (newName != var.Name)
+                    {
+                        // 同步所有过渡条件中对旧名的引用，避免改名后条件静默失效
+                        renameVariableReferences(var.Name, newName);
+                        var.Name = newName;
+                        markDirty();
+                    }
+                }
+                m_editingVarIndex = -1;
+            }
+            else if (ImGui::IsItemDeactivated() && m_editingVarIndex == static_cast<int>(i))
+            {
+                m_editingVarIndex = -1;
             }
             ImGui::SameLine();
             switch (var.Type)
@@ -631,19 +828,31 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
             case VariableType::VariableType_Float:
                 {
                     float value = std::get<float>(var.Value);
-                    if (ImGui::DragFloat("值", &value)) var.Value = value;
+                    if (ImGui::DragFloat("值", &value))
+                    {
+                        var.Value = value;
+                        markDirty();
+                    }
                     break;
                 }
             case VariableType::VariableType_Bool:
                 {
                     bool value = std::get<bool>(var.Value);
-                    if (ImGui::Checkbox("值", &value)) var.Value = value;
+                    if (ImGui::Checkbox("值", &value))
+                    {
+                        var.Value = value;
+                        markDirty();
+                    }
                     break;
                 }
             case VariableType::VariableType_Int:
                 {
                     int value = std::get<int>(var.Value);
-                    if (ImGui::DragInt("值", &value)) var.Value = value;
+                    if (ImGui::DragInt("值", &value))
+                    {
+                        var.Value = value;
+                        markDirty();
+                    }
                     break;
                 }
             case VariableType::VariableType_Trigger:
@@ -655,9 +864,21 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
             ImGui::SameLine();
             if (ImGui::Button("删除"))
             {
-                m_controllerData.Variables.erase(m_controllerData.Variables.begin() + i);
-                ImGui::PopID();
-                break;
+                int refCount = countVariableReferences(var.Name);
+                if (refCount > 0)
+                {
+                    // 被条件引用时先弹确认，确认后连带删除引用条件
+                    m_pendingDeleteVarIndex = static_cast<int>(i);
+                    m_pendingDeleteVarName = var.Name;
+                    m_deleteVarConfirmOpen = true;
+                }
+                else
+                {
+                    m_controllerData.Variables.erase(m_controllerData.Variables.begin() + i);
+                    markDirty();
+                    ImGui::PopID();
+                    break;
+                }
             }
             ImGui::Separator();
             ImGui::PopID();
@@ -667,6 +888,25 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
 }
 void AnimationControllerEditorPanel::drawNodeEditor()
 {
+    // 播放模式下查询选中实体的运行时播放状态，用于当前/目标状态节点描边高亮
+    bool runtimeStatusValid = false;
+    RuntimeAnimationController::PlaybackStatus runtimeStatus;
+    if (m_context && m_context->editorState == EditorState::Playing &&
+        m_context->selectionType == SelectionType::GameObject &&
+        !m_context->selectionList.empty() && m_context->activeScene)
+    {
+        RuntimeGameObject selectedGO = m_context->activeScene->FindGameObjectByGuid(m_context->selectionList[0]);
+        if (selectedGO.IsValid() && selectedGO.HasComponent<ECS::AnimationControllerComponent>())
+        {
+            auto& animComp = selectedGO.GetComponent<ECS::AnimationControllerComponent>();
+            if (animComp.runtimeController &&
+                animComp.animationController.assetGuid == m_currentControllerGuid)
+            {
+                runtimeStatus = animComp.runtimeController->GetPlaybackStatus();
+                runtimeStatusValid = true;
+            }
+        }
+    }
     ed::SetCurrentEditor(m_nodeEditorContext);
     ed::Begin("AnimationStateMachine");
     if (m_forceLayoutUpdate)
@@ -692,6 +932,23 @@ void AnimationControllerEditorPanel::drawNodeEditor()
     }
     for (auto& node : m_nodes)
     {
+        // 当前状态绿色描边，过渡目标橙色描边
+        bool highlighted = false;
+        if (runtimeStatusValid && node.type == NodeType::State)
+        {
+            if (runtimeStatus.isTransitioning && node.stateGuid == runtimeStatus.targetStateGuid)
+            {
+                ed::PushStyleColor(ed::StyleColor_NodeBorder, ImVec4(1.0f, 0.6f, 0.1f, 1.0f));
+                ed::PushStyleVar(ed::StyleVar_NodeBorderWidth, 3.5f);
+                highlighted = true;
+            }
+            else if (node.stateGuid == runtimeStatus.currentStateGuid)
+            {
+                ed::PushStyleColor(ed::StyleColor_NodeBorder, ImVec4(0.2f, 1.0f, 0.3f, 1.0f));
+                ed::PushStyleVar(ed::StyleVar_NodeBorderWidth, 3.5f);
+                highlighted = true;
+            }
+        }
         ed::BeginNode(node.id);
         ImGui::PushID(node.id.Get());
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0, 0, 0, 1));
@@ -700,6 +957,11 @@ void AnimationControllerEditorPanel::drawNodeEditor()
         {
         }
         ImGui::PopStyleColor(2);
+        if (node.type == NodeType::State && ImGui::IsItemHovered() &&
+            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+        {
+            openStatePropertiesWindow(node);
+        }
         if (node.type == NodeType::State)
         {
             ed::BeginPin(node.inputPinId, ed::PinKind::Input);
@@ -733,7 +995,19 @@ void AnimationControllerEditorPanel::drawNodeEditor()
         }
         ImGui::PopID();
         ed::EndNode();
-        node.position = ed::GetNodePosition(node.id);
+        if (highlighted)
+        {
+            ed::PopStyleVar();
+            ed::PopStyleColor();
+        }
+        // 拖动节点后同步位置并置脏，保存时随数据持久化
+        ImVec2 canvasPosition = ed::GetNodePosition(node.id);
+        if (std::fabs(canvasPosition.x - node.position.x) > 0.01f ||
+            std::fabs(canvasPosition.y - node.position.y) > 0.01f)
+        {
+            node.position = canvasPosition;
+            markDirty();
+        }
     }
     for (const auto& link : m_links)
     {
@@ -766,6 +1040,7 @@ void AnimationControllerEditorPanel::drawNodeEditor()
                         newLink.transitionName = "新过渡";
                         newLink.duration = 0.3f;
                         m_links.push_back(newLink);
+                        markDirty();
                         LogInfo("创建过渡: {} -> {}", startNode->name, endNode->name);
                     }
                 }
@@ -797,6 +1072,12 @@ void AnimationControllerEditorPanel::drawNodeEditor()
     {
         m_editingLinkIndex = static_cast<int>(clickedLink - m_links.data());
         m_transitionEditWindowOpen = true;
+    }
+    ed::NodeId doubleClickedNodeId = ed::GetDoubleClickedNode();
+    if (ANode* doubleClickedNode = findNodeById(doubleClickedNodeId);
+        doubleClickedNode && doubleClickedNode->type == NodeType::State)
+    {
+        openStatePropertiesWindow(*doubleClickedNode);
     }
     ed::Suspend();
     ed::NodeId contextNodeId = 0;
@@ -850,11 +1131,16 @@ void AnimationControllerEditorPanel::handleAnimationClipDrop(const AssetHandle& 
     newNode.outputPinId = getNextPinId();
     newNode.color = newNode.isDefault ? ImVec4(0.0f, 0.0f, 1.0f, 1.0f) : ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
     AnimationState newState;
+    newState.stateName = clipName;
+    newState.editorPosX = nodePosition.x;
+    newState.editorPosY = nodePosition.y;
+    newState.hasEditorPosition = true;
     m_controllerData.States[newNode.stateGuid] = newState;
     m_controllerData.Clips[clipName] = assetHandle.assetGuid;
     m_stateToNodeIndex[newNode.stateGuid] = static_cast<int>(m_nodes.size());
     m_nodes.push_back(newNode);
     m_forceLayoutUpdate = true;
+    markDirty();
     if (m_nodes.size() == 3)
     {
         ANode* entryNode = findNodeByStateGuid(SpecialStateGuids::Entry());
@@ -890,7 +1176,6 @@ void AnimationControllerEditorPanel::handleAnimationClipDropOnNode(const AssetHa
     auto loader = AnimationClipLoader();
     auto clip = loader.LoadAsset(newGuid);
     std::string newClipName = clip->GetName();
-    targetNode.name = newClipName;
     targetNode.stateGuid = newGuid;
     if (m_controllerData.States.count(oldGuid))
     {
@@ -902,10 +1187,12 @@ void AnimationControllerEditorPanel::handleAnimationClipDropOnNode(const AssetHa
     {
         m_controllerData.States[newGuid] = AnimationState();
     }
+    std::string oldClipName;
     for (auto it = m_controllerData.Clips.begin(); it != m_controllerData.Clips.end();)
     {
         if (it->second == oldGuid)
         {
+            oldClipName = it->first;
             it = m_controllerData.Clips.erase(it);
         }
         else
@@ -914,6 +1201,12 @@ void AnimationControllerEditorPanel::handleAnimationClipDropOnNode(const AssetHa
         }
     }
     m_controllerData.Clips[newClipName] = newGuid;
+    // 仅当状态未被用户重命名（仍等于旧剪辑名或为空）时才跟随新剪辑名
+    if (targetNode.name.empty() || targetNode.name == oldClipName)
+    {
+        targetNode.name = newClipName;
+        m_controllerData.States[newGuid].stateName = newClipName;
+    }
     for (ALink& link : m_links)
     {
         if (link.fromStateGuid == oldGuid)
@@ -931,5 +1224,172 @@ void AnimationControllerEditorPanel::handleAnimationClipDropOnNode(const AssetHa
         m_stateToNodeIndex.erase(oldGuid);
         m_stateToNodeIndex[newGuid] = nodeIndex;
     }
+    markDirty();
     LogInfo("将节点 {} 的动画剪辑更新为 {}", targetNode.name, newClipName);
+}
+
+void AnimationControllerEditorPanel::openStatePropertiesWindow(const ANode& node)
+{
+    m_renamingNodeId = node.id;
+    strncpy(m_renameBuffer, node.name.c_str(), sizeof(m_renameBuffer) - 1);
+    m_renameBuffer[sizeof(m_renameBuffer) - 1] = '\0';
+    m_statePropertiesWindowOpen = true;
+}
+
+void AnimationControllerEditorPanel::drawStatePropertiesWindow()
+{
+    ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_Appearing);
+    if (!ImGui::Begin("状态属性", &m_statePropertiesWindowOpen))
+    {
+        ImGui::End();
+        return;
+    }
+    ANode* node = findNodeById(m_renamingNodeId);
+    if (!node || node->type != NodeType::State)
+    {
+        ImGui::Text("无效的状态");
+        ImGui::End();
+        return;
+    }
+    ImGui::InputText("状态名称", m_renameBuffer, sizeof(m_renameBuffer));
+    if (ImGui::DragFloat("播放速度", &node->speed, 0.01f, 0.01f, 10.0f, "%.2fx"))
+    {
+        markDirty();
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("运行时播放该状态动画时乘上的速度倍率。");
+    }
+    if (ImGui::Button("确定"))
+    {
+        std::string newName = m_renameBuffer;
+        if (!newName.empty() && newName != node->name)
+        {
+            node->name = newName;
+            markDirty();
+        }
+        m_statePropertiesWindowOpen = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消"))
+    {
+        m_statePropertiesWindowOpen = false;
+    }
+    ImGui::End();
+}
+
+void AnimationControllerEditorPanel::drawVariableDeleteConfirmWindow()
+{
+    // 索引可能因增删失效，先按“索引+名字”校验，失败则按名字重新定位
+    int varIndex = -1;
+    if (m_pendingDeleteVarIndex >= 0 &&
+        m_pendingDeleteVarIndex < static_cast<int>(m_controllerData.Variables.size()) &&
+        m_controllerData.Variables[m_pendingDeleteVarIndex].Name == m_pendingDeleteVarName)
+    {
+        varIndex = m_pendingDeleteVarIndex;
+    }
+    else
+    {
+        for (size_t i = 0; i < m_controllerData.Variables.size(); ++i)
+        {
+            if (m_controllerData.Variables[i].Name == m_pendingDeleteVarName)
+            {
+                varIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+    if (varIndex < 0)
+    {
+        m_deleteVarConfirmOpen = false;
+        m_pendingDeleteVarIndex = -1;
+        m_pendingDeleteVarName.clear();
+        return;
+    }
+    ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_Appearing);
+    if (!ImGui::Begin("删除变量确认", &m_deleteVarConfirmOpen))
+    {
+        ImGui::End();
+        return;
+    }
+    int refCount = countVariableReferences(m_pendingDeleteVarName);
+    ImGui::TextWrapped("变量 \"%s\" 正被 %d 个过渡条件引用。", m_pendingDeleteVarName.c_str(), refCount);
+    ImGui::TextWrapped("删除该变量将同时删除所有引用它的条件。");
+    ImGui::Separator();
+    if (ImGui::Button("确认删除"))
+    {
+        removeConditionsReferencing(m_pendingDeleteVarName);
+        m_controllerData.Variables.erase(m_controllerData.Variables.begin() + varIndex);
+        markDirty();
+        LogInfo("删除变量 {} 及其 {} 个引用条件", m_pendingDeleteVarName, refCount);
+        m_deleteVarConfirmOpen = false;
+        m_pendingDeleteVarIndex = -1;
+        m_pendingDeleteVarName.clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消"))
+    {
+        m_deleteVarConfirmOpen = false;
+        m_pendingDeleteVarIndex = -1;
+        m_pendingDeleteVarName.clear();
+    }
+    ImGui::End();
+}
+
+void AnimationControllerEditorPanel::renameVariableReferences(const std::string& oldName, const std::string& newName)
+{
+    int updatedCount = 0;
+    for (ALink& link : m_links)
+    {
+        for (Condition& condition : link.conditions)
+        {
+            std::visit([&](auto& arg)
+            {
+                if (arg.VarName == oldName)
+                {
+                    arg.VarName = newName;
+                    ++updatedCount;
+                }
+            }, condition);
+        }
+    }
+    if (updatedCount > 0)
+    {
+        LogInfo("变量重命名 {} -> {}，同步更新 {} 个条件引用", oldName, newName, updatedCount);
+    }
+}
+
+int AnimationControllerEditorPanel::countVariableReferences(const std::string& name) const
+{
+    int count = 0;
+    for (const ALink& link : m_links)
+    {
+        for (const Condition& condition : link.conditions)
+        {
+            std::visit([&](const auto& arg)
+            {
+                if (arg.VarName == name)
+                {
+                    ++count;
+                }
+            }, condition);
+        }
+    }
+    return count;
+}
+
+void AnimationControllerEditorPanel::removeConditionsReferencing(const std::string& name)
+{
+    for (ALink& link : m_links)
+    {
+        std::erase_if(link.conditions, [&name](const Condition& condition)
+        {
+            bool matches = false;
+            std::visit([&](const auto& arg)
+            {
+                matches = (arg.VarName == name);
+            }, condition);
+            return matches;
+        });
+    }
 }

@@ -32,6 +32,22 @@ public:
     IEditorPanel* GetPanelByName(const std::string& name);
     PlatformWindow* GetPlatWindow();
     EditorContext& GetEditorContext() { return m_editorContext; }
+    const std::vector<std::unique_ptr<IEditorPanel>>& GetPanels() const { return m_panels; }
+
+    /**
+     * @brief 请求退出编辑器：有未保存修改时先弹确认，否则直接关闭窗口。
+     */
+    void RequestExit();
+
+    /**
+     * @brief 最近打开的项目列表（最新在前，最多 10 条）。
+     */
+    static std::vector<std::filesystem::path> GetRecentProjects();
+
+    /**
+     * @brief 请求重建默认 Dock 布局（下一帧生效）。
+     */
+    void RequestDockLayoutReset() { m_resetDockLayout = true; }
 
     /**
      * @brief 由入口在启动早期设置：上一编辑器会话是否异常退出（崩溃/强杀）。
@@ -54,6 +70,7 @@ private:
     void drawExitConfirmPopupContent();
     void drawCrashRecoveryPopupContent();
     void checkCrashRecovery();
+    void buildDefaultDockLayout(unsigned int dockspaceId);
     void updateUps(); 
     void updateFps();
 private:
@@ -64,6 +81,7 @@ private:
     std::unique_ptr<SceneRenderer> m_sceneRenderer; 
     std::filesystem::path m_pendingProjectPath; 
     bool m_undoEditActive = false; ///< 连续编辑（拖拽/输入）进行中，撤销快照推迟到编辑结束提交。
+    bool m_resetDockLayout = false; ///< 置位后下一帧重建默认 Dock 布局。
     float m_autosaveTimer = 0.0f; ///< 自动保存计时器（秒）。
     ListenerHandle m_closeRequestListener; ///< 窗口关闭请求监听（未保存确认）。
     std::filesystem::path m_latestAutosavePath; ///< 崩溃恢复提示中展示的最新自动保存文件。

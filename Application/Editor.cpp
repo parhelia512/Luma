@@ -42,6 +42,7 @@
 #include "Editor/ConsolePanel.h"
 #include "Scripting/ScriptMetadataRegistry.h"
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <array>
 #include "Path.h"
@@ -85,13 +86,33 @@ static std::string ExecuteAndCapture(const std::string& command)
     return result;
 }
 
-static void RecordLastEditingProject(const std::filesystem::path& projectPath)
+static std::vector<std::string> ReadRecentProjectLines()
 {
-    std::fstream file("LastProject", std::ios::out);
+    std::vector<std::string> lines;
+    std::ifstream file("LastProject");
     if (file.is_open())
     {
-        file << projectPath.string();
-        file.close();
+        std::string line;
+        while (std::getline(file, line))
+        {
+            if (!line.empty()) lines.push_back(line);
+        }
+    }
+    return lines;
+}
+
+static void RecordLastEditingProject(const std::filesystem::path& projectPath)
+{
+    // 文件格式：每行一个项目路径，最新在前，最多保留 10 条（文件菜单"最近项目"数据源）
+    std::vector<std::string> lines = ReadRecentProjectLines();
+    const std::string current = projectPath.string();
+    std::erase(lines, current);
+    lines.insert(lines.begin(), current);
+    if (lines.size() > 10) lines.resize(10);
+    std::fstream file("LastProject", std::ios::out | std::ios::trunc);
+    if (file.is_open())
+    {
+        for (const auto& line : lines) file << line << "\n";
     }
     else
     {
@@ -101,15 +122,18 @@ static void RecordLastEditingProject(const std::filesystem::path& projectPath)
 
 static std::string GetLastEditingProject()
 {
-    std::ifstream file("LastProject");
-    if (file.is_open())
+    auto lines = ReadRecentProjectLines();
+    return lines.empty() ? "" : lines.front();
+}
+
+std::vector<std::filesystem::path> Editor::GetRecentProjects()
+{
+    std::vector<std::filesystem::path> result;
+    for (const auto& line : ReadRecentProjectLines())
     {
-        std::string path;
-        std::getline(file, path);
-        file.close();
-        return path;
+        result.emplace_back(line);
     }
-    return "";
+    return result;
 }
 
 static void SDLCALL OnProjectFileSelected(void* userdata, const char* const* filelist, int filter)
@@ -260,15 +284,7 @@ void Editor::InitializeDerived()
     // 拦截窗口关闭：场景有未保存修改时先弹确认，避免直接丢弃修改
     m_closeRequestListener = m_window->OnCloseRequest.AddListener([this]()
     {
-        if (m_editorContext.editorState == EditorState::Editing &&
-            SceneManager::GetInstance().IsCurrentSceneDirty())
-        {
-            PopupManager::GetInstance().Open("ExitConfirm");
-        }
-        else
-        {
-            m_window->ForceClose();
-        }
+        RequestExit();
     });
     initializePanels();
     registerPopups();
@@ -291,6 +307,78 @@ void Editor::InitializeDerived()
     m_editorContext.lastUpsUpdateTime = std::chrono::steady_clock::now();
     // 上次会话异常退出时提示从自动保存恢复（依赖项目已加载，故放在初始化末尾）
     checkCrashRecovery();
+}
+
+void Editor::buildDefaultDockLayout(unsigned int dockspaceId)
+{
+    ImGui::DockBuilderRemoveNode(dockspaceId);
+    ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace | ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->WorkSize);
+
+    ImGuiID center = dockspaceId;
+    const ImGuiID left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.18f, nullptr, &center);
+    const ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.26f, nullptr, &center);
+    const ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, nullptr, &center);
+
+    ImGui::DockBuilderDockWindow("层级", left);
+    ImGui::DockBuilderDockWindow("属性", right);
+    ImGui::DockBuilderDockWindow("资产检视器", right);
+    ImGui::DockBuilderDockWindow("资产浏览器", bottom);
+    ImGui::DockBuilderDockWindow("控制台", bottom);
+    ImGui::DockBuilderDockWindow("场景", center);
+    ImGui::DockBuilderDockWindow("游戏视图", center);
+
+    // 其余工具面板（动画/蓝图/瓦片等）统一作为中央区标签页。
+    // 注意：使用动态标题 + "###固定ID" 的面板，DockBuilder 必须用含 ### 的完整 ID 名，
+    // 否则窗口 ID 哈希不匹配、停靠不生效（窗口会浮动在外）。
+    static const char* explicitlyPlaced[] = {
+        "工具栏", "层级", "属性", "资产检视器", "资产浏览器", "控制台", "场景", "游戏视图",
+    };
+    static const std::pair<const char*, const char*> dockNameAliases[] = {
+        {"动画编辑器", "###动画编辑器"},
+        {"蓝图编辑器", "###BlueprintEditor"},
+        {"动画控制器编辑器", "###AnimationControllerEditorPanel"},
+        {"着色器编辑器", "###着色器编辑器"},
+    };
+    for (const auto& panel : m_panels)
+    {
+        const char* name = panel->GetPanelName();
+        bool placed = false;
+        for (const char* known : explicitlyPlaced)
+        {
+            if (std::strcmp(known, name) == 0)
+            {
+                placed = true;
+                break;
+            }
+        }
+        if (placed) continue;
+        const char* dockName = name;
+        for (const auto& [panelName, aliasName] : dockNameAliases)
+        {
+            if (std::strcmp(panelName, name) == 0)
+            {
+                dockName = aliasName;
+                break;
+            }
+        }
+        ImGui::DockBuilderDockWindow(dockName, center);
+    }
+    ImGui::DockBuilderFinish(dockspaceId);
+    LogInfo("已重建默认编辑器布局。");
+}
+
+void Editor::RequestExit()
+{
+    if (m_editorContext.editorState == EditorState::Editing &&
+        SceneManager::GetInstance().IsCurrentSceneDirty())
+    {
+        PopupManager::GetInstance().Open("ExitConfirm");
+    }
+    else
+    {
+        m_window->ForceClose();
+    }
 }
 
 void Editor::initializeEditorContext()
@@ -532,8 +620,13 @@ void Editor::Update(float fixedDeltaTime)
                 m_window->SetTitle(newTitle);
             });
         }
+        bool simulationPaused = m_editorContext.editorState == EditorState::Paused;
+        if (simulationPaused && m_editorContext.stepOneFrame.exchange(false))
+        {
+            simulationPaused = false; // 单步：以非暂停方式推进这一帧后继续停住
+        }
         m_editorContext.activeScene->UpdateSimulation(fixedDeltaTime, *m_editorContext.engineContext,
-                                                      m_editorContext.editorState == EditorState::Paused);
+                                                      simulationPaused);
         if (m_editorContext.editorState == EditorState::Editing)
         {
             // 编辑状态：场景视图用的是编辑器相机，而激活相机（场景相机）可能在别处；
@@ -600,8 +693,25 @@ void Editor::Render()
         PROFILE_SCOPE("ImGui::NewFrame");
         m_imguiRenderer->NewFrame();
     }
-    ImGui::DockSpaceOverViewport(ImGui::GetMainViewport()->ID, ImGui::GetMainViewport(),
-                                 ImGuiDockNodeFlags_PassthruCentralNode);
+    const ImGuiID dockspaceId = ImGui::DockSpaceOverViewport(ImGui::GetMainViewport()->ID, ImGui::GetMainViewport(),
+                                                             ImGuiDockNodeFlags_PassthruCentralNode);
+    // 首次见到该 dockspace（全新安装，节点为空）或用户请求重置布局时，构建默认布局。
+    // 延迟到第 5 帧执行：首帧窗口/视口尺寸尚未稳定，过早构建会得到错误的节点尺寸。
+    static int s_layoutCheckFrame = 0;
+    if (s_layoutCheckFrame <= 5)
+    {
+        ++s_layoutCheckFrame;
+    }
+    if (s_layoutCheckFrame == 5 || m_resetDockLayout)
+    {
+        const ImGuiDockNode* node = ImGui::DockBuilderGetNode(dockspaceId);
+        const bool isVirginNode = node == nullptr || (node->IsLeafNode() && node->Windows.Size == 0);
+        if (m_resetDockLayout || isVirginNode)
+        {
+            buildDefaultDockLayout(dockspaceId);
+        }
+        m_resetDockLayout = false;
+    }
     Profiler::GetInstance().DrawUI();
     {
         // 场景数据锁（段 B）：面板绘制直接读写 registry（检查器编辑、层级操作、gizmo 拾取），

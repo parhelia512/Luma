@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <deque>
 #include "BlueprintNodeRegistry.h"
 namespace ed = ax::NodeEditor;
 namespace std
@@ -80,6 +81,19 @@ private:
         ed::LinkId id; 
         ed::PinId startPinId; 
         ed::PinId endPinId; 
+    };
+    struct ClipboardNode
+    {
+        BlueprintNode data; // 节点源数据副本（含默认值与动态引脚信息）
+        ImVec2 relativePosition; // 相对选区左上角的偏移
+    };
+    struct ClipboardLink
+    {
+        // 剪贴板内部连线，以节点在剪贴板中的下标 + 引脚名表示
+        int fromNodeIndex = -1; 
+        std::string fromPinName; 
+        int toNodeIndex = -1; 
+        std::string toPinName; 
     };
     struct BRegion
     {
@@ -155,7 +169,7 @@ private:
     void createNodeFromDefinition(const BlueprintNodeDefinition* definition, ImVec2 position);
     void createVariableNode(const BlueprintVariable& variable, BlueprintNodeType type, ImVec2 position);
     void createFunctionCallNode(const BlueprintFunction& func, ImVec2 position);
-    void deleteNode(ed::NodeId nodeId);
+    void deleteNode(ed::NodeId nodeId, bool allowProtected = false);
     void deleteLink(ed::LinkId linkId);
     void deleteFunction(const std::string& functionName);
     void updateSelfNodePinTypes();
@@ -169,6 +183,26 @@ private:
     bool doesEventNodeExist(const std::string& fullName);
     SelectFunctionWindow* findSelectFunctionWindow(uint32_t nodeId, const std::string& pinName);
     void handleShortcutInput();
+    void captureStateToData();
+    Blueprint makeSnapshot();
+    void pushUndoSnapshot();
+    void pushUndoSnapshotDirect(Blueprint&& snapshot);
+    void restoreFromSnapshot(const Blueprint& snapshot);
+    void performUndo();
+    void performRedo();
+    void trackItemEditUndo();
+    void deleteSelectedObjects();
+    bool collectSelectionForClipboard(std::vector<ClipboardNode>& outNodes, std::vector<ClipboardLink>& outLinks,
+                                      ImVec2& outTopLeft);
+    void pasteFromClipboard(const std::vector<ClipboardNode>& nodes, const std::vector<ClipboardLink>& links,
+                            ImVec2 basePosition);
+    void copySelectionToClipboard();
+    void pasteClipboardAtMouse();
+    void duplicateSelection();
+    void drawCreateNodeFromPinMenu();
+    void drawVariableDropMenu();
+    bool nodeDefinitionHasCompatiblePin(const BlueprintNodeDefinition* definition, const BPin* startPin) const;
+    void connectPinToFirstCompatiblePin(BPin* startPin, BNode& newNode);
     uint32_t getNextNodeId() { return m_nextNodeId++; }
     ed::PinId getNextPinId() { return ed::PinId(1000000 + m_nextPinId++); }
     ed::LinkId getNextLinkId() { return ed::LinkId(2000000 + m_nextLinkId++); }
@@ -212,5 +246,22 @@ private:
     std::vector<std::string> m_sortedTypeNames; 
     ListenerHandle m_scriptCompiledListener; 
     std::vector<SelectFunctionWindow> m_selectFunctionWindows;
+    static constexpr size_t kUndoStackLimit = 64; 
+    std::deque<Blueprint> m_undoStack; // 撤销栈：结构性修改前的全量数据快照
+    std::deque<Blueprint> m_redoStack; 
+    int m_lastUndoPushFrame = -1; // 同一帧内的批量修改合并为一个撤销步骤
+    Blueprint m_pendingEditSnapshot; // 文本编辑开始时暂存的前置快照，提交时入栈
+    bool m_hasPendingEditSnapshot = false; 
+    Blueprint m_moveCandidateSnapshot; // 鼠标按下时暂存的快照，用于拖动结束后入栈
+    bool m_hasMoveCandidate = false; 
+    std::unordered_map<uint64_t, ImVec2> m_moveStartNodePositions; 
+    std::unordered_map<uint32_t, std::pair<ImVec2, ImVec2>> m_moveStartRegionRects; 
+    std::vector<ClipboardNode> m_clipboardNodes; 
+    std::vector<ClipboardLink> m_clipboardLinks; 
+    ed::PinId m_pendingLinkPin = 0; // 拖线到空白处松开时的起点引脚
+    char m_pinMenuSearchBuffer[128] = {0}; 
+    std::string m_varDropName; 
+    ImVec2 m_varDropCanvasPos = ImVec2(0, 0); 
+    bool m_openVarDropMenu = false; 
 };
 #endif 

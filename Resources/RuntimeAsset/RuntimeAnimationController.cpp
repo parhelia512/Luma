@@ -39,6 +39,10 @@ void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>&
         return;
     }
 
+    // 记录切换前的状态，供播放状态快照区分过渡的起点与终点
+    const std::string previousAnimationName = m_currentAnimationName;
+    const Guid previousAnimationGuid = m_currentAnimationGuid;
+
     if (transitionDuration > 0.0f && m_isPlaying)
     {
         m_isTransitioning = true;
@@ -60,6 +64,12 @@ void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>&
     m_currentFrameIndex = 0;
     m_totalFrames = 0;
 
+    // 播放帧率以剪辑资产为准（替代硬编码默认 60）
+    if (animData.FrameRate > 0.0f)
+    {
+        m_frameRate = animData.FrameRate;
+    }
+
     if (!animData.Frames.empty())
     {
         for (const auto& [frameIndex, frame] : animData.Frames)
@@ -68,11 +78,33 @@ void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>&
         }
     }
 
-    m_animationSpeed = speed;
+    // 状态配置的速度倍率在此统一乘算，覆盖状态机自动过渡与外部 PlayAnimation 两种入口
+    m_animationSpeed = speed * getStateSpeed(m_currentAnimationGuid);
     m_isPlaying = true;
 
 
     m_justTransitioned = true;
+
+    {
+        std::lock_guard<std::mutex> lock(m_playbackStatusMutex);
+        if (m_isTransitioning)
+        {
+            m_playbackStatus.currentStateName = previousAnimationName;
+            m_playbackStatus.currentStateGuid = previousAnimationGuid;
+            m_playbackStatus.isTransitioning = true;
+            m_playbackStatus.targetStateName = m_currentAnimationName;
+            m_playbackStatus.targetStateGuid = m_currentAnimationGuid;
+        }
+        else
+        {
+            m_playbackStatus.currentStateName = m_currentAnimationName;
+            m_playbackStatus.currentStateGuid = m_currentAnimationGuid;
+            m_playbackStatus.isTransitioning = false;
+            m_playbackStatus.targetStateName.clear();
+            m_playbackStatus.targetStateGuid = Guid();
+        }
+        m_playbackStatus.transitionProgress = 0.0f;
+    }
 }
 
 bool RuntimeAnimationController::EvaluateCondition(const std::vector<Condition>& conditions)
@@ -157,16 +189,26 @@ void RuntimeAnimationController::UpdateFrameBasedAnimation(float deltaTime)
     float frameDuration = 1.0f / m_frameRate;
     float animationDuration = m_totalFrames * frameDuration;
 
+    // 用 find 避免 operator[] 在名称未注册时插入空剪辑
+    auto clipIt = m_animationClips.find(m_currentAnimationName);
+    sk_sp<RuntimeAnimationClip> currentClip = (clipIt != m_animationClips.end()) ? clipIt->second : nullptr;
 
     if (m_currentTime >= animationDuration)
     {
-        m_currentTime = fmod(m_currentTime, animationDuration);
+        // 循环标志来自剪辑资产：非循环剪辑停留在末尾，保持"已结束"状态供 hasExitTime 过渡判定
+        const bool looping = currentClip ? currentClip->getAnimationClip().IsLooping : true;
+        if (looping)
+        {
+            m_currentTime = fmod(m_currentTime, animationDuration);
+        }
+        else
+        {
+            m_currentTime = animationDuration;
+        }
     }
 
     m_currentFrameIndex = static_cast<int>(m_currentTime / frameDuration);
 
-
-    auto currentClip = m_animationClips[m_currentAnimationName];
     if (currentClip)
     {
         int keyframeToApply = FindLastKeyframeIndex(currentClip->getAnimationClip(), m_currentFrameIndex);
@@ -190,6 +232,24 @@ void RuntimeAnimationController::UpdateTransition(float deltaTime)
         blendFactor = 1.0f;
         m_isTransitioning = false;
         LogInfo("动画过渡完成");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_playbackStatusMutex);
+        if (m_isTransitioning)
+        {
+            m_playbackStatus.transitionProgress = blendFactor;
+        }
+        else
+        {
+            // 过渡完成，目标状态转正
+            m_playbackStatus.currentStateName = m_currentAnimationName;
+            m_playbackStatus.currentStateGuid = m_currentAnimationGuid;
+            m_playbackStatus.isTransitioning = false;
+            m_playbackStatus.targetStateName.clear();
+            m_playbackStatus.targetStateGuid = Guid();
+            m_playbackStatus.transitionProgress = 0.0f;
+        }
     }
 
 
@@ -342,11 +402,35 @@ void RuntimeAnimationController::StopAnimation()
     m_isTransitioning = false;
     m_currentTime = 0.0f;
     m_currentFrameIndex = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(m_playbackStatusMutex);
+        m_playbackStatus.isTransitioning = false;
+        m_playbackStatus.targetStateName.clear();
+        m_playbackStatus.targetStateGuid = Guid();
+        m_playbackStatus.transitionProgress = 0.0f;
+    }
 }
 
 std::string RuntimeAnimationController::GetCurrentAnimationName() const
 {
     return m_currentAnimationName;
+}
+
+RuntimeAnimationController::PlaybackStatus RuntimeAnimationController::GetPlaybackStatus() const
+{
+    std::lock_guard<std::mutex> lock(m_playbackStatusMutex);
+    return m_playbackStatus;
+}
+
+float RuntimeAnimationController::getStateSpeed(const Guid& stateGuid) const
+{
+    auto it = m_animationControllerData.States.find(stateGuid);
+    if (it != m_animationControllerData.States.end() && it->second.speed > 0.0f)
+    {
+        return it->second.speed;
+    }
+    return 1.0f;
 }
 
 bool RuntimeAnimationController::IsAnimationPlaying(const std::string& animationName)
@@ -402,7 +486,7 @@ void RuntimeAnimationController::PlayEntryAnimation()
     }
 }
 
-const Transition* RuntimeAnimationController::FindBestTransition(bool animationHasFinished)
+const Transition* RuntimeAnimationController::FindBestTransition(float normalizedTime)
 {
     const Transition* bestCandidate = nullptr;
 
@@ -437,7 +521,8 @@ const Transition* RuntimeAnimationController::FindBestTransition(bool animationH
         const auto& currentState = m_animationControllerData.States.at(m_currentAnimationGuid);
         for (const auto& transition : currentState.Transitions)
         {
-            if (!transition.hasExitTime || animationHasFinished)
+            // 归一化退出时间：播放进度达到 exitTime 才允许过渡；默认 1.0 等价于旧的“播放完毕”语义
+            if (!transition.hasExitTime || normalizedTime >= transition.exitTime)
             {
                 evaluate(transition);
             }
@@ -462,13 +547,14 @@ void RuntimeAnimationController::Update(float deltaTime)
         return;
     }
 
-    bool isCurrentAnimationFinished = false;
+    // 归一化播放进度（0-1），供退出时间判定；未播放时为 0 以保持旧行为（不触发带退出时间的过渡）
+    float normalizedTime = 0.0f;
     if (m_isPlaying)
     {
         float animationDuration = (m_totalFrames > 0 && m_frameRate > 0) ? (float)m_totalFrames / m_frameRate : 0.0f;
         if (animationDuration > 0)
         {
-            isCurrentAnimationFinished = m_currentTime >= animationDuration;
+            normalizedTime = m_currentTime / animationDuration;
         }
     }
 
@@ -478,7 +564,7 @@ void RuntimeAnimationController::Update(float deltaTime)
     }
     else
     {
-        const Transition* bestTransition = FindBestTransition(isCurrentAnimationFinished);
+        const Transition* bestTransition = FindBestTransition(normalizedTime);
 
         if (bestTransition)
         {

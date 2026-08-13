@@ -37,6 +37,7 @@ private:
         bool isDefault = false;          
         ed::PinId inputPinId;            
         ed::PinId outputPinId;           
+        float speed = 1.0f;              
     };
     struct ALink
     {
@@ -50,6 +51,7 @@ private:
         int priority = 0;                
         std::vector<Condition> conditions; 
         bool hasExitTime = true;         
+        float exitTime = 1.0f;           
     };
     std::vector<ANode> m_nodes;
     std::vector<ALink> m_links;
@@ -57,6 +59,15 @@ private:
     bool m_variablesPanelOpen = true;
     bool m_transitionEditWindowOpen = false;
     int m_editingLinkIndex = -1;
+    bool m_isDirty = false;
+    bool m_statePropertiesWindowOpen = false;
+    ed::NodeId m_renamingNodeId = 0;
+    char m_renameBuffer[256] = {0};
+    int m_editingVarIndex = -1;
+    char m_varNameEditBuffer[256] = {0};
+    bool m_deleteVarConfirmOpen = false;
+    int m_pendingDeleteVarIndex = -1;
+    std::string m_pendingDeleteVarName;
     void initializeFromControllerData();
     void saveToControllerData();
     void drawNodeEditor();
@@ -66,7 +77,10 @@ private:
     void drawTransitionEditor();
     void drawNodeContextMenu();
     void drawLinkContextMenu();
-    void drawConditionEditor(std::vector<Condition>& conditions);
+    bool drawConditionEditor(std::vector<Condition>& conditions);
+    void drawStatePropertiesWindow();
+    void drawVariableDeleteConfirmWindow();
+    void openStatePropertiesWindow(const ANode& node);
     ANode* findNodeByStateGuid(const Guid& stateGuid);
     ALink* findLinkById(ed::LinkId linkId);
     ANode* findNodeById(ed::NodeId nodeId);
@@ -74,6 +88,13 @@ private:
     void deleteNode(ed::NodeId nodeId);
     void deleteLink(ed::LinkId linkId);
     void handleShortcutInput();
+    void markDirty()
+    {
+        m_isDirty = true;
+    }
+    void renameVariableReferences(const std::string& oldName, const std::string& newName);
+    int countVariableReferences(const std::string& name) const;
+    void removeConditionsReferencing(const std::string& name);
     ed::NodeId getNextNodeId()
     {
         return ed::NodeId(m_nextNodeId++);

@@ -292,6 +292,11 @@ void SceneViewPanel::Initialize(EditorContext* context)
     m_isEditingCollider = false;
     m_activeColliderHandle.Reset();
     m_draggedObjects.clear();
+    m_isGizmoDragging = false;
+    m_gizmoChanged = false;
+    m_activeGizmoHandle = GizmoHandle::None;
+    m_gizmoTargets.clear();
+    m_isBoxSelecting = false;
     m_particleRenderer = std::make_unique<Particles::ParticleRenderer>();
     setupTouchGestureCallbacks();
 }
@@ -303,6 +308,11 @@ void SceneViewPanel::Shutdown()
     m_isEditingCollider = false;
     m_activeColliderHandle.Reset();
     m_draggedObjects.clear();
+    m_isGizmoDragging = false;
+    m_gizmoChanged = false;
+    m_activeGizmoHandle = GizmoHandle::None;
+    m_gizmoTargets.clear();
+    m_isBoxSelecting = false;
     if (m_particleRenderer)
     {
         m_particleRenderer->Shutdown();
@@ -385,6 +395,8 @@ void SceneViewPanel::Draw()
             handleTouchNavigation(viewportScreenPos, viewportSize);
             handleNavigationAndPick(viewportScreenPos, viewportSize);
             drawSelectionOutlines(viewportScreenPos, viewportSize);
+            drawTransformGizmo(ImGui::GetWindowDrawList());
+            drawBoxSelection(ImGui::GetWindowDrawList());
             drawParticlePreview(ImGui::GetWindowDrawList(), viewportScreenPos, viewportSize);
             
             // 绘制光照调试覆盖层
@@ -399,6 +411,9 @@ void SceneViewPanel::Draw()
     
     drawLightingDebugUI();
 
+    ImGui::SetCursorPos(ImVec2(8, 4));
+    drawTransformToolbar();
+
     ImGui::SetCursorPos(ImVec2(ImGui::GetWindowContentRegionMax().x - 200, 4));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4, 2));
     ImGui::Checkbox("Snap", &m_snapEnabled);
@@ -407,6 +422,11 @@ void SceneViewPanel::Draw()
         ImGui::SameLine();
         ImGui::SetNextItemWidth(60);
         ImGui::DragFloat("##grid", &m_snapGridSize, 1.0f, 1.0f, 256.0f, "%.0f");
+        ImGui::SetItemTooltip("移动吸附网格大小");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(50);
+        ImGui::DragFloat("##rotSnap", &m_rotationSnapDegrees, 1.0f, 1.0f, 180.0f, "%.0f°");
+        ImGui::SetItemTooltip("旋转吸附步进（度）");
     }
     ImGui::PopStyleVar();
 
@@ -1400,7 +1420,12 @@ void SceneViewPanel::drawTilemapGrid(ImDrawList* drawList, const ECS::TransformC
     const float bottom = cy + halfH;
     const float cellWidth = tilemap.cellSize.x;
     const float cellHeight = tilemap.cellSize.y;
-    if (cellWidth <= 0 || cellHeight <= 0) return;
+    if (cellWidth <= 0 || cellHeight <= 0)
+    {
+        // 网格无法绘制时工具条仍需可见
+        drawTileToolbar(drawList, viewportScreenPos, viewportSize);
+        return;
+    }
     const ImU32 gridColor = IM_COL32(255, 255, 255, 40);
     const float offsetX = 0.5f * cellWidth;
     const float offsetY = 0.5f * cellHeight;
@@ -1424,31 +1449,265 @@ void SceneViewPanel::drawTilemapGrid(ImDrawList* drawList, const ECS::TransformC
             ImVec2(viewportScreenPos.x + viewportSize.x, pLeft.y),
             gridColor);
     }
+    drawTileToolbar(drawList, viewportScreenPos, viewportSize);
 }
-void SceneViewPanel::drawTileBrushPreview(ImDrawList* drawList, const ECS::TransformComponent& tilemapTransform,
-                                          const ECS::TilemapComponent& tilemap)
+SceneViewPanel::TileTool SceneViewPanel::effectiveTileTool() const
 {
-    if (!m_context->activeTileBrush.Valid()) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    // 修饰键作临时覆盖：I 吸管优先；Ctrl 直线、Shift 矩形可与 Alt 擦除组合；单独 Alt 为橡皮
+    if (!io.WantTextInput && ImGui::IsKeyDown(ImGuiKey_I)) return TileTool::Picker;
+    if (io.KeyCtrl) return TileTool::Line;
+    if (io.KeyShift) return TileTool::Rect;
+    if (io.KeyAlt) return TileTool::Eraser;
+    return m_activeTileTool;
+}
+ECS::Vector2i SceneViewPanel::mouseTileCoord(const ECS::TransformComponent& tilemapTransform,
+                                             const ECS::TilemapComponent& tilemap) const
+{
+    if (tilemap.cellSize.x <= 0.0f || tilemap.cellSize.y <= 0.0f) return {0, 0};
     ECS::Vector2f worldMousePos = screenToWorldWith(m_editorCameraProperties, ImGui::GetIO().MousePos);
     ECS::Vector2f localMousePos = {
         worldMousePos.x - tilemapTransform.position.x,
         worldMousePos.y - tilemapTransform.position.y
     };
-    ECS::Vector2i gridCoord = {
+    return {
         static_cast<int>(std::floor(localMousePos.x / tilemap.cellSize.x + 0.5f)),
         static_cast<int>(std::floor(localMousePos.y / tilemap.cellSize.y + 0.5f))
     };
+}
+void SceneViewPanel::tileCellScreenRect(const ECS::TransformComponent& tilemapTransform,
+                                        const ECS::TilemapComponent& tilemap, const ECS::Vector2i& coord,
+                                        ImVec2& outMin, ImVec2& outMax) const
+{
     ECS::Vector2f tileWorldPos = {
-        tilemapTransform.position.x + (gridCoord.x - 0.5f) * tilemap.cellSize.x,
-        tilemapTransform.position.y + (gridCoord.y - 0.5f) * tilemap.cellSize.y
+        tilemapTransform.position.x + (coord.x - 0.5f) * tilemap.cellSize.x,
+        tilemapTransform.position.y + (coord.y - 0.5f) * tilemap.cellSize.y
     };
     ECS::Vector2f tileWorldPosEnd = {
-        tilemapTransform.position.x + (gridCoord.x + 0.5f) * tilemap.cellSize.x,
-        tilemapTransform.position.y + (gridCoord.y + 0.5f) * tilemap.cellSize.y
+        tilemapTransform.position.x + (coord.x + 0.5f) * tilemap.cellSize.x,
+        tilemapTransform.position.y + (coord.y + 0.5f) * tilemap.cellSize.y
     };
-    ImVec2 screenMin = worldToScreenWith(m_editorCameraProperties, tileWorldPos);
-    ImVec2 screenMax = worldToScreenWith(m_editorCameraProperties, tileWorldPosEnd);
-    ImU32 previewColor = ImGui::GetIO().KeyAlt ? IM_COL32(255, 80, 80, 100) : IM_COL32(80, 255, 80, 100);
+    outMin = worldToScreenWith(m_editorCameraProperties, tileWorldPos);
+    outMax = worldToScreenWith(m_editorCameraProperties, tileWorldPosEnd);
+}
+void SceneViewPanel::drawTileCellsPreview(ImDrawList* drawList, const ECS::TransformComponent& tilemapTransform,
+                                          const ECS::TilemapComponent& tilemap,
+                                          const std::vector<ECS::Vector2i>& coords, ImU32 color)
+{
+    const ImVec2 clipMin = drawList->GetClipRectMin();
+    const ImVec2 clipMax = drawList->GetClipRectMax();
+    for (const auto& coord : coords)
+    {
+        ImVec2 screenMin, screenMax;
+        tileCellScreenRect(tilemapTransform, tilemap, coord, screenMin, screenMax);
+        // 大区域（油漆桶预览）逐格剔除视口外的格子，避免无谓的绘制提交
+        if (screenMax.x < clipMin.x || screenMin.x > clipMax.x ||
+            screenMax.y < clipMin.y || screenMin.y > clipMax.y)
+        {
+            continue;
+        }
+        drawList->AddRectFilled(screenMin, screenMax, color);
+    }
+}
+void SceneViewPanel::collectTileLineCoords(const ECS::Vector2i& from, const ECS::Vector2i& to,
+                                           std::vector<ECS::Vector2i>& outCoords)
+{
+    int x1 = from.x, y1 = from.y;
+    const int x2 = to.x, y2 = to.y;
+    const int dx = std::abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
+    const int dy = -std::abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
+    int err = dx + dy;
+    for (;;)
+    {
+        outCoords.push_back({x1, y1});
+        if (x1 == x2 && y1 == y2) break;
+        const int e2 = 2 * err;
+        if (e2 >= dy)
+        {
+            err += dy;
+            x1 += sx;
+        }
+        if (e2 <= dx)
+        {
+            err += dx;
+            y1 += sy;
+        }
+    }
+}
+void SceneViewPanel::collectTileRectCoords(const ECS::Vector2i& from, const ECS::Vector2i& to,
+                                           std::vector<ECS::Vector2i>& outCoords)
+{
+    const int minX = std::min(from.x, to.x);
+    const int maxX = std::max(from.x, to.x);
+    const int minY = std::min(from.y, to.y);
+    const int maxY = std::max(from.y, to.y);
+    outCoords.reserve(outCoords.size() +
+        static_cast<size_t>(maxX - minX + 1) * static_cast<size_t>(maxY - minY + 1));
+    for (int x = minX; x <= maxX; ++x)
+    {
+        for (int y = minY; y <= maxY; ++y)
+        {
+            outCoords.push_back({x, y});
+        }
+    }
+}
+void SceneViewPanel::computeTileFillRegion(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& anchor,
+                                           std::vector<ECS::Vector2i>& outCoords) const
+{
+    outCoords.clear();
+    // 连通填充上限，防止空白区域无界扩散
+    constexpr size_t kMaxFillCells = 10000;
+    // 格子内容标识：kind 0 空 / 1 普通瓦片 / 2 规则瓦片
+    auto cellContent = [&tilemap](const ECS::Vector2i& coord) -> std::pair<int, Guid>
+    {
+        auto itRule = tilemap.ruleTiles.find(coord);
+        if (itRule != tilemap.ruleTiles.end() && itRule->second.Valid()) return {2, itRule->second.assetGuid};
+        auto itNormal = tilemap.normalTiles.find(coord);
+        if (itNormal != tilemap.normalTiles.end() && itNormal->second.Valid()) return {1, itNormal->second.assetGuid};
+        return {0, Guid()};
+    };
+    const std::pair<int, Guid> target = cellContent(anchor);
+    const AssetHandle& brush = m_context->activeTileBrush;
+    const int brushKind = brush.assetType == AssetType::RuleTile ? 2 : (brush.assetType == AssetType::Tile ? 1 : 0);
+    // 目标区域已是笔刷内容时填充是空操作
+    if (target.first == brushKind && target.second == brush.assetGuid) return;
+    std::unordered_set<ECS::Vector2i, ECS::Vector2iHash> visited;
+    visited.insert(anchor);
+    outCoords.push_back(anchor);
+    const ECS::Vector2i steps[4] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    // 以 vector 为队列的 BFS，扩展顺序确定，预览与提交结果一致
+    for (size_t head = 0; head < outCoords.size() && outCoords.size() < kMaxFillCells; ++head)
+    {
+        const ECS::Vector2i current = outCoords[head];
+        for (const auto& step : steps)
+        {
+            const ECS::Vector2i next = {current.x + step.x, current.y + step.y};
+            if (visited.count(next)) continue;
+            if (cellContent(next) != target) continue;
+            visited.insert(next);
+            outCoords.push_back(next);
+            if (outCoords.size() >= kMaxFillCells) break;
+        }
+    }
+}
+void SceneViewPanel::drawTileToolbar(ImDrawList* drawList, const ImVec2& viewportScreenPos, const ImVec2& viewportSize)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    // G 键在填充与笔刷之间切换
+    if (m_context->engineContext->isSceneViewFocused && !io.WantTextInput &&
+        ImGui::IsKeyPressed(ImGuiKey_G, false))
+    {
+        m_activeTileTool = (m_activeTileTool == TileTool::Fill) ? TileTool::Brush : TileTool::Fill;
+    }
+    struct ToolItem
+    {
+        TileTool tool;
+        const char* label;
+    };
+    // 工具条用 drawList 手绘并手动命中测试：这里不能提交 ImGui 控件，
+    // 否则会覆盖场景视口 InvisibleButton 的 LastItem 状态，破坏 handleNavigationAndPick 的悬停判定
+    const ToolItem items[] = {
+        {TileTool::Brush, "笔刷"},
+        {TileTool::Eraser, "橡皮(Alt)"},
+        {TileTool::Line, "直线(Ctrl)"},
+        {TileTool::Rect, "矩形(Shift)"},
+        {TileTool::Fill, "填充(G)"},
+        {TileTool::Picker, "吸管(I)"},
+    };
+    constexpr int itemCount = static_cast<int>(sizeof(items) / sizeof(items[0]));
+    const float padX = 10.0f;
+    const float padY = 5.0f;
+    const float gap = 4.0f;
+    const float lineHeight = ImGui::GetTextLineHeight();
+    float widths[itemCount];
+    float totalWidth = gap * (itemCount - 1);
+    for (int i = 0; i < itemCount; ++i)
+    {
+        widths[i] = ImGui::CalcTextSize(items[i].label).x + padX * 2.0f;
+        totalWidth += widths[i];
+    }
+    const float barHeight = lineHeight + padY * 2.0f;
+    const ImVec2 barMin = {
+        viewportScreenPos.x + (viewportSize.x - totalWidth) * 0.5f,
+        viewportScreenPos.y + 8.0f
+    };
+    const ImVec2 bgMin = {barMin.x - 6.0f, barMin.y - 4.0f};
+    const ImVec2 bgMax = {barMin.x + totalWidth + 6.0f, barMin.y + barHeight + 4.0f};
+    drawList->AddRectFilled(bgMin, bgMax, IM_COL32(20, 20, 20, 200), 6.0f);
+    m_tileToolbarHovered = io.MousePos.x >= bgMin.x && io.MousePos.x <= bgMax.x &&
+        io.MousePos.y >= bgMin.y && io.MousePos.y <= bgMax.y;
+    const TileTool effective = effectiveTileTool();
+    float x = barMin.x;
+    for (int i = 0; i < itemCount; ++i)
+    {
+        const ImVec2 btnMin = {x, barMin.y};
+        const ImVec2 btnMax = {x + widths[i], barMin.y + barHeight};
+        const bool hovered = io.MousePos.x >= btnMin.x && io.MousePos.x <= btnMax.x &&
+            io.MousePos.y >= btnMin.y && io.MousePos.y <= btnMax.y;
+        const ImU32 bgColor = effective == items[i].tool
+                                  ? IM_COL32(70, 130, 200, 230)
+                                  : (hovered ? IM_COL32(90, 90, 90, 220) : IM_COL32(55, 55, 55, 200));
+        drawList->AddRectFilled(btnMin, btnMax, bgColor, 4.0f);
+        if (m_activeTileTool == items[i].tool)
+        {
+            // 白色描边标记工具条的持久选择，与修饰键的临时高亮区分
+            drawList->AddRect(btnMin, btnMax, IM_COL32(255, 255, 255, 200), 4.0f, 0, 1.5f);
+        }
+        drawList->AddText(ImVec2(x + padX, barMin.y + padY), IM_COL32(235, 235, 235, 255), items[i].label);
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            m_activeTileTool = items[i].tool;
+        }
+        x += widths[i] + gap;
+    }
+}
+void SceneViewPanel::drawTileBrushPreview(ImDrawList* drawList, const ECS::TransformComponent& tilemapTransform,
+                                          const ECS::TilemapComponent& tilemap)
+{
+    if (!m_context->activeTileBrush.Valid()) return;
+    // 悬停工具条时隐藏格子预览（进行中的笔画虚影仍保留）
+    if (m_tileToolbarHovered && !m_isPainting) return;
+    const ECS::Vector2i gridCoord = mouseTileCoord(tilemapTransform, tilemap);
+    const TileTool tool = effectiveTileTool();
+    const bool erasing = ImGui::GetIO().KeyAlt || tool == TileTool::Eraser;
+    const ImU32 previewColor = erasing ? IM_COL32(255, 80, 80, 100) : IM_COL32(80, 255, 80, 100);
+    if (tool == TileTool::Picker)
+    {
+        ImVec2 screenMin, screenMax;
+        tileCellScreenRect(tilemapTransform, tilemap, gridCoord, screenMin, screenMax);
+        drawList->AddRectFilled(screenMin, screenMax, IM_COL32(255, 220, 80, 60));
+        drawList->AddRect(screenMin, screenMax, IM_COL32(255, 220, 80, 220), 0.0f, 0, 2.0f);
+        return;
+    }
+    if (m_isPainting && (tool == TileTool::Line || tool == TileTool::Rect))
+    {
+        // 拖拽中的直线/矩形完整虚影
+        std::vector<ECS::Vector2i> coords;
+        if (tool == TileTool::Line) collectTileLineCoords(m_paintStartCoord, gridCoord, coords);
+        else collectTileRectCoords(m_paintStartCoord, gridCoord, coords);
+        drawTileCellsPreview(drawList, tilemapTransform, tilemap, coords, previewColor);
+        return;
+    }
+    if (tool == TileTool::Fill && !m_isPainting)
+    {
+        // BFS 结果缓存：锚点格子变化、瓦片数据修改或换了 Tilemap 后重算
+        if (!m_fillPreviewValid ||
+            m_fillPreviewAnchor.x != gridCoord.x || m_fillPreviewAnchor.y != gridCoord.y ||
+            m_fillPreviewTilemap != static_cast<const void*>(&tilemap))
+        {
+            computeTileFillRegion(tilemap, gridCoord, m_fillPreviewCoords);
+            m_fillPreviewAnchor = gridCoord;
+            m_fillPreviewTilemap = &tilemap;
+            m_fillPreviewValid = true;
+        }
+        drawTileCellsPreview(drawList, tilemapTransform, tilemap, m_fillPreviewCoords, previewColor);
+        ImVec2 screenMin, screenMax;
+        tileCellScreenRect(tilemapTransform, tilemap, gridCoord, screenMin, screenMax);
+        drawList->AddRect(screenMin, screenMax, IM_COL32(80, 255, 80, 220), 0.0f, 0, 2.0f);
+        return;
+    }
+    ImVec2 screenMin, screenMax;
+    tileCellScreenRect(tilemapTransform, tilemap, gridCoord, screenMin, screenMax);
     drawList->AddRectFilled(screenMin, screenMax, previewColor);
 }
 void SceneViewPanel::drawEditorGrid(const ImVec2& viewportScreenPos, const ImVec2& viewportSize)
@@ -1518,51 +1777,93 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
     if (!tilemapGo.HasComponent<ECS::TilemapComponent>()) return;
     auto& tilemap = tilemapGo.GetComponent<ECS::TilemapComponent>();
     const auto& tilemapTransform = tilemapGo.GetComponent<ECS::TransformComponent>();
-    const ImGuiIO& io = ImGui::GetIO();
-    ECS::Vector2f worldMousePos = screenToWorldWith(m_editorCameraProperties, io.MousePos);
-    ECS::Vector2f localMousePos = {
-        worldMousePos.x - tilemapTransform.position.x,
-        worldMousePos.y - tilemapTransform.position.y
-    };
-    ECS::Vector2i gridCoord = {
-        static_cast<int>(std::floor(localMousePos.x / tilemap.cellSize.x + 0.5f)),
-        static_cast<int>(std::floor(localMousePos.y / tilemap.cellSize.y + 0.5f))
-    };
-    bool isErasing = io.KeyAlt;
-    auto paintTile = [&](const ECS::Vector2i& coord)
+    const ECS::Vector2i gridCoord = mouseTileCoord(tilemapTransform, tilemap);
+    const TileTool tool = effectiveTileTool();
+    const bool isErasing = ImGui::GetIO().KeyAlt || tool == TileTool::Eraser;
+    auto publishTilemapUpdate = [&]()
     {
-        if (m_paintedCoordsThisStroke.count(coord)) return;
-        m_paintedCoordsThisStroke.insert(coord);
+        EventBus::GetInstance().Publish(ComponentUpdatedEvent{
+            m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
+        });
+    };
+    // 底层写入：不去重、不发事件，供笔画与油漆桶共用
+    auto applyBrushAt = [&](const ECS::Vector2i& coord)
+    {
         if (isErasing)
         {
             tilemap.normalTiles.erase(coord);
             tilemap.ruleTiles.erase(coord);
-            EventBus::GetInstance().Publish(ComponentUpdatedEvent{
-                m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
-            });
         }
-        else
+        else if (m_context->activeTileBrush.assetType == AssetType::RuleTile)
         {
-            if (m_context->activeTileBrush.assetType == AssetType::RuleTile)
-            {
-                tilemap.ruleTiles[coord] = m_context->activeTileBrush;
-                tilemap.normalTiles.erase(coord);
-                EventBus::GetInstance().Publish(ComponentUpdatedEvent{
-                    m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
-                });
-            }
-            else if (m_context->activeTileBrush.assetType == AssetType::Tile)
-            {
-                tilemap.normalTiles[coord] = m_context->activeTileBrush;
-                tilemap.ruleTiles.erase(coord);
-                EventBus::GetInstance().Publish(ComponentUpdatedEvent{
-                    m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
-                });
-            }
+            tilemap.ruleTiles[coord] = m_context->activeTileBrush;
+            tilemap.normalTiles.erase(coord);
         }
+        else if (m_context->activeTileBrush.assetType == AssetType::Tile)
+        {
+            tilemap.normalTiles[coord] = m_context->activeTileBrush;
+            tilemap.ruleTiles.erase(coord);
+        }
+    };
+    auto paintTile = [&](const ECS::Vector2i& coord)
+    {
+        if (m_paintedCoordsThisStroke.count(coord)) return;
+        m_paintedCoordsThisStroke.insert(coord);
+        const bool brushPaintable = m_context->activeTileBrush.assetType == AssetType::RuleTile ||
+            m_context->activeTileBrush.assetType == AssetType::Tile;
+        if (!isErasing && !brushPaintable) return;
+        applyBrushAt(coord);
+        m_fillPreviewValid = false;
+        publishTilemapUpdate();
     };
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
     {
+        // 点击工具条属于 UI 操作，不落到画布
+        if (m_tileToolbarHovered) return;
+        if (tool == TileTool::Picker)
+        {
+            // 吸管：拾取格子内容为当前笔刷，TilesetPanel 的选中态与预览随 activeTileBrush 自动同步
+            auto itRule = tilemap.ruleTiles.find(gridCoord);
+            if (itRule != tilemap.ruleTiles.end() && itRule->second.Valid())
+            {
+                m_context->activeTileBrush = itRule->second;
+            }
+            else
+            {
+                auto itNormal = tilemap.normalTiles.find(gridCoord);
+                if (itNormal != tilemap.normalTiles.end() && itNormal->second.Valid())
+                {
+                    m_context->activeTileBrush = itNormal->second;
+                }
+            }
+            return;
+        }
+        if (tool == TileTool::Fill)
+        {
+            // 油漆桶：单击即完成，不进入笔画状态；区域为空说明是无效填充（目标已是笔刷内容）
+            std::vector<ECS::Vector2i> region;
+            if (m_fillPreviewValid &&
+                m_fillPreviewAnchor.x == gridCoord.x && m_fillPreviewAnchor.y == gridCoord.y &&
+                m_fillPreviewTilemap == static_cast<const void*>(&tilemap))
+            {
+                region = m_fillPreviewCoords;
+            }
+            else
+            {
+                computeTileFillRegion(tilemap, gridCoord, region);
+            }
+            if (!region.empty())
+            {
+                SceneManager::GetInstance().PushUndoState(m_context->activeScene);
+                for (const auto& coord : region)
+                {
+                    applyBrushAt(coord);
+                }
+                m_fillPreviewValid = false;
+                publishTilemapUpdate();
+            }
+            return;
+        }
         m_isPainting = true;
         m_paintedCoordsThisStroke.clear();
         m_paintStartCoord = gridCoord;
@@ -1571,59 +1872,27 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
     }
     if (m_isPainting && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
     {
-        if (io.KeyCtrl)
+        // 直线/矩形拖拽阶段只显示虚影，松开时统一提交
+        if (tool == TileTool::Brush || tool == TileTool::Eraser)
         {
+            paintTile(gridCoord);
         }
-        else if (io.KeyShift)
-        {
-        }
-        else { paintTile(gridCoord); }
     }
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
     {
         if (m_isPainting)
         {
-            if (io.KeyCtrl)
+            if (tool == TileTool::Line || tool == TileTool::Rect)
             {
-                int x1 = m_paintStartCoord.x, y1 = m_paintStartCoord.y;
-                int x2 = gridCoord.x, y2 = gridCoord.y;
-                int dx = abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
-                int dy = -abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
-                int err = dx + dy, e2;
-                for (;;)
+                std::vector<ECS::Vector2i> coords;
+                if (tool == TileTool::Line) collectTileLineCoords(m_paintStartCoord, gridCoord, coords);
+                else collectTileRectCoords(m_paintStartCoord, gridCoord, coords);
+                for (const auto& coord : coords)
                 {
-                    paintTile({x1, y1});
-                    if (x1 == x2 && y1 == y2) break;
-                    e2 = 2 * err;
-                    if (e2 >= dy)
-                    {
-                        err += dy;
-                        x1 += sx;
-                    }
-                    if (e2 <= dx)
-                    {
-                        err += dx;
-                        y1 += sy;
-                    }
+                    paintTile(coord);
                 }
             }
-            else if (io.KeyShift)
-            {
-                int minX = std::min(m_paintStartCoord.x, gridCoord.x);
-                int maxX = std::max(m_paintStartCoord.x, gridCoord.x);
-                int minY = std::min(m_paintStartCoord.y, gridCoord.y);
-                int maxY = std::max(m_paintStartCoord.y, gridCoord.y);
-                for (int x = minX; x <= maxX; ++x)
-                {
-                    for (int y = minY; y <= maxY; ++y)
-                    {
-                        paintTile({x, y});
-                    }
-                }
-            }
-            EventBus::GetInstance().Publish(ComponentUpdatedEvent{
-                m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
-            });
+            publishTilemapUpdate();
         }
         m_isPainting = false;
     }
@@ -1658,6 +1927,7 @@ void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, co
                                                               sumY / static_cast<float>(validCount));
         }
     }
+    handleTransformToolHotkeys();
     const bool isHovered = ImGui::IsItemHovered(ImGuiHoveredFlags_None);
     if (!m_context->engineContext->isSceneViewFocused || !isHovered)
     {
@@ -1665,6 +1935,11 @@ void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, co
         m_activeColliderHandle.Reset();
         m_draggedObjects.clear();
         m_potentialDragEntity = entt::null;
+        m_isGizmoDragging = false;
+        m_gizmoChanged = false;
+        m_activeGizmoHandle = GizmoHandle::None;
+        m_gizmoTargets.clear();
+        m_isBoxSelecting = false;
         return;
     }
     const ImGuiIO& io = ImGui::GetIO();
@@ -1713,15 +1988,27 @@ void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, co
         {
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
             {
-                if (!handleUIRectHandlePicking(worldMousePos) && !handleColliderHandlePicking(worldMousePos))
+                // gizmo 手柄命中优先级最高，其次 UI 矩形/碰撞体手柄，最后才是物体拾取
+                if (!handleGizmoHandlePicking(worldMousePos) &&
+                    !handleUIRectHandlePicking(worldMousePos) &&
+                    !handleColliderHandlePicking(worldMousePos))
                 {
                     m_potentialDragEntity = handleObjectPicking(worldMousePos);
                     if (m_potentialDragEntity != entt::null) { m_mouseDownScreenPos = io.MousePos; }
+                    else if (m_activeTool == TransformTool::Select || m_activeTool == TransformTool::Move)
+                    {
+                        // 空白处按下：预备框选，是否真正框选由释放时的位移阈值判定
+                        m_isBoxSelecting = true;
+                        m_boxSelectStartWorld = worldMousePos;
+                        m_boxSelectStartScreen = io.MousePos;
+                    }
                 }
             }
             if (ImGui::IsMouseDragging(ImGuiMouseButton_Left))
             {
-                if (m_potentialDragEntity != entt::null && !m_isDragging && !m_isEditingCollider && !m_isEditingUIRect)
+                // Select 工具只做选择，Rotate/Scale 工具下拖拽物体本体也不移动（与 Unity 一致）
+                if (m_potentialDragEntity != entt::null && !m_isDragging && !m_isEditingCollider &&
+                    !m_isEditingUIRect && !m_isGizmoDragging && m_activeTool == TransformTool::Move)
                 {
                     const float dragThresholdSq = 5.0f * 5.0f;
                     if (ImLengthSqr(io.MousePos - m_mouseDownScreenPos) > dragThresholdSq)
@@ -1732,13 +2019,19 @@ void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, co
                         m_potentialDragEntity = entt::null;
                     }
                 }
-                if (m_isEditingCollider) { handleColliderHandleDragging(worldMousePos); }
+                if (m_isGizmoDragging) { handleGizmoDragging(worldMousePos); }
+                else if (m_isEditingCollider) { handleColliderHandleDragging(worldMousePos); }
                 else if (m_isEditingUIRect) { handleUIRectHandleDragging(worldMousePos); }
                 else if (m_isDragging) { handleObjectDragging(worldMousePos); }
             }
             if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
             {
-                if (m_isEditingCollider || m_isEditingUIRect || m_isDragging)
+                if (m_isBoxSelecting)
+                {
+                    finalizeBoxSelection(worldMousePos);
+                }
+                if (m_isEditingCollider || m_isEditingUIRect || m_isDragging ||
+                    (m_isGizmoDragging && m_gizmoChanged))
                 {
                     SceneManager::GetInstance().PushUndoState(m_context->activeScene);
                 }
@@ -1748,6 +2041,11 @@ void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, co
                 m_isDragging = false;
                 m_draggedObjects.clear();
                 m_potentialDragEntity = entt::null;
+                m_isGizmoDragging = false;
+                m_gizmoChanged = false;
+                m_activeGizmoHandle = GizmoHandle::None;
+                m_gizmoTargets.clear();
+                m_isBoxSelecting = false;
             }
         }
     }
@@ -4010,5 +4308,608 @@ void SceneViewPanel::drawLightingDebugOverlay(ImDrawList* drawList, const ImVec2
             IM_COL32(255, 255, 0, 200),
             0.0f, 0, 3.0f
         );
+    }
+}
+namespace
+{
+    constexpr float kGizmoAxisLength = 60.0f; ///< 轴手柄长度（屏幕像素）
+    constexpr float kGizmoArrowSize = 10.0f; ///< 轴端箭头/方块大小
+    constexpr float kGizmoCenterHalf = 8.0f; ///< 中心方块半边长
+    constexpr float kGizmoRingRadius = 60.0f; ///< 旋转圆环半径
+    constexpr float kGizmoRingHitTol = 8.0f; ///< 圆环命中容差
+    constexpr float kGizmoAxisHitTol = 7.0f; ///< 轴命中容差
+    constexpr float kPiF = 3.14159265358979f;
+
+    // 在鼠标右下角画带底色的小标签（旋转角度 / 缩放倍数）
+    void DrawGizmoMouseLabel(ImDrawList* drawList, const char* text)
+    {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const ImVec2 pos(mouse.x + 16.0f, mouse.y + 12.0f);
+        const ImVec2 size = ImGui::CalcTextSize(text);
+        drawList->AddRectFilled(ImVec2(pos.x - 3.0f, pos.y - 2.0f),
+                                ImVec2(pos.x + size.x + 3.0f, pos.y + size.y + 2.0f),
+                                IM_COL32(0, 0, 0, 180), 2.0f);
+        drawList->AddText(pos, IM_COL32(255, 255, 255, 255), text);
+    }
+}
+void SceneViewPanel::handleTransformToolHotkeys()
+{
+    // 仿照 F 聚焦的门控：场景视图聚焦/悬停且未在输入文本；播放中键盘输入属于游戏，不切换工具
+    if (!m_context->engineContext->isSceneViewFocused ||
+        ImGui::GetIO().WantTextInput ||
+        m_context->editorState != EditorState::Editing)
+    {
+        return;
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    // 带修饰键的组合键（如 Ctrl+W）留给其他快捷键；拖拽中途不切换工具
+    if (io.KeyCtrl || io.KeyAlt || io.KeySuper ||
+        m_isGizmoDragging || m_isDragging || m_isBoxSelecting)
+    {
+        return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Q, false)) { m_activeTool = TransformTool::Select; }
+    else if (ImGui::IsKeyPressed(ImGuiKey_W, false)) { m_activeTool = TransformTool::Move; }
+    else if (ImGui::IsKeyPressed(ImGuiKey_E, false)) { m_activeTool = TransformTool::Rotate; }
+    else if (ImGui::IsKeyPressed(ImGuiKey_R, false)) { m_activeTool = TransformTool::Scale; }
+}
+void SceneViewPanel::drawTransformToolbar()
+{
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6, 3));
+    const struct
+    {
+        const char* label;
+        TransformTool tool;
+        const char* tooltip;
+    } tools[] = {
+        {"Q", TransformTool::Select, "选择工具：点选与框选，不移动物体 (Q)"},
+        {"W", TransformTool::Move, "移动工具：拖拽物体或 X/Y 轴手柄 (W)"},
+        {"E", TransformTool::Rotate, "旋转工具：拖拽圆环旋转选中对象 (E)"},
+        {"R", TransformTool::Scale, "缩放工具：中心等比缩放，轴手柄单轴缩放 (R)"},
+    };
+    for (int i = 0; i < 4; ++i)
+    {
+        if (i > 0)
+        {
+            ImGui::SameLine(0.0f, 2.0f);
+        }
+        const bool isActive = (m_activeTool == tools[i].tool);
+        if (isActive)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        }
+        if (ImGui::Button(tools[i].label))
+        {
+            m_activeTool = tools[i].tool;
+        }
+        if (isActive)
+        {
+            ImGui::PopStyleColor();
+        }
+        ImGui::SetItemTooltip("%s", tools[i].tooltip);
+    }
+    ImGui::PopStyleVar();
+}
+bool SceneViewPanel::computeSelectionCenter(ECS::Vector2f& outCenter)
+{
+    if (m_context->selectionType != SelectionType::GameObject || m_context->selectionList.empty())
+    {
+        return false;
+    }
+    float sumX = 0.0f;
+    float sumY = 0.0f;
+    int validCount = 0;
+    for (const Guid& guid : m_context->selectionList)
+    {
+        RuntimeGameObject go = m_context->activeScene->FindGameObjectByGuid(guid);
+        if (go.IsValid() && go.HasComponent<ECS::TransformComponent>())
+        {
+            const auto& transform = go.GetComponent<ECS::TransformComponent>();
+            sumX += transform.position.x;
+            sumY += transform.position.y;
+            ++validCount;
+        }
+    }
+    if (validCount == 0)
+    {
+        return false;
+    }
+    outCenter = {sumX / static_cast<float>(validCount), sumY / static_cast<float>(validCount)};
+    return true;
+}
+void SceneViewPanel::drawTransformGizmo(ImDrawList* drawList)
+{
+    if (m_activeTool == TransformTool::Select)
+    {
+        return;
+    }
+    ECS::Vector2f center;
+    // 旋转/缩放拖拽中锚定按下时的原点；移动拖拽跟随对象，其余情况取实时选中集中心
+    if (m_isGizmoDragging && m_activeTool != TransformTool::Move)
+    {
+        center = m_gizmoOrigin;
+    }
+    else if (!computeSelectionCenter(center))
+    {
+        return;
+    }
+    const ImVec2 origin = worldToScreenWith(m_editorCameraProperties, center);
+    const ImGuiIO& io = ImGui::GetIO();
+    const ImU32 xColor = IM_COL32(230, 80, 60, 255);
+    const ImU32 yColor = IM_COL32(120, 210, 60, 255);
+    const ImU32 activeColor = IM_COL32(255, 220, 60, 255);
+    const ImU32 ringColor = IM_COL32(90, 170, 255, 255);
+    if (m_activeTool == TransformTool::Rotate)
+    {
+        const bool ringActive = m_isGizmoDragging && m_activeGizmoHandle == GizmoHandle::RotateRing;
+        const ImU32 col = ringActive ? activeColor : ringColor;
+        drawList->AddCircle(origin, kGizmoRingRadius, col, 64, 2.5f);
+        drawList->AddCircleFilled(origin, 3.0f, col);
+        if (ringActive)
+        {
+            ImVec2 dir(io.MousePos.x - origin.x, io.MousePos.y - origin.y);
+            const float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
+            if (len > 1.0f)
+            {
+                dir.x = dir.x / len * kGizmoRingRadius;
+                dir.y = dir.y / len * kGizmoRingRadius;
+                drawList->AddLine(origin, ImVec2(origin.x + dir.x, origin.y + dir.y), activeColor, 1.5f);
+            }
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.1f°", m_gizmoDisplayAngle);
+            DrawGizmoMouseLabel(drawList, buf);
+        }
+        return;
+    }
+    // Move / Scale 共用轴 + 中心方块布局；本引擎世界 Y 轴向下，故 Y 手柄指向屏幕下方
+    const bool xActive = m_isGizmoDragging && m_activeGizmoHandle == GizmoHandle::AxisX;
+    const bool yActive = m_isGizmoDragging && m_activeGizmoHandle == GizmoHandle::AxisY;
+    const bool cActive = m_isGizmoDragging && m_activeGizmoHandle == GizmoHandle::Center;
+    const ImVec2 xEnd(origin.x + kGizmoAxisLength, origin.y);
+    const ImVec2 yEnd(origin.x, origin.y + kGizmoAxisLength);
+    drawList->AddLine(ImVec2(origin.x + kGizmoCenterHalf, origin.y), xEnd, xActive ? activeColor : xColor, 2.0f);
+    drawList->AddLine(ImVec2(origin.x, origin.y + kGizmoCenterHalf), yEnd, yActive ? activeColor : yColor, 2.0f);
+    if (m_activeTool == TransformTool::Move)
+    {
+        drawList->AddTriangleFilled(ImVec2(xEnd.x + kGizmoArrowSize, xEnd.y),
+                                    ImVec2(xEnd.x, xEnd.y - kGizmoArrowSize * 0.5f),
+                                    ImVec2(xEnd.x, xEnd.y + kGizmoArrowSize * 0.5f),
+                                    xActive ? activeColor : xColor);
+        drawList->AddTriangleFilled(ImVec2(yEnd.x, yEnd.y + kGizmoArrowSize),
+                                    ImVec2(yEnd.x - kGizmoArrowSize * 0.5f, yEnd.y),
+                                    ImVec2(yEnd.x + kGizmoArrowSize * 0.5f, yEnd.y),
+                                    yActive ? activeColor : yColor);
+    }
+    else
+    {
+        const float half = kGizmoArrowSize * 0.5f;
+        drawList->AddRectFilled(ImVec2(xEnd.x, xEnd.y - half),
+                                ImVec2(xEnd.x + kGizmoArrowSize, xEnd.y + half),
+                                xActive ? activeColor : xColor);
+        drawList->AddRectFilled(ImVec2(yEnd.x - half, yEnd.y),
+                                ImVec2(yEnd.x + half, yEnd.y + kGizmoArrowSize),
+                                yActive ? activeColor : yColor);
+    }
+    drawList->AddRectFilled(ImVec2(origin.x - kGizmoCenterHalf, origin.y - kGizmoCenterHalf),
+                            ImVec2(origin.x + kGizmoCenterHalf, origin.y + kGizmoCenterHalf),
+                            cActive ? activeColor : IM_COL32(255, 255, 255, 60));
+    drawList->AddRect(ImVec2(origin.x - kGizmoCenterHalf, origin.y - kGizmoCenterHalf),
+                      ImVec2(origin.x + kGizmoCenterHalf, origin.y + kGizmoCenterHalf),
+                      cActive ? activeColor : IM_COL32(255, 255, 255, 220), 0.0f, 0, 1.5f);
+    if (m_activeTool == TransformTool::Scale && m_isGizmoDragging)
+    {
+        char buf[48];
+        if (m_activeGizmoHandle == GizmoHandle::Center)
+        {
+            snprintf(buf, sizeof(buf), "x%.2f", m_gizmoDisplayScale.x);
+        }
+        else if (m_activeGizmoHandle == GizmoHandle::AxisX)
+        {
+            snprintf(buf, sizeof(buf), "X x%.2f", m_gizmoDisplayScale.x);
+        }
+        else
+        {
+            snprintf(buf, sizeof(buf), "Y x%.2f", m_gizmoDisplayScale.y);
+        }
+        DrawGizmoMouseLabel(drawList, buf);
+    }
+}
+void SceneViewPanel::drawBoxSelection(ImDrawList* drawList)
+{
+    if (!m_isBoxSelecting)
+    {
+        return;
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    // 未超过拖拽阈值不画框，保证单击空白仍表现为纯粹的取消选择
+    if (ImLengthSqr(io.MousePos - m_boxSelectStartScreen) <= 5.0f * 5.0f)
+    {
+        return;
+    }
+    const ImVec2 startScreen = worldToScreenWith(m_editorCameraProperties, m_boxSelectStartWorld);
+    const ImVec2 pMin(std::min(startScreen.x, io.MousePos.x), std::min(startScreen.y, io.MousePos.y));
+    const ImVec2 pMax(std::max(startScreen.x, io.MousePos.x), std::max(startScreen.y, io.MousePos.y));
+    drawList->AddRectFilled(pMin, pMax, IM_COL32(100, 150, 255, 50));
+    drawList->AddRect(pMin, pMax, IM_COL32(100, 150, 255, 150), 0.0f, 0, 1.5f);
+}
+bool SceneViewPanel::handleGizmoHandlePicking(const ECS::Vector2f& worldMousePos)
+{
+    if (m_activeTool == TransformTool::Select)
+    {
+        return false;
+    }
+    ECS::Vector2f center;
+    if (!computeSelectionCenter(center))
+    {
+        return false;
+    }
+    const ImVec2 originScreen = worldToScreenWith(m_editorCameraProperties, center);
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const float dx = mouse.x - originScreen.x;
+    const float dy = mouse.y - originScreen.y;
+    GizmoHandle hit = GizmoHandle::None;
+    if (m_activeTool == TransformTool::Rotate)
+    {
+        const float dist = sqrtf(dx * dx + dy * dy);
+        if (std::abs(dist - kGizmoRingRadius) <= kGizmoRingHitTol)
+        {
+            hit = GizmoHandle::RotateRing;
+        }
+    }
+    else
+    {
+        if (std::abs(dx) <= kGizmoCenterHalf + 2.0f && std::abs(dy) <= kGizmoCenterHalf + 2.0f)
+        {
+            hit = GizmoHandle::Center;
+        }
+        else if (dx >= kGizmoCenterHalf && dx <= kGizmoAxisLength + kGizmoArrowSize &&
+                 std::abs(dy) <= kGizmoAxisHitTol)
+        {
+            hit = GizmoHandle::AxisX;
+        }
+        else if (dy >= kGizmoCenterHalf && dy <= kGizmoAxisLength + kGizmoArrowSize &&
+                 std::abs(dx) <= kGizmoAxisHitTol)
+        {
+            hit = GizmoHandle::AxisY;
+        }
+    }
+    if (hit == GizmoHandle::None)
+    {
+        return false;
+    }
+    m_gizmoTargets.clear();
+    for (const Guid& guid : m_context->selectionList)
+    {
+        RuntimeGameObject go = m_context->activeScene->FindGameObjectByGuid(guid);
+        if (!go.IsValid() || !go.HasComponent<ECS::TransformComponent>())
+        {
+            continue;
+        }
+        const auto& transform = go.GetComponent<ECS::TransformComponent>();
+        GizmoTarget target;
+        target.guid = guid;
+        target.startPosition = transform.position;
+        target.startRotation = transform.rotation;
+        target.startScale = transform.scale;
+        m_gizmoTargets.push_back(target);
+    }
+    if (m_gizmoTargets.empty())
+    {
+        return false;
+    }
+    m_isGizmoDragging = true;
+    m_gizmoChanged = false;
+    m_activeGizmoHandle = hit;
+    m_gizmoOrigin = center;
+    m_gizmoDragStartWorld = worldMousePos;
+    m_gizmoDragStartScreen = mouse;
+    m_gizmoDisplayAngle = 0.0f;
+    m_gizmoDisplayScale = {1.0f, 1.0f};
+    return true;
+}
+void SceneViewPanel::handleGizmoDragging(const ECS::Vector2f& worldMousePos)
+{
+    if (!m_isGizmoDragging || m_gizmoTargets.empty())
+    {
+        return;
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    const bool snapping = m_snapEnabled || io.KeyCtrl;
+    if (m_activeTool == TransformTool::Move)
+    {
+        ECS::Vector2f delta = worldMousePos - m_gizmoDragStartWorld;
+        if (m_activeGizmoHandle == GizmoHandle::AxisX)
+        {
+            delta.y = 0.0f;
+        }
+        else if (m_activeGizmoHandle == GizmoHandle::AxisY)
+        {
+            delta.x = 0.0f;
+        }
+        for (const auto& target : m_gizmoTargets)
+        {
+            RuntimeGameObject go = m_context->activeScene->FindGameObjectByGuid(target.guid);
+            if (!go.IsValid() || !go.HasComponent<ECS::TransformComponent>())
+            {
+                continue;
+            }
+            ECS::Vector2f newPos = target.startPosition + delta;
+            if (snapping && m_snapGridSize > 0.0f)
+            {
+                // 轴向拖拽只吸附被拖动的分量，避免破坏轴向约束
+                if (m_activeGizmoHandle != GizmoHandle::AxisY)
+                {
+                    newPos.x = std::round(newPos.x / m_snapGridSize) * m_snapGridSize;
+                }
+                if (m_activeGizmoHandle != GizmoHandle::AxisX)
+                {
+                    newPos.y = std::round(newPos.y / m_snapGridSize) * m_snapGridSize;
+                }
+            }
+            applyWorldTransform(go, newPos, target.startRotation, target.startScale);
+        }
+        if (delta.x != 0.0f || delta.y != 0.0f)
+        {
+            m_gizmoChanged = true;
+        }
+    }
+    else if (m_activeTool == TransformTool::Rotate)
+    {
+        const float startAngle = atan2f(m_gizmoDragStartWorld.y - m_gizmoOrigin.y,
+                                        m_gizmoDragStartWorld.x - m_gizmoOrigin.x);
+        const float currentAngle = atan2f(worldMousePos.y - m_gizmoOrigin.y,
+                                          worldMousePos.x - m_gizmoOrigin.x);
+        float deltaAngle = currentAngle - startAngle;
+        if (snapping && m_rotationSnapDegrees > 0.0f)
+        {
+            const float step = m_rotationSnapDegrees * kPiF / 180.0f;
+            deltaAngle = std::round(deltaAngle / step) * step;
+        }
+        const float sinD = sinf(deltaAngle);
+        const float cosD = cosf(deltaAngle);
+        for (const auto& target : m_gizmoTargets)
+        {
+            RuntimeGameObject go = m_context->activeScene->FindGameObjectByGuid(target.guid);
+            if (!go.IsValid() || !go.HasComponent<ECS::TransformComponent>())
+            {
+                continue;
+            }
+            // 绕 gizmo 原点公转 + 自转，与 Unity 多选旋转一致
+            const ECS::Vector2f offset = target.startPosition - m_gizmoOrigin;
+            const ECS::Vector2f newPos = {
+                m_gizmoOrigin.x + offset.x * cosD - offset.y * sinD,
+                m_gizmoOrigin.y + offset.x * sinD + offset.y * cosD
+            };
+            applyWorldTransform(go, newPos, target.startRotation + deltaAngle, target.startScale);
+        }
+        m_gizmoDisplayAngle = deltaAngle * 180.0f / kPiF;
+        if (deltaAngle != 0.0f)
+        {
+            m_gizmoChanged = true;
+        }
+    }
+    else if (m_activeTool == TransformTool::Scale)
+    {
+        const ImVec2 originScreen = worldToScreenWith(m_editorCameraProperties, m_gizmoOrigin);
+        const float startDx = m_gizmoDragStartScreen.x - originScreen.x;
+        const float startDy = m_gizmoDragStartScreen.y - originScreen.y;
+        const float curDx = io.MousePos.x - originScreen.x;
+        const float curDy = io.MousePos.y - originScreen.y;
+        ECS::Vector2f factor = {1.0f, 1.0f};
+        if (m_activeGizmoHandle == GizmoHandle::Center)
+        {
+            // 中心抓取点几乎与原点重合，距离直接取比值会爆炸，
+            // 改用距离差比例：外移一个轴长放大一倍
+            const float startDist = sqrtf(startDx * startDx + startDy * startDy);
+            const float curDist = sqrtf(curDx * curDx + curDy * curDy);
+            const float uniform = std::max(0.01f, 1.0f + (curDist - startDist) / kGizmoAxisLength);
+            factor = {uniform, uniform};
+        }
+        else if (m_activeGizmoHandle == GizmoHandle::AxisX)
+        {
+            const float ref = (std::abs(startDx) > 1.0f) ? startDx : kGizmoAxisLength;
+            factor.x = curDx / ref;
+            if (std::abs(factor.x) < 0.01f)
+            {
+                factor.x = (factor.x < 0.0f) ? -0.01f : 0.01f;
+            }
+        }
+        else if (m_activeGizmoHandle == GizmoHandle::AxisY)
+        {
+            const float ref = (std::abs(startDy) > 1.0f) ? startDy : kGizmoAxisLength;
+            factor.y = curDy / ref;
+            if (std::abs(factor.y) < 0.01f)
+            {
+                factor.y = (factor.y < 0.0f) ? -0.01f : 0.01f;
+            }
+        }
+        for (const auto& target : m_gizmoTargets)
+        {
+            RuntimeGameObject go = m_context->activeScene->FindGameObjectByGuid(target.guid);
+            if (!go.IsValid() || !go.HasComponent<ECS::TransformComponent>())
+            {
+                continue;
+            }
+            // 位置同样围绕原点伸缩，与 Unity 中心枢轴多选缩放一致
+            const ECS::Vector2f offset = target.startPosition - m_gizmoOrigin;
+            const ECS::Vector2f newPos = {
+                m_gizmoOrigin.x + offset.x * factor.x,
+                m_gizmoOrigin.y + offset.y * factor.y
+            };
+            const ECS::Vector2f newScale = {target.startScale.x * factor.x, target.startScale.y * factor.y};
+            applyWorldTransform(go, newPos, target.startRotation, newScale);
+        }
+        m_gizmoDisplayScale = factor;
+        if (factor.x != 1.0f || factor.y != 1.0f)
+        {
+            m_gizmoChanged = true;
+        }
+    }
+}
+void SceneViewPanel::applyWorldTransform(RuntimeGameObject& gameObject, const ECS::Vector2f& worldPosition,
+                                         float worldRotation, const ECS::Vector2f& worldScale)
+{
+    auto& transform = gameObject.GetComponent<ECS::TransformComponent>();
+    transform.position = worldPosition;
+    transform.rotation = worldRotation;
+    transform.scale = worldScale;
+    if (!gameObject.HasComponent<ECS::ParentComponent>())
+    {
+        return;
+    }
+    auto& parentComponent = gameObject.GetComponent<ECS::ParentComponent>();
+    RuntimeGameObject parentGO = m_context->activeScene->FindGameObjectByEntity(parentComponent.parent);
+    if (!parentGO.IsValid() || !parentGO.HasComponent<ECS::TransformComponent>())
+    {
+        return;
+    }
+    const auto& parentTransform = parentGO.GetComponent<ECS::TransformComponent>();
+    // TransformSystem 按 world = parent.position + rotate(parent.rotation, parent.scale ⊙ local) 合成，
+    // 这里做精确逆变换回写 local，保证下一帧系统重算后世界值不变
+    const ECS::Vector2f relative = worldPosition - parentTransform.position;
+    const float sinR = sinf(-parentTransform.rotation);
+    const float cosR = cosf(-parentTransform.rotation);
+    const ECS::Vector2f unrotated = {
+        relative.x * cosR - relative.y * sinR,
+        relative.x * sinR + relative.y * cosR
+    };
+    transform.localPosition = {
+        std::abs(parentTransform.scale.x) > 1e-5f ? unrotated.x / parentTransform.scale.x : unrotated.x,
+        std::abs(parentTransform.scale.y) > 1e-5f ? unrotated.y / parentTransform.scale.y : unrotated.y
+    };
+    transform.localRotation = worldRotation - parentTransform.rotation;
+    transform.localScale = {
+        std::abs(parentTransform.scale.x) > 1e-5f ? worldScale.x / parentTransform.scale.x : worldScale.x,
+        std::abs(parentTransform.scale.y) > 1e-5f ? worldScale.y / parentTransform.scale.y : worldScale.y
+    };
+}
+bool SceneViewPanel::getEntityWorldBounds(entt::entity entity, ECS::Vector2f& outMin, ECS::Vector2f& outMax)
+{
+    auto& registry = m_context->activeScene->GetRegistry();
+    const auto* transform = registry.try_get<ECS::TransformComponent>(entity);
+    if (!transform)
+    {
+        return false;
+    }
+    float width = 0.0f;
+    float height = 0.0f;
+    ECS::Vector2f center = transform->position;
+    if (const auto* sprite = registry.try_get<ECS::SpriteComponent>(entity); sprite && sprite->image)
+    {
+        // 与 IsPointInSprite 相同的尺寸估算：sourceRect 优先，否则取整图，按 pixelPerUnit 换算
+        width = 100.f / sprite->image->getImportSettings().pixelPerUnit * (sprite->sourceRect.Width() > 0
+            ? sprite->sourceRect.Width()
+            : sprite->image->getImage()->width());
+        height = 100.f / sprite->image->getImportSettings().pixelPerUnit * (sprite->sourceRect.Height() > 0
+            ? sprite->sourceRect.Height()
+            : sprite->image->getImage()->height());
+        center = ComputeAnchoredCenter(*transform, width, height);
+    }
+    else if (const auto* button = registry.try_get<ECS::ButtonComponent>(entity))
+    {
+        width = button->rect.Width();
+        height = button->rect.Height();
+        center = ComputeAnchoredCenter(*transform, width, height);
+    }
+    else if (const auto* text = registry.try_get<ECS::TextComponent>(entity); text && text->typeface)
+    {
+        const SkRect localBounds = GetLocalTextBounds(*text);
+        if (!localBounds.isEmpty())
+        {
+            width = localBounds.width();
+            height = localBounds.height();
+            ECS::Vector2f centerOffset = {
+                localBounds.centerX() * transform->scale.x,
+                localBounds.centerY() * transform->scale.y
+            };
+            if (std::abs(transform->rotation) > 0.001f)
+            {
+                const float sinR = sinf(transform->rotation);
+                const float cosR = cosf(transform->rotation);
+                const float tempX = centerOffset.x;
+                centerOffset.x = centerOffset.x * cosR - centerOffset.y * sinR;
+                centerOffset.y = tempX * sinR + centerOffset.y * cosR;
+            }
+            center = transform->position + centerOffset;
+        }
+    }
+    if (width > 0.0f && height > 0.0f)
+    {
+        const float halfW = width * std::abs(transform->scale.x) * 0.5f;
+        const float halfH = height * std::abs(transform->scale.y) * 0.5f;
+        const float cosR = cosf(transform->rotation);
+        const float sinR = sinf(transform->rotation);
+        // 旋转矩形的世界空间 AABB 半径
+        const float extX = std::abs(halfW * cosR) + std::abs(halfH * sinR);
+        const float extY = std::abs(halfW * sinR) + std::abs(halfH * cosR);
+        outMin = {center.x - extX, center.y - extY};
+        outMax = {center.x + extX, center.y + extY};
+        return true;
+    }
+    // 无可视组件（或尺寸无效）：退化为位置点
+    outMin = transform->position;
+    outMax = transform->position;
+    return true;
+}
+void SceneViewPanel::finalizeBoxSelection(const ECS::Vector2f& worldMousePos)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    // 无拖拽位移视为单击空白：clearSelection 已在按下时发生，这里不再处理
+    if (ImLengthSqr(io.MousePos - m_boxSelectStartScreen) <= 5.0f * 5.0f)
+    {
+        return;
+    }
+    const ECS::Vector2f rectMin = {
+        std::min(m_boxSelectStartWorld.x, worldMousePos.x),
+        std::min(m_boxSelectStartWorld.y, worldMousePos.y)
+    };
+    const ECS::Vector2f rectMax = {
+        std::max(m_boxSelectStartWorld.x, worldMousePos.x),
+        std::max(m_boxSelectStartWorld.y, worldMousePos.y)
+    };
+    const bool additive = io.KeyCtrl || io.KeyShift;
+    std::vector<Guid> hits;
+    auto& registry = m_context->activeScene->GetRegistry();
+    auto view = registry.view<ECS::TransformComponent, ECS::IDComponent>();
+    for (auto entity : view)
+    {
+        ECS::Vector2f boundsMin;
+        ECS::Vector2f boundsMax;
+        if (!getEntityWorldBounds(entity, boundsMin, boundsMax))
+        {
+            continue;
+        }
+        const bool overlap = boundsMin.x <= rectMax.x && boundsMax.x >= rectMin.x &&
+            boundsMin.y <= rectMax.y && boundsMax.y >= rectMin.y;
+        if (overlap)
+        {
+            hits.push_back(view.get<ECS::IDComponent>(entity).guid);
+        }
+    }
+    if (!additive)
+    {
+        m_context->selectionList.clear();
+        m_context->selectionAnchor = Guid();
+    }
+    for (const Guid& guid : hits)
+    {
+        if (std::find(m_context->selectionList.begin(), m_context->selectionList.end(), guid) ==
+            m_context->selectionList.end())
+        {
+            m_context->selectionList.push_back(guid);
+        }
+    }
+    if (m_context->selectionList.empty())
+    {
+        m_context->selectionType = SelectionType::NA;
+        m_context->selectionAnchor = Guid();
+    }
+    else
+    {
+        m_context->selectionType = SelectionType::GameObject;
+        if (!m_context->selectionAnchor.Valid())
+        {
+            m_context->selectionAnchor = m_context->selectionList.front();
+        }
     }
 }

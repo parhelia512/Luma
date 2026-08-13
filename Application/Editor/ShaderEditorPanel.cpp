@@ -2,17 +2,39 @@
 #include "AssetManager.h"
 #include "Logger.h"
 #include "EditorContext.h"
+#include "ImGuiRenderer.h"
+#include "RenderTarget.h"
 #include "Renderer/Nut/NutContext.h"
 #include "Renderer/Nut/ShaderModuleRegistry.h"
+#include "Renderer/Nut/RenderPass.h"
+#include "Renderer/Nut/ShaderStruct.h"
 #include "imgui.h"
 #include "imgui_stdlib.h"
 #include <fstream>
+#include <sstream>
 #include <regex>
 #include <set>
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <format>
 #include "GraphicsBackend.h"
+namespace
+{
+    // Dawn 的 StringView 不保证以 \0 结尾，按 length 语义安全转换
+    std::string WGPUStringViewToString(const wgpu::StringView& view)
+    {
+        if (view.data == nullptr)
+        {
+            return {};
+        }
+        if (view.length == WGPU_STRLEN)
+        {
+            return std::string(view.data);
+        }
+        return std::string(view.data, view.length);
+    }
+}
 ShaderEditorPanel::ShaderEditorPanel()
 {
     m_textEditor.SetLanguageDefinition(TextEditor::LanguageDefinition::WGSL());
@@ -36,13 +58,34 @@ void ShaderEditorPanel::Initialize(EditorContext* context)
 }
 void ShaderEditorPanel::Update(float deltaTime)
 {
+    if (m_isOpen && m_previewEnabled)
+    {
+        m_previewTime += deltaTime;
+        m_previewDeltaTime = deltaTime;
+    }
 }
 void ShaderEditorPanel::Draw()
 {
     if (!m_isVisible || !m_isOpen) return;
     ImGui::SetNextWindowSize(ImVec2(1200, 800), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin(GetPanelName(), &m_isOpen, ImGuiWindowFlags_MenuBar))
+    // ### 之后为固定窗口 ID，前半段标题可动态附加未保存标记 *
+    std::string windowTitle = std::string(GetPanelName()) + (m_hasUnsavedChanges ? " *" : "");
+    windowTitle += "###";
+    windowTitle += GetPanelName();
+    if (ImGui::Begin(windowTitle.c_str(), &m_isOpen, ImGuiWindowFlags_MenuBar))
     {
+        // 面板（含子窗口）聚焦时的快捷键；IsKeyChordPressed 为边沿触发
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
+        {
+            if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S) && m_hasUnsavedChanges)
+            {
+                SaveShader();
+            }
+            if (ImGui::IsKeyChordPressed(ImGuiKey_F5))
+            {
+                CompileShader();
+            }
+        }
         RenderToolbar();
         ImGui::BeginChild("##shader_editor_split", ImVec2(0, -200), false);
         {
@@ -54,6 +97,11 @@ void ShaderEditorPanel::Draw()
             ImGui::SameLine();
             ImGui::BeginChild("##bindings_panel", ImVec2(0, 0), true);
             {
+                if (m_previewEnabled)
+                {
+                    RenderPreviewPanel();
+                    ImGui::Separator();
+                }
                 RenderBindingsPanel();
             }
             ImGui::EndChild();
@@ -86,7 +134,10 @@ void ShaderEditorPanel::HandleAutoComplete()
         std::string prefix = GetWordUnderCursor();
         m_popupPos = m_textEditor.GetCursorScreenPosition();
         m_popupPos.y += 20;
-        if (isCtrl && ImGui::IsKeyPressed(ImGuiKey_S))
+        // 方向键优先，Ctrl+N/P 作为备选；避免占用 Ctrl+S（保存）/Ctrl+W（关闭）
+        bool selectNext = ImGui::IsKeyPressed(ImGuiKey_DownArrow) || (isCtrl && ImGui::IsKeyPressed(ImGuiKey_N));
+        bool selectPrev = ImGui::IsKeyPressed(ImGuiKey_UpArrow) || (isCtrl && ImGui::IsKeyPressed(ImGuiKey_P));
+        if (selectNext)
         {
             m_autoCompleteSelectedIndex++;
             if (m_autoCompleteSelectedIndex >= static_cast<int>(m_autoCompleteCandidates.size()))
@@ -94,7 +145,7 @@ void ShaderEditorPanel::HandleAutoComplete()
             m_textEditor.SetHandleKeyboardInputs(false);
             return;
         }
-        else if (isCtrl && ImGui::IsKeyPressed(ImGuiKey_W))
+        else if (selectPrev)
         {
             m_autoCompleteSelectedIndex--;
             if (m_autoCompleteSelectedIndex < 0)
@@ -310,7 +361,7 @@ void ShaderEditorPanel::RenderAutoCompletePopup()
     if (windowVisible)
     {
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Auto Complete (%d)", (int)m_autoCompleteCandidates.size());
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Ctrl+W/S: 选择 | Tab/Enter: 确认 | Esc: 取消");
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "↑/↓ 或 Ctrl+P/N: 选择 | Tab/Enter: 确认 | Esc: 取消");
         ImGui::Separator();
         for (int i = 0; i < static_cast<int>(m_autoCompleteCandidates.size()); ++i)
         {
@@ -450,6 +501,9 @@ void ShaderEditorPanel::CompileShader()
     m_compileOutput.clear();
     m_compileSuccess = false;
     m_shaderBindings.clear();
+    m_compileMessages.clear();
+    m_lastExpandedCode.clear();
+    m_textEditor.SetErrorMarkers({});
     if (m_shaderCodeBuffer.empty())
     {
         m_compileOutput = "错误: 代码为空。";
@@ -478,29 +532,50 @@ void ShaderEditorPanel::CompileShader()
         {
             throw std::runtime_error("NutContext 获取失败，图形后端未就绪。");
         }
+        // 先自行展开一遍模块引用：拿到展开失败的错误文本，
+        // 同时展开结果用于把 Tint 报告的行号映射回编辑器行号
+        std::string expandError;
+        std::string exportedModuleName;
+        std::string expandedCode =
+            Nut::ShaderModuleExpander::ExpandModules(m_shaderCodeBuffer, expandError, exportedModuleName);
+        if (expandedCode.empty())
+        {
+            m_compileOutput = "模块展开失败: " + expandError;
+            return;
+        }
         LogInfo("ShaderEditorPanel: Compiling WGSL shader...");
         Nut::ShaderModule& module = Nut::ShaderManager::GetFromString(m_shaderCodeBuffer, nutCtx);
-        if (module)
+        if (!module)
         {
-            m_compileSuccess = true;
-            m_compileOutput = "编译成功 (Validation Passed)";
-            module.ForeachBinding([this](const Nut::ShaderBindingInfo& info)
-            {
-                m_shaderBindings.push_back(info);
-            });
-            std::sort(m_shaderBindings.begin(), m_shaderBindings.end(),
-                      [](const Nut::ShaderBindingInfo& a, const Nut::ShaderBindingInfo& b)
-                      {
-                          if (a.groupIndex != b.groupIndex) return a.groupIndex < b.groupIndex;
-                          return a.location < b.location;
-                      });
-            LogInfo("ShaderEditorPanel: Compilation successful. Found {} bindings.", m_shaderBindings.size());
-        }
-        else
-        {
-            m_compileSuccess = false;
             m_compileOutput = "编译失败: ShaderModule 创建失败 (请查看控制台日志)。";
+            return;
         }
+        CollectCompileDiagnostics(module, nutCtx, expandedCode, exportedModuleName);
+        bool hasError = std::any_of(m_compileMessages.begin(), m_compileMessages.end(),
+                                    [](const CompileMessage& msg) { return msg.isError; });
+        if (hasError)
+        {
+            m_compileOutput = "编译失败";
+            return;
+        }
+        m_compileSuccess = true;
+        m_compileOutput = "编译成功 (Validation Passed)";
+        m_lastExpandedCode = std::move(expandedCode);
+        // 快照通过验证的代码：预览材质只能用它重建，
+        // 避免编译成功后继续编辑时把未验证的新代码交给渲染管线
+        m_previewShaderCode = m_shaderCodeBuffer;
+        module.ForeachBinding([this](const Nut::ShaderBindingInfo& info)
+        {
+            m_shaderBindings.push_back(info);
+        });
+        std::sort(m_shaderBindings.begin(), m_shaderBindings.end(),
+                  [](const Nut::ShaderBindingInfo& a, const Nut::ShaderBindingInfo& b)
+                  {
+                      if (a.groupIndex != b.groupIndex) return a.groupIndex < b.groupIndex;
+                      return a.location < b.location;
+                  });
+        m_previewMaterialDirty = true;
+        LogInfo("ShaderEditorPanel: Compilation successful. Found {} bindings.", m_shaderBindings.size());
     }
     catch (const std::exception& e)
     {
@@ -508,6 +583,130 @@ void ShaderEditorPanel::CompileShader()
         m_compileOutput = std::string("编译异常:\n") + e.what();
         LogError("ShaderEditorPanel::CompileShader - Exception: {}", e.what());
     }
+}
+void ShaderEditorPanel::CollectCompileDiagnostics(Nut::ShaderModule& module,
+                                                  const std::shared_ptr<Nut::NutContext>& nutCtx,
+                                                  const std::string& expandedCode,
+                                                  const std::string& exportedModuleName)
+{
+    std::vector<int> lineMap = BuildExpandedLineMap(expandedCode, exportedModuleName);
+    struct RawMessage
+    {
+        std::string text;
+        uint64_t line = 0;
+        uint64_t column = 0;
+        bool isError = false;
+        bool isWarning = false;
+    };
+    struct DiagnosticsHolder
+    {
+        std::vector<RawMessage> messages;
+        bool completed = false;
+    };
+    // WaitAny 超时后回调理论上仍可能滞后触发，shared_ptr 保证其写入目标不悬空
+    auto holder = std::make_shared<DiagnosticsHolder>();
+    wgpu::Future future = module.Get().GetCompilationInfo(
+        wgpu::CallbackMode::WaitAnyOnly,
+        [holder](wgpu::CompilationInfoRequestStatus status, wgpu::CompilationInfo const* info)
+        {
+            holder->completed = true;
+            if (status != wgpu::CompilationInfoRequestStatus::Success || !info)
+            {
+                return;
+            }
+            for (size_t i = 0; i < info->messageCount; ++i)
+            {
+                const wgpu::CompilationMessage& msg = info->messages[i];
+                RawMessage raw;
+                raw.text = WGPUStringViewToString(msg.message);
+                raw.line = msg.lineNum;
+                raw.column = msg.linePos;
+                raw.isError = (msg.type == wgpu::CompilationMessageType::Error);
+                raw.isWarning = (msg.type == wgpu::CompilationMessageType::Warning);
+                holder->messages.push_back(std::move(raw));
+            }
+        });
+    // Shader 验证在创建时已同步完成，这里只是取回结果，2 秒余量充足
+    nutCtx->GetWGPUInstance().WaitAny(future, 2'000'000'000);
+    if (!holder->completed)
+    {
+        LogWarn("ShaderEditorPanel: GetCompilationInfo 等待超时，无法获取编译诊断");
+        return;
+    }
+    TextEditor::ErrorMarkers markers;
+    for (const auto& raw : holder->messages)
+    {
+        if (!raw.isError && !raw.isWarning)
+        {
+            continue;
+        }
+        CompileMessage msg;
+        msg.isError = raw.isError;
+        msg.text = raw.text;
+        msg.column = static_cast<int>(raw.column);
+        if (raw.line > 0)
+        {
+            int expandedIdx = static_cast<int>(raw.line) - 1;
+            if (expandedIdx >= 0 && expandedIdx < static_cast<int>(lineMap.size()))
+            {
+                msg.editorLine = lineMap[expandedIdx];
+            }
+            if (msg.editorLine < 0)
+            {
+                // 行号落在展开出的导入模块代码里，无法映射回编辑器
+                msg.text = std::format("(导入模块内 第{}行) {}", raw.line, raw.text);
+            }
+        }
+        if (msg.isError && msg.editorLine >= 0)
+        {
+            auto [it, inserted] = markers.try_emplace(msg.editorLine + 1, msg.text);
+            if (!inserted)
+            {
+                it->second += "\n" + msg.text;
+            }
+        }
+        m_compileMessages.push_back(std::move(msg));
+    }
+    m_textEditor.SetErrorMarkers(markers);
+}
+std::vector<int> ShaderEditorPanel::BuildExpandedLineMap(const std::string& expandedCode,
+                                                         const std::string& exportedModuleName) const
+{
+    auto splitLines = [](const std::string& text)
+    {
+        std::vector<std::string> lines;
+        std::istringstream stream(text);
+        std::string line;
+        while (std::getline(stream, line))
+        {
+            lines.push_back(line);
+        }
+        return lines;
+    };
+    std::vector<std::string> expandedLines = splitLines(expandedCode);
+    std::vector<std::string> originalLines = splitLines(m_shaderCodeBuffer);
+    std::vector<int> map(expandedLines.size(), -1);
+    // 展开器把导入模块整体前置，主代码保持原有顺序放在尾部，
+    // 只是删掉了其中的 import/export 行，因此从尾部向前逐行对齐即可
+    int expIdx = static_cast<int>(expandedLines.size()) - 1;
+    if (!exportedModuleName.empty() && expIdx >= 0 && expandedLines[expIdx].rfind("// ==========", 0) == 0)
+    {
+        --expIdx; // 导出模块时主代码末尾会追加一行结束注释
+    }
+    for (int origIdx = static_cast<int>(originalLines.size()) - 1; origIdx >= 0 && expIdx >= 0;)
+    {
+        if (expandedLines[expIdx] == originalLines[origIdx])
+        {
+            map[expIdx] = origIdx;
+            --expIdx;
+            --origIdx;
+        }
+        else
+        {
+            --origIdx; // 原始行是被展开器移除的 import/export 行
+        }
+    }
+    return map;
 }
 void ShaderEditorPanel::RenderBindingsPanel()
 {
@@ -620,6 +819,11 @@ void ShaderEditorPanel::SaveShader()
     m_hasUnsavedChanges = false;
     m_codeChanged = false;
     LogInfo("ShaderEditorPanel::SaveShader - Saved: {}", metadata->assetPath.string());
+    // 保存成功后立即编译校验（仅 WGSL），编译失败不回滚已完成的保存
+    if (m_shaderData.language == Data::ShaderLanguage::WGSL)
+    {
+        CompileShader();
+    }
 }
 void ShaderEditorPanel::OpenMaterial(const AssetHandle& materialHandle)
 {
@@ -663,11 +867,13 @@ void ShaderEditorPanel::RenderToolbar()
         }
         ImGui::EndMenuBar();
     }
-    if (ImGui::Button("保存")) SaveShader();
+    if (ImGui::Button("保存 (Ctrl+S)")) SaveShader();
     ImGui::SameLine();
     if (ImGui::Button("编译 (F5)")) CompileShader();
     ImGui::SameLine();
     if (ImGui::Button("设置")) m_showSettingsPanel = !m_showSettingsPanel;
+    ImGui::SameLine();
+    ImGui::Checkbox("预览", &m_previewEnabled);
     ImGui::SameLine();
     if (m_hasUnsavedChanges)
         ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.0f, 1.0f), "  * 未保存");
@@ -676,21 +882,281 @@ void ShaderEditorPanel::RenderToolbar()
 }
 void ShaderEditorPanel::RenderCompileOutput()
 {
+    // 主题色：错误沿用 0.62,0.24,0.24 色系（正文用提亮变体保证暗底可读），成功用低饱和绿
+    const ImVec4 errorBase(0.62f, 0.24f, 0.24f, 1.0f);
+    const ImVec4 errorText(0.85f, 0.45f, 0.45f, 1.0f);
+    const ImVec4 successText(0.48f, 0.68f, 0.48f, 1.0f);
+    const ImVec4 warningText(0.80f, 0.68f, 0.35f, 1.0f);
     ImGui::Text("输出日志:");
+    if (!m_compileMessages.empty())
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(单击诊断行可跳转到对应代码)");
+    }
     ImGui::Separator();
     if (!m_compileOutput.empty())
     {
         if (m_compileSuccess)
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "[Success] %s", m_compileOutput.c_str());
+            ImGui::TextColored(successText, "[Success] %s", m_compileOutput.c_str());
         else
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "[Error] %s", m_compileOutput.c_str());
+            ImGui::TextColored(errorBase, "[Error] %s", m_compileOutput.c_str());
     }
+    for (size_t i = 0; i < m_compileMessages.size(); ++i)
+    {
+        const CompileMessage& msg = m_compileMessages[i];
+        ImGui::PushID(static_cast<int>(i));
+        std::string label;
+        if (msg.editorLine >= 0)
+        {
+            if (msg.column > 0)
+                label = std::format("{} 行 {} 列 {}: {}", msg.isError ? "错误" : "警告",
+                                    msg.editorLine + 1, msg.column, msg.text);
+            else
+                label = std::format("{} 行 {}: {}", msg.isError ? "错误" : "警告",
+                                    msg.editorLine + 1, msg.text);
+        }
+        else
+        {
+            label = std::format("{}: {}", msg.isError ? "错误" : "警告", msg.text);
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, msg.isError ? errorText : warningText);
+        if (ImGui::Selectable(label.c_str()) && msg.editorLine >= 0)
+        {
+            // Tint 的列以字符计而编辑器列按 Tab 展开计，跳到行首已足够定位
+            m_textEditor.SetCursorPosition(TextEditor::Coordinates(msg.editorLine, 0));
+        }
+        ImGui::PopStyleColor();
+        ImGui::PopID();
+    }
+}
+void ShaderEditorPanel::RenderPreviewPanel()
+{
+    ImGui::Text("实时预览");
+    ImGui::Separator();
+    if (!m_currentShaderHandle.Valid() ||
+        m_shaderData.language != Data::ShaderLanguage::WGSL ||
+        m_shaderData.type != Data::ShaderType::VertFrag)
+    {
+        ImGui::TextDisabled("仅支持 WGSL VertFrag 着色器的预览。");
+        return;
+    }
+    RebuildPreviewMaterialIfNeeded();
+    if (!m_previewMaterial)
+    {
+        if (!m_previewStatus.empty())
+            ImGui::TextWrapped("%s", m_previewStatus.c_str());
+        else
+            ImGui::TextDisabled("编译通过后自动生成预览。");
+        return;
+    }
+    float width = ImGui::GetContentRegionAvail().x;
+    if (width < 64.0f) width = 64.0f;
+    float height = width * 0.75f;
+    RenderPreviewImage(width, height);
+    if (!m_previewStatus.empty())
+    {
+        ImGui::TextWrapped("%s", m_previewStatus.c_str());
+    }
+}
+void ShaderEditorPanel::RebuildPreviewMaterialIfNeeded()
+{
+    if (!m_previewMaterialDirty)
+    {
+        return;
+    }
+    if (!m_compileSuccess)
+    {
+        return; // 保留上一份可用的预览材质，等编译通过后再重建
+    }
+    m_previewMaterialDirty = false;
+    m_previewStatus.clear();
+    // 预览复用引擎的 Sprite 材质通路：要求标准入口与 group(0) 保留绑定（import Std 即满足）
+    static const std::regex vsEntryRe(R"(\bfn\s+vs_main\b)");
+    static const std::regex fsEntryRe(R"(\bfn\s+fs_main\b)");
+    if (!std::regex_search(m_lastExpandedCode, vsEntryRe) ||
+        !std::regex_search(m_lastExpandedCode, fsEntryRe))
+    {
+        m_previewMaterial.reset();
+        m_previewStatus = "预览不可用: 缺少 vs_main/fs_main 入口（需使用标准 Sprite 材质模板）。";
+        return;
+    }
+    bool hasEngineData = false;
+    bool hasInstances = false;
+    bool hasTexture = false;
+    bool hasSampler = false;
+    for (const auto& binding : m_shaderBindings)
+    {
+        bool isReservedSlot = (binding.groupIndex == 0 && binding.location <= 3);
+        // 预览无法提供主纹理槽之外的纹理/采样器（如 Lighting 的阴影贴图），直接降级
+        if (!isReservedSlot &&
+            (binding.type == Nut::BindingType::Texture || binding.type == Nut::BindingType::Sampler))
+        {
+            m_previewMaterial.reset();
+            m_previewStatus = std::format("预览不可用: 绑定 {} (group {}, binding {}) 需要引擎运行时资源。",
+                                          binding.name, binding.groupIndex, binding.location);
+            return;
+        }
+        if (binding.groupIndex != 0) continue;
+        if (binding.location == 0 && binding.type == Nut::BindingType::UniformBuffer) hasEngineData = true;
+        if (binding.location == 1 && binding.type == Nut::BindingType::StorageBuffer) hasInstances = true;
+        if (binding.location == 2 && binding.type == Nut::BindingType::Texture) hasTexture = true;
+        if (binding.location == 3 && binding.type == Nut::BindingType::Sampler) hasSampler = true;
+    }
+    if (!hasEngineData || !hasInstances || !hasTexture || !hasSampler)
+    {
+        m_previewMaterial.reset();
+        m_previewStatus = "预览不可用: 缺少 group(0) 引擎保留绑定，请 import Std。";
+        return;
+    }
+    GraphicsBackend* backend = m_context ? m_context->graphicsBackend : nullptr;
+    auto nutCtx = backend ? backend->GetNutContext() : nullptr;
+    if (!nutCtx)
+    {
+        m_previewStatus = "预览不可用: 图形后端未就绪。";
+        return;
+    }
+    auto material = std::make_unique<RuntimeWGSLMaterial>();
+    if (!material->Initialize(nutCtx, m_previewShaderCode, backend->GetSurfaceFormat(), 1))
+    {
+        m_previewMaterial.reset();
+        m_previewStatus = "预览材质构建失败（详见控制台日志）。";
+        return;
+    }
+    // group(0) 由每帧 SwapTexture 构建；group(1)+ 只含占位 uniform/storage，
+    // 在此一次性构建，否则 SetPipeline 会绑到未 Build 的空组
+    if (Nut::RenderPipeline* pipeline = material->GetPipeline(1))
+    {
+        pipeline->ForeachGroup([&nutCtx](size_t groupIdx, Nut::BindGroup& group)
+        {
+            if (groupIdx != 0)
+            {
+                group.Build(nutCtx);
+            }
+        });
+    }
+    m_previewMaterial = std::move(material);
+}
+bool ShaderEditorPanel::EnsurePreviewResources(const std::shared_ptr<Nut::NutContext>& nutCtx)
+{
+    if (m_previewResourcesReady)
+    {
+        return true;
+    }
+    const uint32_t whitePixel = 0xFFFFFFFFu;
+    m_previewWhiteTexture = Nut::TextureBuilder()
+                            .SetPixelData(&whitePixel, 1, 1, 4)
+                            .SetSize(1, 1)
+                            .Build(nutCtx);
+    if (!m_previewWhiteTexture)
+    {
+        return false;
+    }
+    // 与 RenderSystem 的精灵四边形一致的单位几何
+    std::vector<Vertex> vertices = {
+        {-0.5f, -0.5f, 0.0f, 0.0f},
+        {-0.5f, 0.5f, 0.0f, 1.0f},
+        {0.5f, 0.5f, 1.0f, 1.0f},
+        {0.5f, -0.5f, 1.0f, 0.0f}
+    };
+    std::vector<uint16_t> indices = {0, 1, 2, 0, 2, 3};
+    m_previewQuadVBO = Nut::BufferBuilder()
+                       .SetUsage(Nut::BufferUsage::Vertex | Nut::BufferUsage::CopyDst)
+                       .SetData(vertices)
+                       .Build(nutCtx);
+    m_previewQuadIBO = Nut::BufferBuilder()
+                       .SetUsage(Nut::BufferUsage::Index | Nut::BufferUsage::CopyDst)
+                       .SetData(indices)
+                       .Build(nutCtx);
+    m_previewSampler.SetMagFilter(wgpu::FilterMode::Linear)
+                    .SetMinFilter(wgpu::FilterMode::Linear)
+                    .Build(nutCtx);
+    m_previewResourcesReady = true;
+    return true;
+}
+void ShaderEditorPanel::RenderPreviewImage(float width, float height)
+{
+    GraphicsBackend* backend = m_context ? m_context->graphicsBackend : nullptr;
+    if (!backend || !m_context->imguiRenderer)
+    {
+        return;
+    }
+    auto nutCtx = backend->GetNutContext();
+    if (!nutCtx || !EnsurePreviewResources(nutCtx))
+    {
+        return;
+    }
+    auto renderTarget = backend->CreateOrGetRenderTarget("ShaderEditorPreview",
+                                                         static_cast<uint16_t>(width),
+                                                         static_cast<uint16_t>(height));
+    if (!renderTarget)
+    {
+        return;
+    }
+    Nut::RenderPipeline* pipeline = m_previewMaterial->GetPipeline(1);
+    if (!pipeline)
+    {
+        return;
+    }
+    EngineData engineData{};
+    engineData.CameraPosition = {0.0f, 0.0f};
+    engineData.CameraScaleX = 1.0f;
+    engineData.CameraScaleY = -1.0f; // 与 GameView 相同的 Y 翻转约定
+    engineData.CameraSinR = 0.0f;
+    engineData.CameraCosR = 1.0f;
+    engineData.ViewportSize = {width, height};
+    engineData.TimeData = {m_previewTime, m_previewDeltaTime};
+    engineData.MousePosition = {0.0f, 0.0f};
+    // 单实例四边形铺满整个预览视口
+    std::vector<InstanceData> instances(1);
+    InstanceData& inst = instances[0];
+    inst.position = {0.0f, 0.0f, 0.0f, 1.0f};
+    inst.scaleX = 1.0f;
+    inst.scaleY = 1.0f;
+    inst.sinR = 0.0f;
+    inst.cosR = 1.0f;
+    inst.color = {1.0f, 1.0f, 1.0f, 1.0f};
+    inst.uvRect = {0.0f, 0.0f, 1.0f, 1.0f};
+    inst.size = {width, height};
+    pipeline->SetReservedBuffers(engineData, instances, nutCtx);
+    if (!pipeline->SwapTexture(m_previewWhiteTexture, &m_previewSampler, nutCtx))
+    {
+        ImGui::TextDisabled("预览绑定构建失败。");
+        return;
+    }
+    auto targetTexture = Nut::TextureA::CreateTextureA(renderTarget->GetTexture(), nutCtx);
+    auto attachment = Nut::ColorAttachmentBuilder()
+                      .SetTexture(targetTexture)
+                      .SetLoadOnOpen(Nut::LoadOnOpen::Clear)
+                      .SetClearColor({0.08, 0.08, 0.10, 1.0})
+                      .SetStoreOnOpen(Nut::StoreOnOpen::Store)
+                      .Build();
+    auto renderPass = nutCtx->BeginRenderFrame()
+                            .AddColorAttachment(attachment)
+                            .Build();
+    if (!renderPass)
+    {
+        return;
+    }
+    renderPass.SetPipeline(*pipeline);
+    m_previewMaterial->Bind(renderPass);
+    renderPass.SetVertexBuffer(0, m_previewQuadVBO);
+    renderPass.SetIndexBuffer(m_previewQuadIBO, wgpu::IndexFormat::Uint16);
+    renderPass.DrawIndexed(6, 1, 0, 0, 0);
+    nutCtx->Submit({nutCtx->EndRenderFrame(renderPass)});
+    ImTextureID textureId = m_context->imguiRenderer->GetOrCreateTextureIdFor(renderTarget->GetTexture());
+    ImGui::Image(textureId, ImVec2(width, height));
 }
 void ShaderEditorPanel::Shutdown()
 {
     m_isOpen = false;
     m_compileOutput.clear();
+    m_compileMessages.clear();
     m_shaderBindings.clear();
+    m_previewMaterial.reset();
+    m_previewWhiteTexture.reset();
+    m_previewQuadVBO = Nut::Buffer(std::nullopt);
+    m_previewQuadIBO = Nut::Buffer(std::nullopt);
+    m_previewResourcesReady = false;
     m_context = nullptr;
 }
 void ShaderEditorPanel::HandleFontZoom()

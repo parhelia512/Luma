@@ -25,6 +25,10 @@ struct AnimationClip : Data::IData<AnimationClip>
     std::string Name;
     /// 动画剪辑所针对的目标实体的全局唯一标识符。
     Guid TargetEntityGuid;
+    /// 播放帧率（帧/秒）。旧资产缺失该字段时按 60 处理。
+    float FrameRate = 60.0f;
+    /// 是否循环播放。旧资产缺失该字段时按循环处理。
+    bool IsLooping = true;
     /// 存储动画的所有帧，键为帧索引，值为对应的动画帧数据。
     std::unordered_map<int, AnimFrame> Frames;
 };
@@ -48,6 +52,8 @@ namespace YAML
             Node node;
             node["Name"] = clip.Name;
             node["TargetEntityGuid"] = clip.TargetEntityGuid.ToString();
+            node["FrameRate"] = clip.FrameRate;
+            node["IsLooping"] = clip.IsLooping;
 
 
             Node framesNode(YAML::NodeType::Map);
@@ -81,6 +87,13 @@ namespace YAML
 
             clip.Name = node["Name"].as<std::string>();
             clip.TargetEntityGuid = Guid::FromString(node["TargetEntityGuid"].as<std::string>());
+            // 向后兼容：旧资产缺少帧率/循环字段时使用默认值
+            clip.FrameRate = node["FrameRate"] ? node["FrameRate"].as<float>(60.0f) : 60.0f;
+            if (clip.FrameRate <= 0.0f)
+            {
+                clip.FrameRate = 60.0f;
+            }
+            clip.IsLooping = node["IsLooping"] ? node["IsLooping"].as<bool>(true) : true;
 
 
             clip.Frames.clear();

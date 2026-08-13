@@ -1,5 +1,7 @@
 #ifndef RUNTIMEANIMATIONCONTROLLER_H
 #define RUNTIMEANIMATIONCONTROLLER_H
+#include <mutex>
+
 #include "AnimationControllerData.h"
 #include "IRuntimeAsset.h"
 #include "RuntimeAnimationClip.h"
@@ -55,6 +57,14 @@ private:
      */
     bool EvaluateCondition(const std::vector<Condition>& conditions);
     /**
+     * @brief 查询状态数据中配置的播放速度倍率。
+     * @param stateGuid 状态的全局唯一标识符。
+     * @return 该状态的速度倍率，未配置或非法时返回 1.0。
+     */
+    float getStateSpeed(const Guid& stateGuid) const;
+
+    mutable std::mutex m_playbackStatusMutex; ///< 保护播放状态快照：模拟线程写、UI线程读。
+    /**
      * @brief 更新基于帧的动画。
      * @param deltaTime 帧之间的时间差。
      */
@@ -81,6 +91,32 @@ private:
      */
     void BlendAnimationFrames(const sk_sp<RuntimeAnimationClip>& fromClip, int fromFrame,
                               const sk_sp<RuntimeAnimationClip>& toClip, int toFrame, float blendFactor);
+
+public:
+    /**
+     * @brief 播放状态快照，供编辑器等UI线程只读展示。
+     *
+     * 运行时数据在模拟线程更新，UI线程通过 GetPlaybackStatus 拷贝快照读取，
+     * 避免直接访问内部容器造成数据竞争。
+     */
+    struct PlaybackStatus
+    {
+        std::string currentStateName; ///< 当前状态（剪辑）名称。
+        Guid currentStateGuid; ///< 当前状态的全局唯一标识符。
+        bool isTransitioning = false; ///< 是否正在过渡。
+        std::string targetStateName; ///< 过渡目标状态名称，未过渡时为空。
+        Guid targetStateGuid; ///< 过渡目标状态的全局唯一标识符。
+        float transitionProgress = 0.0f; ///< 过渡进度（0-1）。
+    };
+
+    /**
+     * @brief 获取播放状态快照（线程安全，返回拷贝）。
+     * @return 当前播放状态快照。
+     */
+    PlaybackStatus GetPlaybackStatus() const;
+
+private:
+    PlaybackStatus m_playbackStatus; ///< 播放状态快照，写入点见 playInternal / UpdateTransition。
 
 public:
     /**
@@ -150,10 +186,10 @@ public:
     void PlayEntryAnimation();
     /**
      * @brief 查找最佳的动画过渡。
-     * @param animationHasFinished 标记当前动画是否已播放完毕。
+     * @param normalizedTime 当前动画的归一化播放进度（0-1），用于退出时间判定。
      * @return 指向最佳过渡的指针，如果没有找到则为 nullptr。
      */
-    const Transition* FindBestTransition(bool animationHasFinished);
+    const Transition* FindBestTransition(float normalizedTime);
 
     /**
      * @brief 更新动画控制器的状态。

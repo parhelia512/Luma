@@ -1,5 +1,8 @@
 #include "ToolBarPanel.h"
 #include "PopupManager.h"
+#include "HierarchyPanel.h"
+#include "../Components/IDComponent.h"
+#include <imgui_internal.h>
 #include "AnimationSystem.h"
 #include "AssetManager.h"
 #include "AssetPacker.h"
@@ -363,9 +366,192 @@ void ToolbarPanel::Draw()
     PROFILE_FUNCTION();
     handleShortcuts();
     drawMainMenuBar();
+    drawQuickSearchPopup();
+    drawSaveSceneAsPopup();
     drawSettingsWindow();
     drawScriptCompilationPopup();
     drawPackagingPopup();
+}
+
+void ToolbarPanel::openSceneByGuid(const Guid& sceneGuid)
+{
+    sk_sp<RuntimeScene> newScene = SceneManager::GetInstance().LoadScene(sceneGuid);
+    if (!newScene)
+    {
+        LogError("场景加载失败: {}", sceneGuid.ToString());
+        return;
+    }
+    m_context->activeScene = newScene;
+    SceneManager::ConfigureEditorPreviewSystems(m_context->activeScene);
+    m_context->activeScene->Activate(*m_context->engineContext);
+    m_context->selectionType = SelectionType::NA;
+    m_context->selectionList.clear();
+    // 触发层级面板重建缓存（与资产浏览器打开场景的做法一致）
+    m_context->objectToFocusInHierarchy = Guid::NewGuid();
+    LogInfo("场景已打开: {}", newScene->GetName());
+}
+
+void ToolbarPanel::drawQuickSearchPopup()
+{
+    if (m_quickSearchRequested)
+    {
+        m_quickSearchRequested = false;
+        m_quickSearchBuffer[0] = '\0';
+        ImGui::OpenPopup("##QuickSearch");
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->GetCenter().x, viewport->WorkPos.y + 80.0f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 0.0f));
+    if (!ImGui::BeginPopup("##QuickSearch"))
+    {
+        return;
+    }
+    if (ImGui::IsWindowAppearing())
+    {
+        ImGui::SetKeyboardFocusHere();
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##QuickSearchInput", "搜索资产、场景对象、面板... (Esc 关闭)",
+                             m_quickSearchBuffer, sizeof(m_quickSearchBuffer));
+    std::string filter = m_quickSearchBuffer;
+    std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+    auto matches = [&filter](const std::string& text)
+    {
+        std::string lower = text;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        return lower.find(filter) != std::string::npos;
+    };
+
+    ImGui::BeginChild("##QuickSearchResults", ImVec2(0.0f, 380.0f));
+    if (!filter.empty())
+    {
+        constexpr int kMaxPerCategory = 15;
+
+        // 面板命令
+        int shown = 0;
+        for (const auto& panel : m_context->editor->GetPanels())
+        {
+            const char* name = panel->GetPanelName();
+            if (std::strcmp(name, "工具栏") == 0 || !matches(name)) continue;
+            if (shown == 0) ImGui::SeparatorText("面板");
+            if (ImGui::Selectable(std::format("打开面板: {}", name).c_str()))
+            {
+                panel->SetVisible(true);
+                ImGui::SetWindowFocus(name);
+                ImGui::CloseCurrentPopup();
+            }
+            if (++shown >= kMaxPerCategory) break;
+        }
+
+        // 场景对象
+        if (m_context->activeScene)
+        {
+            shown = 0;
+            auto& registry = m_context->activeScene->GetRegistry();
+            auto view = registry.view<ECS::IDComponent>();
+            for (auto entity : view)
+            {
+                const auto& id = view.get<ECS::IDComponent>(entity);
+                if (!matches(id.name)) continue;
+                if (shown == 0) ImGui::SeparatorText("场景对象");
+                ImGui::PushID(static_cast<int>(entity));
+                if (ImGui::Selectable(id.name.c_str()))
+                {
+                    m_context->selectionType = SelectionType::GameObject;
+                    m_context->selectionList = {id.guid};
+                    m_context->selectionAnchor = id.guid;
+                    m_context->objectToFocusInHierarchy = id.guid;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::PopID();
+                if (++shown >= kMaxPerCategory) break;
+            }
+        }
+
+        // 资产
+        shown = 0;
+        for (const auto& [guidStr, meta] : AssetManager::GetInstance().GetAssetDatabase())
+        {
+            const std::string fileName = meta.assetPath.filename().string();
+            if (!matches(fileName)) continue;
+            if (shown == 0) ImGui::SeparatorText("资产");
+            ImGui::PushID(guidStr.c_str());
+            if (ImGui::Selectable(meta.assetPath.string().c_str()))
+            {
+                m_context->assetToFocusInBrowser = meta.guid;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopID();
+            if (++shown >= kMaxPerCategory) break;
+        }
+    }
+    else
+    {
+        ImGui::TextDisabled("输入以搜索。回车/点击跳转：资产会在资产浏览器中定位，对象会在层级中定位。");
+    }
+    ImGui::EndChild();
+    ImGui::EndPopup();
+}
+
+void ToolbarPanel::drawSaveSceneAsPopup()
+{
+    if (m_saveAsPopupRequested)
+    {
+        m_saveAsPopupRequested = false;
+        const std::string suggested = (m_context->activeScene && !m_context->activeScene->GetName().empty())
+                                          ? m_context->activeScene->GetName() + "_副本"
+                                          : std::string("NewScene");
+        std::snprintf(m_saveAsNameBuffer, sizeof(m_saveAsNameBuffer), "%s", suggested.c_str());
+        ImGui::OpenPopup("场景另存为");
+    }
+    const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("场景另存为", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextUnformatted("将当前场景另存为副本（保存到 Assets 根目录）：");
+        ImGui::SetNextItemWidth(300.0f);
+        ImGui::InputText("##SaveAsName", m_saveAsNameBuffer, sizeof(m_saveAsNameBuffer));
+        ImGui::SameLine();
+        ImGui::TextUnformatted(".scene");
+        ImGui::Separator();
+        const bool nameValid = m_saveAsNameBuffer[0] != '\0' && m_context->activeScene;
+        if (!nameValid) ImGui::BeginDisabled();
+        if (ImGui::Button("保存副本", ImVec2(110, 0)))
+        {
+            Data::SceneData sceneData = m_context->activeScene->SerializeToData();
+            std::filesystem::path targetPath = AssetManager::GetInstance().GetAssetsRootPath() /
+                (std::string(m_saveAsNameBuffer) + ".scene");
+            if (std::filesystem::exists(targetPath))
+            {
+                LogWarn("另存为失败：文件已存在 {}", targetPath.generic_string());
+            }
+            else
+            {
+                YAML::Node sceneNode = YAML::convert<Data::SceneData>::encode(sceneData);
+                std::ofstream fout(targetPath.generic_string());
+                if (fout.is_open())
+                {
+                    fout << sceneNode;
+                    fout.close();
+                    AssetManager::GetInstance().LoadAsset(targetPath);
+                    LogInfo("场景副本已保存: {}", targetPath.generic_string());
+                    ImGui::CloseCurrentPopup();
+                }
+                else
+                {
+                    LogError("另存为失败，无法写入: {}", targetPath.generic_string());
+                }
+            }
+        }
+        if (!nameValid) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("取消", ImVec2(110, 0)))
+        {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 void ToolbarPanel::drawPackagingPopup()
 {
@@ -881,41 +1067,21 @@ void ToolbarPanel::drawWindowMenu()
 {
     if (ImGui::BeginMenu("窗口"))
     {
-        IEditorPanel* pluginPanel = m_context->editor->GetPanelByName("插件管理");
-        IEditorPanel* consolePanel = m_context->editor->GetPanelByName("控制台");
-        IEditorPanel* animPanel = m_context->editor->GetPanelByName("动画编辑器");
-        IEditorPanel* aiPanel = m_context->editor->GetPanelByName("AI 助手");
-        if (pluginPanel)
+        // 全部面板的可见性开关（工具栏自身除外——关掉菜单栏就无法恢复了）
+        for (const auto& panel : m_context->editor->GetPanels())
         {
-            bool visible = pluginPanel->IsVisible();
-            if (ImGui::MenuItem("插件管理", nullptr, &visible))
+            const char* name = panel->GetPanelName();
+            if (std::strcmp(name, "工具栏") == 0) continue;
+            bool visible = panel->IsVisible();
+            if (ImGui::MenuItem(name, nullptr, &visible))
             {
-                pluginPanel->SetVisible(visible);
+                panel->SetVisible(visible);
             }
         }
-        if (consolePanel)
+        ImGui::Separator();
+        if (ImGui::MenuItem("重置窗口布局"))
         {
-            bool visible = consolePanel->IsVisible();
-            if (ImGui::MenuItem("控制台", nullptr, &visible))
-            {
-                consolePanel->SetVisible(visible);
-            }
-        }
-        if (animPanel)
-        {
-            bool visible = animPanel->IsVisible();
-            if (ImGui::MenuItem("动画编辑器", nullptr, &visible))
-            {
-                animPanel->SetVisible(visible);
-            }
-        }
-        if (aiPanel)
-        {
-            bool visible = aiPanel->IsVisible();
-            if (ImGui::MenuItem("AI 助手", nullptr, &visible))
-            {
-                aiPanel->SetVisible(visible);
-            }
+            m_context->editor->RequestDockLayoutReset();
         }
         PluginManager::GetInstance().DrawPluginMenuItems("窗口");
         ImGui::EndMenu();
@@ -923,6 +1089,19 @@ void ToolbarPanel::drawWindowMenu()
 }
 void ToolbarPanel::drawMainMenuBar()
 {
+    // 播放/暂停状态给菜单栏着色（Unity 风格的全局状态提示），避免误在运行态编辑场景
+    const EditorState state = m_context->editorState;
+    int stateColorCount = 0;
+    if (state == EditorState::Playing)
+    {
+        ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.238f, 0.157f, 0.078f, 1.00f));
+        stateColorCount = 1;
+    }
+    else if (state == EditorState::Paused)
+    {
+        ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.114f, 0.169f, 0.243f, 1.00f));
+        stateColorCount = 1;
+    }
     if (ImGui::BeginMainMenuBar())
     {
         drawFileMenu();
@@ -964,6 +1143,10 @@ void ToolbarPanel::drawMainMenuBar()
         }
         drawFpsDisplay();
         ImGui::EndMainMenuBar();
+    }
+    if (stateColorCount > 0)
+    {
+        ImGui::PopStyleColor(stateColorCount);
     }
 }
 void ToolbarPanel::drawProjectMenu()
@@ -1513,9 +1696,44 @@ void ToolbarPanel::drawEditMenu()
 {
     if (ImGui::BeginMenu("编辑"))
     {
+        auto& sceneManager = SceneManager::GetInstance();
+        if (ImGui::MenuItem("撤销", "Ctrl+Z", false, sceneManager.CanUndo())) { undo(); }
+        if (ImGui::MenuItem("重做", "Ctrl+Shift+Z", false, sceneManager.CanRedo())) { redo(); }
+        ImGui::Separator();
+        const bool hasSelection = m_context->selectionType == SelectionType::GameObject &&
+            !m_context->selectionList.empty();
+        auto* hierarchy = dynamic_cast<HierarchyPanel*>(m_context->editor->GetPanelByName("层级"));
+        if (ImGui::MenuItem("复制", "Ctrl+C", false, hasSelection && hierarchy != nullptr))
+        {
+            hierarchy->CopySelectedGameObjects();
+        }
+        if (ImGui::MenuItem("粘贴", "Ctrl+V", false,
+                            m_context->gameObjectClipboard.has_value() && hierarchy != nullptr))
+        {
+            hierarchy->PasteGameObjects(nullptr);
+        }
+        if (ImGui::MenuItem("创建副本", "Ctrl+D", false, hasSelection && hierarchy != nullptr))
+        {
+            duplicateSelection();
+        }
+        if (ImGui::MenuItem("删除", "Delete", false, hasSelection))
+        {
+            m_context->gameObjectsToDelete = m_context->selectionList;
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("偏好设置...")) { PopupManager::GetInstance().Open("PreferencesPopup"); }
         ImGui::EndMenu();
     }
+}
+void ToolbarPanel::duplicateSelection()
+{
+    // 创建副本 = 复制到剪贴板并立即粘贴（不覆盖用户已有剪贴板内容）
+    auto* hierarchy = dynamic_cast<HierarchyPanel*>(m_context->editor->GetPanelByName("层级"));
+    if (!hierarchy) return;
+    auto savedClipboard = m_context->gameObjectClipboard;
+    hierarchy->CopySelectedGameObjects();
+    hierarchy->PasteGameObjects(nullptr);
+    m_context->gameObjectClipboard = std::move(savedClipboard);
 }
 void ToolbarPanel::drawFileMenu()
 {
@@ -1524,6 +1742,29 @@ void ToolbarPanel::drawFileMenu()
         if (ImGui::MenuItem("新建游戏项目...")) { m_context->editor->CreateNewProject(); }
         if (ImGui::MenuItem("新建插件项目...")) { m_context->editor->CreateNewPluginProject(); }
         if (ImGui::MenuItem("打开项目...")) { m_context->editor->OpenProject(); }
+        if (ImGui::BeginMenu("最近项目"))
+        {
+            const auto recentProjects = Editor::GetRecentProjects();
+            const std::filesystem::path currentRoot = ProjectSettings::GetInstance().GetProjectRoot();
+            bool anyShown = false;
+            for (const auto& projectPath : recentProjects)
+            {
+                std::error_code ec;
+                if (!std::filesystem::exists(projectPath, ec)) continue;
+                const bool isCurrent = !currentRoot.empty() &&
+                    std::filesystem::equivalent(projectPath.parent_path(), currentRoot, ec);
+                anyShown = true;
+                if (ImGui::MenuItem(projectPath.string().c_str(), nullptr, false, !isCurrent))
+                {
+                    m_context->editor->LoadProject(projectPath);
+                }
+            }
+            if (!anyShown)
+            {
+                ImGui::TextDisabled("（暂无最近项目）");
+            }
+            ImGui::EndMenu();
+        }
         ImGui::Separator();
         bool isProjectLoaded = ProjectSettings::GetInstance().IsProjectLoaded();
         if (!isProjectLoaded) ImGui::BeginDisabled();
@@ -1531,15 +1772,45 @@ void ToolbarPanel::drawFileMenu()
         {
             newScene();
         }
+        if (ImGui::BeginMenu("打开场景"))
+        {
+            // 列出项目内全部场景资产（比"最近场景"更直接可靠）
+            const auto& database = AssetManager::GetInstance().GetAssetDatabase();
+            std::vector<const AssetMetadata*> scenes;
+            for (const auto& [guidStr, meta] : database)
+            {
+                if (meta.type == AssetType::Scene) scenes.push_back(&meta);
+            }
+            std::sort(scenes.begin(), scenes.end(), [](const AssetMetadata* a, const AssetMetadata* b)
+            {
+                return a->assetPath < b->assetPath;
+            });
+            if (scenes.empty())
+            {
+                ImGui::TextDisabled("（项目内没有场景）");
+            }
+            for (const auto* meta : scenes)
+            {
+                if (ImGui::MenuItem(meta->assetPath.string().c_str()))
+                {
+                    openSceneByGuid(meta->guid);
+                }
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("保存场景", "Ctrl+S"))
         {
             saveScene();
         }
-        ImGui::Separator();
+        if (ImGui::MenuItem("场景另存为..."))
+        {
+            m_saveAsPopupRequested = true;
+        }
         if (!isProjectLoaded) ImGui::EndDisabled();
         ImGui::Separator();
-        if (ImGui::MenuItem("退出"))
+        if (ImGui::MenuItem("退出", "Alt+F4"))
         {
+            m_context->editor->RequestExit();
         }
         PluginManager::GetInstance().DrawPluginMenuItems("文件");
         ImGui::EndMenu();
@@ -1550,26 +1821,54 @@ void ToolbarPanel::drawPlayControls()
     if (m_context->editorState == EditorState::Editing)
     {
         if (ImGui::Button("播放")) { play(); }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("进入播放模式 (Ctrl+P)");
     }
     else
     {
         if (ImGui::Button("停止")) { stop(); }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("停止播放 (Ctrl+P)");
         ImGui::SameLine();
         const char* pauseLabel = (m_context->editorState == EditorState::Paused) ? "继续" : "暂停";
         if (ImGui::Button(pauseLabel)) { pause(); }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("暂停/继续 (Ctrl+Shift+P)");
+        if (m_context->editorState == EditorState::Paused)
+        {
+            ImGui::SameLine();
+            if (ImGui::Button("单步")) { m_context->stepOneFrame.store(true); }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) ImGui::SetTooltip("推进一个模拟帧 (F10)");
+        }
     }
 }
 void ToolbarPanel::drawFpsDisplay()
 {
+    // 右侧信息带：场景状态 + 性能指标（状态栏信息合并于此，规避底部区域的呈现问题）
+    const bool dirty = SceneManager::GetInstance().IsCurrentSceneDirty();
+    std::string sceneName = m_context->currentSceneName.empty() ? "无场景" : m_context->currentSceneName;
+    if (dirty) sceneName += "*";
+    std::string selectionText;
+    if (m_context->selectionType == SelectionType::GameObject && !m_context->selectionList.empty())
+    {
+        selectionText = std::format("选中 {}", m_context->selectionList.size());
+    }
     std::string statsText = std::format("FPS: {0:.1f} ({1:.2f}ms) | UPS: {2:.1f} ({3:.2f}ms)",
                                         m_context->lastFps,
                                         m_context->renderLatency,
                                         m_context->lastUps,
                                         m_context->updateLatency);
-    const float textWidth = ImGui::CalcTextSize(statsText.c_str()).x;
+    std::string fullText = sceneName;
+    if (!selectionText.empty()) fullText += " | " + selectionText;
+    fullText += " | " + statsText;
+    const float textWidth = ImGui::CalcTextSize(fullText.c_str()).x;
     const float rightPadding = ImGui::GetStyle().FramePadding.x * 2;
     ImGui::SameLine(ImGui::GetWindowWidth() - textWidth - rightPadding);
-    ImGui::Text("%s", statsText.c_str());
+    ImGui::TextUnformatted(sceneName.c_str());
+    if (!selectionText.empty())
+    {
+        ImGui::SameLine(0.0f, 4.0f);
+        ImGui::TextDisabled("| %s", selectionText.c_str());
+    }
+    ImGui::SameLine(0.0f, 4.0f);
+    ImGui::TextDisabled("| %s", statsText.c_str());
 }
 void ToolbarPanel::updateFps()
 {
@@ -1826,12 +2125,30 @@ void ToolbarPanel::handleShortcuts()
         if (m_context->editorState == EditorState::Editing) { play(); }
         else { stop(); }
     }
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D))
+    // 暂停/继续：Ctrl+Shift+P（Unity 惯例）；Ctrl+D 让位给"创建副本"
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_P))
     {
         if (m_context->editorState != EditorState::Editing) { pause(); }
     }
+    if (ImGui::IsKeyPressed(ImGuiKey_F10, false) && m_context->editorState == EditorState::Paused)
+    {
+        m_context->stepOneFrame.store(true);
+    }
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) &&
+        m_context->editorState == EditorState::Editing &&
+        m_context->selectionType == SelectionType::GameObject && !m_context->selectionList.empty())
+    {
+        duplicateSelection();
+    }
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_K))
+    {
+        m_quickSearchRequested = true;
+    }
+    // 动画编辑器聚焦时优先处理剪辑数据的撤销/重做（该面板绘制顺序在工具栏之后，用帧号标记让路）
+    const bool animationEditorTakesUndo =
+        (ImGui::GetFrameCount() - m_context->animationEditorUndoCaptureFrame) <= 1;
     // 拖拽/编辑控件进行中不响应撤销重做，避免撤销到编辑中途的状态
-    if (!ImGui::IsAnyItemActive())
+    if (!ImGui::IsAnyItemActive() && !animationEditorTakesUndo)
     {
         if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
         {

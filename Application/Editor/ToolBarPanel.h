@@ -78,6 +78,10 @@ private:
     void createNewSceneNow();
     void drawNewSceneConfirmPopup();
     void saveScene();
+    void openSceneByGuid(const Guid& sceneGuid);
+    void duplicateSelection();
+    void drawQuickSearchPopup();
+    void drawSaveSceneAsPopup();
     void play();
     void pause();
     void stop();
@@ -112,6 +116,10 @@ private:
     std::filesystem::path m_lastBuildDirectory; 
     bool m_isTransitioningPlayState = false; 
     bool m_shouldOpenKeystorePicker = false;
+    bool m_quickSearchRequested = false; ///< Ctrl+K 请求打开全局搜索（下一帧 OpenPopup）。
+    char m_quickSearchBuffer[256] = {0};
+    bool m_saveAsPopupRequested = false; ///< 文件菜单请求"场景另存为"弹窗。
+    char m_saveAsNameBuffer[128] = {0};
     std::vector<std::filesystem::path> m_keystoreCandidates;
     std::array<char, 512> m_keystorePickerBuffer{};
     struct KeystorePopupState

@@ -25,8 +25,7 @@ private:
     int m_selectedFrameIndex = -1; 
     bool m_frameEditWindowOpen = false; 
     int m_editingFrameIndex = -1; 
-    int m_copiedFrameIndex = -1; 
-    bool m_hasFrameDataToCopy = false; 
+    std::vector<std::pair<int, AnimFrame>> m_copiedFrames; ///< 多帧复制缓冲：相对最小选中帧的偏移 -> 深拷贝帧数据
     bool m_componentSelectorOpen = false; 
     std::vector<std::string> m_availableComponents; 
     std::set<std::string> m_selectedComponents; 
@@ -36,11 +35,33 @@ private:
     int m_editingEventIndex = -1; 
     std::string m_newEventName; 
     std::vector<std::string> m_availableEventTypes; 
+    bool m_isDirty = false; ///< 剪辑数据自上次保存后是否被修改
+    bool m_onionSkinEnabled = false; ///< 洋葱皮开关（降级实现：时间轴高亮播放头前后关键帧）
+    std::vector<AnimationClip> m_undoStack; ///< 面板级撤销栈（剪辑数据全量快照）
+    std::vector<AnimationClip> m_redoStack; ///< 面板级重做栈
+    std::unordered_map<std::string, YAML::Node> m_previewComponentBackup; ///< 预览前目标对象受影响组件的快照
+    Guid m_previewBackupObjectGuid; ///< 预览快照所属对象
+    bool m_hasPreviewBackup = false; 
+    int m_contextMenuFrame = -1; ///< 时间轴右键菜单落点帧
+    int m_contextMenuKeyframe = -1; ///< 右键命中的关键帧索引（未命中为 -1）
+    /// 关闭/切换动作因未保存修改而挂起时的类型
+    enum class PendingCloseAction
+    {
+        None,
+        HidePanel,
+        CloseClip,
+        OpenOther,
+        NewClip
+    };
+    PendingCloseAction m_pendingCloseAction = PendingCloseAction::None; 
+    Guid m_pendingOpenClipGuid; ///< 挂起的待切换剪辑
+    int m_confirmPopupVisibleFrame = -1000; ///< 确认弹窗最近可见的 ImGui 帧号（检测弹窗被 X 关闭视作取消）
     void openAnimationClipFromContext(const Guid& clipGuid);
     void closeCurrentClipFromContext();
     void createNewAnimation();
     void drawTargetObjectSelector();
     void drawTimeline();
+    void drawTimelineContextMenu();
     void drawFrameEditor();
     void drawPropertiesPanel();
     void drawControlPanel();
@@ -49,7 +70,7 @@ private:
     void addKeyFrame(int frameIndex);
     void addKeyFrameFromCurrentObject(int frameIndex);
     void removeKeyFrame(int frameIndex);
-    void copyFrameData(int fromFrame, int toFrame);
+    void removeSelectedKeyFrames();
     void saveCurrentClip();
     void centerTimelineOnCurrentFrame();
     void fitTimelineToAllFrames(float viewWidth);
@@ -62,6 +83,25 @@ private:
     void addEventTarget(AnimFrame& frame);
     void removeEventTarget(AnimFrame& frame, size_t index);
     void handleShortcutInput();
+    static AnimFrame cloneFrameData(const AnimFrame& source);
+    static AnimationClip cloneClipData(const AnimationClip& source);
+    void pushUndoSnapshot();
+    void pushUndoSnapshotFrom(AnimationClip snapshot);
+    void performUndo();
+    void performRedo();
+    void afterClipDataRestored();
+    void markDirty();
+    void backupPreviewTargetState();
+    void restorePreviewTargetState();
+    void stopPreviewPlayback();
+    void copySelectedFrames();
+    void pasteFramesAt(int targetFrame);
+    void drawUnsavedChangesPopup();
+    void executePendingCloseAction();
+    void discardCurrentClipChanges();
+    void requestCloseClip();
+    void requestNewAnimation();
+    void openUnsavedConfirmPopup(PendingCloseAction action);
 public:
     AnimationEditorPanel() = default;
     ~AnimationEditorPanel() override = default;

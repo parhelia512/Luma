@@ -1,6 +1,7 @@
 #include "TilesetPanel.h"
 #include "imgui.h"
 #include "AssetManager.h"
+#include "ImGuiRenderer.h"
 #include "Path.h"
 #include "Loaders/TileLoader.h"
 #include "Loaders/RuleTileLoader.h"
@@ -117,6 +118,7 @@ void TilesetPanel::closeCurrentTileset()
     m_tileHandles.clear();
     m_hydratedTiles.clear();
     m_hydratedRuleTiles.clear();
+    m_thumbnailCache.clear();
 }
 void TilesetPanel::saveCurrentTileset()
 {
@@ -152,10 +154,30 @@ void TilesetPanel::drawTilesetContent()
             {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
             }
-            // TODO: 此处应绘制资产的真实缩略图
-            if (ImGui::Button(name.c_str(), ImVec2(m_thumbnailSize, m_thumbnailSize)))
+            const TileThumbnail& thumb = getOrCreateThumbnail(handle);
+            wgpu::Texture gpuTexture = (thumb.texture && thumb.texture->getNutTexture())
+                                           ? thumb.texture->getNutTexture()->GetTexture()
+                                           : wgpu::Texture();
+            bool clicked = false;
+            if (gpuTexture)
+            {
+                ImTextureID texId = m_context->imguiRenderer->GetOrCreateTextureIdFor(gpuTexture);
+                clicked = ImGui::ImageButton("##thumb", texId, ImVec2(m_thumbnailSize, m_thumbnailSize),
+                                             thumb.uv0, thumb.uv1);
+            }
+            else
+            {
+                // 无法提取纹理（预制体瓦片、缺失资产等）时退回文字按钮
+                clicked = ImGui::Button(name.c_str(), ImVec2(m_thumbnailSize, m_thumbnailSize));
+            }
+            if (clicked)
             {
                 m_context->activeTileBrush = handle;
+            }
+            if (isSelected)
+            {
+                ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                                                    IM_COL32(255, 200, 60, 255), 3.0f, 0, 2.0f);
             }
             if (ImGui::BeginPopupContextItem("TileItemContext"))
             {
@@ -168,6 +190,7 @@ void TilesetPanel::drawTilesetContent()
                         if (m_context->activeTileBrush.assetGuid == handle.assetGuid) { m_context->activeTileBrush = {}; }
                         m_hydratedTiles.erase(handle.assetGuid);
                         m_hydratedRuleTiles.erase(handle.assetGuid);
+                        m_thumbnailCache.erase(handle.assetGuid);
                         m_tileHandles.erase(it);
                     }
                 }
@@ -260,6 +283,54 @@ void TilesetPanel::createTileAssetFromSource(const AssetHandle& sourceAssetHandl
     fout << node;
     fout.close();
     LogInfo("已自动创建Tile资产: {}. 请从资源浏览器中将其拖入本面板。", newAssetRelativePath.string());
+}
+const TilesetPanel::TileThumbnail& TilesetPanel::getOrCreateThumbnail(const AssetHandle& handle)
+{
+    auto cached = m_thumbnailCache.find(handle.assetGuid);
+    if (cached != m_thumbnailCache.end()) return cached->second;
+    TileThumbnail thumb;
+    // 与 updateBrushPreview 相同的提取逻辑：RuleTile 取默认瓦片，精灵瓦片取纹理与源矩形
+    AssetHandle finalTileHandle;
+    if (handle.assetType == AssetType::Tile)
+    {
+        finalTileHandle = handle;
+    }
+    else if (handle.assetType == AssetType::RuleTile)
+    {
+        RuleTileLoader ruleTileLoader;
+        sk_sp<RuntimeRuleTile> ruleTile = ruleTileLoader.LoadAsset(handle.assetGuid);
+        if (ruleTile)
+        {
+            finalTileHandle = ruleTile->GetData().defaultTileHandle;
+        }
+    }
+    if (finalTileHandle.Valid())
+    {
+        TileLoader tileLoader;
+        sk_sp<RuntimeTile> tileAsset = tileLoader.LoadAsset(finalTileHandle.assetGuid);
+        if (tileAsset && std::holds_alternative<SpriteTileData>(tileAsset->GetData()))
+        {
+            const auto& spriteData = std::get<SpriteTileData>(tileAsset->GetData());
+            if (spriteData.textureHandle.Valid())
+            {
+                TextureLoader textureLoader(*m_context->graphicsBackend);
+                thumb.texture = textureLoader.LoadAsset(spriteData.textureHandle.assetGuid);
+                if (thumb.texture && thumb.texture->getImage() &&
+                    spriteData.sourceRect.Width() > 0 && spriteData.sourceRect.Height() > 0)
+                {
+                    const float texW = static_cast<float>(thumb.texture->getImage()->width());
+                    const float texH = static_cast<float>(thumb.texture->getImage()->height());
+                    if (texW > 0.0f && texH > 0.0f)
+                    {
+                        thumb.uv0 = ImVec2(spriteData.sourceRect.x / texW, spriteData.sourceRect.y / texH);
+                        thumb.uv1 = ImVec2((spriteData.sourceRect.x + spriteData.sourceRect.Width()) / texW,
+                                           (spriteData.sourceRect.y + spriteData.sourceRect.Height()) / texH);
+                    }
+                }
+            }
+        }
+    }
+    return m_thumbnailCache.emplace(handle.assetGuid, std::move(thumb)).first->second;
 }
 void TilesetPanel::updateBrushPreview()
 {

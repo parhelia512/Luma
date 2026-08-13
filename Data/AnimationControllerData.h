@@ -117,6 +117,7 @@ struct Transition
     std::vector<Condition> Conditions; ///< 触发此过渡的条件列表。
     int priority = 0; ///< 过渡的优先级。
     bool hasExitTime = true; ///< 是否有退出时间。
+    float exitTime = 1.0f; ///< 归一化退出时间（0-1），hasExitTime 开启时动画播放进度达到该比例才允许过渡。
 };
 
 
@@ -126,6 +127,11 @@ struct Transition
 struct AnimationState
 {
     std::vector<Transition> Transitions; ///< 从此状态出发的过渡列表。
+    std::string stateName; ///< 状态显示名，与剪辑名解耦；旧数据缺省为空，编辑器加载时以剪辑名初始化。
+    float speed = 1.0f; ///< 状态播放速度倍率，运行时播放该状态动画时乘上。
+    float editorPosX = 0.0f; ///< 编辑器中节点画布位置X。
+    float editorPosY = 0.0f; ///< 编辑器中节点画布位置Y。
+    bool hasEditorPosition = false; ///< 旧数据无位置字段时为 false，编辑器回退到网格布局并写回。
 };
 
 
@@ -475,6 +481,7 @@ namespace YAML
             node["Conditions"] = transition.Conditions;
             node["priority"] = transition.priority;
             node["hasExitTime"] = transition.hasExitTime;
+            node["exitTime"] = transition.exitTime;
             return node;
         }
 
@@ -494,6 +501,7 @@ namespace YAML
                 transition.Conditions = node["Conditions"].as<std::vector<Condition>>();
             transition.priority = node["priority"] ? node["priority"].as<int>() : 0;
             transition.hasExitTime = node["hasExitTime"] ? node["hasExitTime"].as<bool>() : true;
+            transition.exitTime = node["exitTime"] ? node["exitTime"].as<float>() : 1.0f;
             return true;
         }
     };
@@ -513,6 +521,14 @@ namespace YAML
         {
             Node node;
             node["Transitions"] = state.Transitions;
+            if (!state.stateName.empty())
+                node["stateName"] = state.stateName;
+            node["speed"] = state.speed;
+            if (state.hasEditorPosition)
+            {
+                node["editorPosX"] = state.editorPosX;
+                node["editorPosY"] = state.editorPosY;
+            }
             return node;
         }
 
@@ -527,6 +543,15 @@ namespace YAML
             if (!node.IsMap()) return false;
             if (node["Transitions"])
                 state.Transitions = node["Transitions"].as<std::vector<Transition>>();
+            if (node["stateName"])
+                state.stateName = node["stateName"].as<std::string>();
+            state.speed = node["speed"] ? node["speed"].as<float>() : 1.0f;
+            if (node["editorPosX"] && node["editorPosY"])
+            {
+                state.editorPosX = node["editorPosX"].as<float>();
+                state.editorPosY = node["editorPosY"].as<float>();
+                state.hasEditorPosition = true;
+            }
             return true;
         }
     };

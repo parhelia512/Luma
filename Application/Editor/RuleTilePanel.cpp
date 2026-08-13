@@ -98,7 +98,7 @@ void RuleTilePanel::drawRuleList()
     if (ImGui::Button("添加规则"))
     {
         Rule r;
-        r.resultTileHandle = {};
+        r.outputs.push_back(RuleTileOutput{});
         r.neighbors.fill(NeighborRule::DontCare);
         m_editingData.rules.push_back(r);
     }
@@ -125,11 +125,52 @@ void RuleTilePanel::drawRuleList()
                 }
             }
             ImGui::Spacing();
-            InspectorUI::DrawAssetHandle("结果瓦片", m_editingData.rules[i].resultTileHandle, *m_context->uiCallbacks);
+            drawRuleOutputs(i);
             ImGui::Text("邻居规则:");
             drawRuleGrid(i);
         }
         ImGui::PopID();
+    }
+}
+void RuleTilePanel::drawRuleOutputs(int ruleIndex)
+{
+    if (ruleIndex < 0 || ruleIndex >= static_cast<int>(m_editingData.rules.size())) return;
+    Rule& rule = m_editingData.rules[ruleIndex];
+    ImGui::Text("结果瓦片(多个时按权重随机):");
+    if (ImGui::BeginTable("RuleOutputs", 3, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("tile", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("weight", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("del", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+        for (int j = 0; j < static_cast<int>(rule.outputs.size()); ++j)
+        {
+            ImGui::PushID(j);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            InspectorUI::DrawAssetHandle("瓦片", rule.outputs[j].tileHandle, *m_context->uiCallbacks);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::DragFloat("##weight", &rule.outputs[j].weight, 0.05f, 0.0f, 100.0f, "权重 %.2f"))
+            {
+                if (m_context && m_context->uiCallbacks) m_context->uiCallbacks->onValueChanged();
+            }
+            ImGui::TableSetColumnIndex(2);
+            if (ImGui::Button("删除"))
+            {
+                rule.outputs.erase(rule.outputs.begin() + j);
+                if (m_context && m_context->uiCallbacks) m_context->uiCallbacks->onValueChanged();
+                ImGui::PopID();
+                --j;
+                continue;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (ImGui::Button("添加变体"))
+    {
+        rule.outputs.push_back(RuleTileOutput{});
+        if (m_context && m_context->uiCallbacks) m_context->uiCallbacks->onValueChanged();
     }
 }
 void RuleTilePanel::drawRuleGrid(int ruleIndex)

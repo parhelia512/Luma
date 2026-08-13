@@ -447,6 +447,7 @@ void GraphicsBackend::Resize(uint16_t width, uint16_t height)
     {
         return;
     }
+    LogInfo("交换链重建: {}x{} -> {}x{}", currentWidth, currentHeight, width, height);
 
     if (nutContext)
     {
