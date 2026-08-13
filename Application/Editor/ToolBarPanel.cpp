@@ -2513,7 +2513,7 @@ void ToolbarPanel::OnKeystoreSavePathChosen(const std::filesystem::path& path)
 namespace
 {
     constexpr const char* kGradleConstantBlock = R"(# --- NDK/CMake ---
-ndkVersion=27.0.12077973
+ndkVersion=30.0.15729638
 cmakeVersion=3.22.1
 abiFilters=arm64-v8a
 # 逗号分隔 CMake 参数（可覆盖默认）
