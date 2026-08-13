@@ -1,7 +1,9 @@
 #include "RuntimeAnimationController.h"
+#include "AnimationTrackSampler.h"
 #include "Logger.h"
 #include "SceneManager.h"
 #include "Loaders/AnimationClipLoader.h"
+#include <algorithm>
 
 int FindLastKeyframeIndex(const AnimationClip& clipData, int currentFrame)
 {
@@ -19,24 +21,24 @@ int FindLastKeyframeIndex(const AnimationClip& clipData, int currentFrame)
     return lastKeyframe;
 }
 
-void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>& clip, float speed,
-                                              float transitionDuration)
+bool RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>& clip, float speed,
+                                              float transitionDuration, const Guid& stateGuidOverride)
 {
     if (clip == nullptr)
     {
         LogWarn("尝试播放空动画剪辑");
-        return;
+        return false;
     }
 
     auto& animData = clip->getAnimationClip();
     auto currentScene = SceneManager::GetInstance().GetCurrentScene();
-    if (!currentScene) return;
+    if (!currentScene) return false;
 
     auto go = currentScene->FindGameObjectByGuid(animData.TargetEntityGuid);
     if (!go.IsValid())
     {
         LogWarn("无法找到目标实体: {}", animData.TargetEntityGuid.ToString());
-        return;
+        return false;
     }
 
     // 记录切换前的状态，供播放状态快照区分过渡的起点与终点
@@ -48,7 +50,8 @@ void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>&
         m_isTransitioning = true;
         m_transitionTime = 0.0f;
         m_transitionDuration = transitionDuration;
-        m_fromClip = m_animationClips[m_currentAnimationName];
+        // 直接取当前帧来源剪辑，混合树状态名不在按名索引的剪辑表中
+        m_fromClip = m_currentClip;
         m_fromFrameIndex = m_currentFrameIndex;
         m_toClip = clip;
         LogInfo("开始过渡动画，过渡时长: {}秒", transitionDuration);
@@ -60,6 +63,22 @@ void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>&
 
     m_currentAnimationGuid = clip->GetSourceGuid();
     m_currentAnimationName = clip->GetName();
+    if (stateGuidOverride.Valid())
+    {
+        // 混合树等状态GUID与剪辑GUID不同的场合：状态机身份（过渡查找/速度倍率/高亮）按状态记
+        m_currentAnimationGuid = stateGuidOverride;
+        auto stateIt = m_animationControllerData.States.find(stateGuidOverride);
+        if (stateIt != m_animationControllerData.States.end() && !stateIt->second.stateName.empty())
+        {
+            m_currentAnimationName = stateIt->second.stateName;
+        }
+    }
+    m_currentClip = clip;
+    // 单剪辑路径默认重置混合标记，进入混合树时由 playBlendTreeState 在其后补写
+    m_isBlendTreeState = false;
+    m_blendDominantChildIndex = -1;
+    m_blendSecondaryChildIndex = -1;
+    m_blendDominantWeight = 1.0f;
     m_currentTime = 0.0f;
     m_currentFrameIndex = 0;
     m_totalFrames = 0;
@@ -75,6 +94,15 @@ void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>&
         for (const auto& [frameIndex, frame] : animData.Frames)
         {
             m_totalFrames = std::max(m_totalFrames, frameIndex + 1);
+        }
+    }
+
+    // 属性轨道关键帧同样决定时长：纯轨道剪辑（无快照帧）也要能确定总帧数并播放
+    for (const auto& track : animData.PropertyTracks)
+    {
+        for (const auto& key : track.keyframes)
+        {
+            m_totalFrames = std::max(m_totalFrames, key.frame + 1);
         }
     }
 
@@ -104,7 +132,13 @@ void RuntimeAnimationController::playInternal(const sk_sp<RuntimeAnimationClip>&
             m_playbackStatus.targetStateGuid = Guid();
         }
         m_playbackStatus.transitionProgress = 0.0f;
+        m_playbackStatus.isBlendTreeState = false;
+        m_playbackStatus.activeChildIndex = -1;
+        m_playbackStatus.secondaryChildIndex = -1;
+        m_playbackStatus.blendWeight = 1.0f;
+        m_playbackStatus.blendParameterValue = 0.0f;
     }
+    return true;
 }
 
 bool RuntimeAnimationController::EvaluateCondition(const std::vector<Condition>& conditions)
@@ -216,7 +250,44 @@ void RuntimeAnimationController::UpdateFrameBasedAnimation(float deltaTime)
         {
             ApplyAnimationFrame(currentClip, keyframeToApply);
         }
+        // 属性轨道用连续帧时间（不取整）采样，帧与帧之间也能得到插值结果
+        ApplyPropertyTracks(currentClip, m_currentTime / frameDuration);
     }
+}
+
+void RuntimeAnimationController::ApplyPropertyTracks(const sk_sp<RuntimeAnimationClip>& clip, float frameTime)
+{
+    if (!clip)
+    {
+        return;
+    }
+
+    const AnimationClip& animData = clip->getAnimationClip();
+    if (animData.PropertyTracks.empty())
+    {
+        return;
+    }
+
+    auto currentScene = SceneManager::GetInstance().GetCurrentScene();
+    if (!currentScene)
+    {
+        return;
+    }
+
+    auto go = currentScene->FindGameObjectByGuid(animData.TargetEntityGuid);
+    if (!go.IsValid())
+    {
+        return;
+    }
+
+    // 绑定缓存按剪辑GUID隔离：换剪辑时重建，避免逐帧的注册表名称查找与类型探测
+    if (m_trackBindingCacheClipGuid != clip->GetSourceGuid())
+    {
+        m_trackBindingCache = {};
+        m_trackBindingCacheClipGuid = clip->GetSourceGuid();
+    }
+    AnimationTrackSampler::ApplyTracksCached(animData, currentScene->GetRegistry(), go.GetEntityHandle(), frameTime,
+                                             m_trackBindingCache);
 }
 
 void RuntimeAnimationController::UpdateTransition(float deltaTime)
@@ -345,6 +416,248 @@ void RuntimeAnimationController::BlendAnimationFrames(const sk_sp<RuntimeAnimati
     }
 }
 
+RuntimeAnimationController::BlendTreeSelection RuntimeAnimationController::evaluateBlendTree(
+    const BlendTreeData& tree) const
+{
+    BlendTreeSelection selection;
+    if (tree.children.empty())
+    {
+        return selection;
+    }
+
+    auto varIt = m_variables.find(tree.parameterName);
+    if (varIt != m_variables.end() && std::holds_alternative<float>(varIt->second))
+    {
+        selection.parameterValue = std::get<float>(varIt->second);
+    }
+
+    const auto& children = tree.children;
+    const float value = selection.parameterValue;
+    // 参数落在两端阈值外时钳制到端点子项，与 Unity 1D Blend Tree 一致
+    if (children.size() == 1 || value <= children.front().threshold)
+    {
+        selection.dominantIndex = 0;
+        return selection;
+    }
+    if (value >= children.back().threshold)
+    {
+        selection.dominantIndex = static_cast<int>(children.size()) - 1;
+        return selection;
+    }
+
+    for (size_t i = 0; i + 1 < children.size(); ++i)
+    {
+        if (value > children[i + 1].threshold)
+        {
+            continue;
+        }
+        const float range = children[i + 1].threshold - children[i].threshold;
+        const float t = range > 0.0f ? (value - children[i].threshold) / range : 0.0f;
+        if (t < 0.5f)
+        {
+            selection.dominantIndex = static_cast<int>(i);
+            selection.secondaryIndex = static_cast<int>(i) + 1;
+            selection.dominantWeight = 1.0f - t;
+        }
+        else
+        {
+            selection.dominantIndex = static_cast<int>(i) + 1;
+            selection.secondaryIndex = static_cast<int>(i);
+            selection.dominantWeight = t;
+        }
+        break;
+    }
+    return selection;
+}
+
+sk_sp<RuntimeAnimationClip> RuntimeAnimationController::getBlendChildClip(const Guid& clipGuid)
+{
+    if (!clipGuid.Valid())
+    {
+        return nullptr;
+    }
+    auto it = m_blendClipCache.find(clipGuid);
+    if (it != m_blendClipCache.end())
+    {
+        return it->second;
+    }
+    auto loader = AnimationClipLoader();
+    sk_sp<RuntimeAnimationClip> clip = loader.LoadAsset(clipGuid);
+    if (clip)
+    {
+        m_blendClipCache[clipGuid] = clip;
+    }
+    else
+    {
+        LogWarn("加载混合树子项剪辑 {} 失败", clipGuid.ToString());
+    }
+    return clip;
+}
+
+void RuntimeAnimationController::playBlendTreeState(const Guid& stateGuid, float speed, float transitionDuration)
+{
+    auto stateIt = m_animationControllerData.States.find(stateGuid);
+    if (stateIt == m_animationControllerData.States.end())
+    {
+        LogWarn("尝试播放不存在的混合树状态: {}", stateGuid.ToString());
+        return;
+    }
+
+    const BlendTreeData& tree = stateIt->second.blendTree;
+    BlendTreeSelection selection = evaluateBlendTree(tree);
+    if (selection.dominantIndex < 0)
+    {
+        LogWarn("混合树状态 {} 没有可用子项", stateIt->second.stateName);
+        return;
+    }
+
+    sk_sp<RuntimeAnimationClip> dominantClip = getBlendChildClip(tree.children[selection.dominantIndex].clipGuid);
+    if (!dominantClip)
+    {
+        return;
+    }
+
+    if (!playInternal(dominantClip, speed, transitionDuration, stateGuid))
+    {
+        return;
+    }
+
+    m_isBlendTreeState = true;
+    m_blendDominantChildIndex = selection.dominantIndex;
+    m_blendSecondaryChildIndex = selection.secondaryIndex;
+    m_blendDominantWeight = selection.dominantWeight;
+
+    {
+        std::lock_guard<std::mutex> lock(m_playbackStatusMutex);
+        m_playbackStatus.isBlendTreeState = true;
+        m_playbackStatus.activeChildIndex = selection.dominantIndex;
+        m_playbackStatus.secondaryChildIndex = selection.secondaryIndex;
+        m_playbackStatus.blendWeight = selection.dominantWeight;
+        m_playbackStatus.blendParameterValue = selection.parameterValue;
+    }
+}
+
+void RuntimeAnimationController::refreshBlendTreeSelection()
+{
+    auto stateIt = m_animationControllerData.States.find(m_currentAnimationGuid);
+    if (stateIt == m_animationControllerData.States.end() ||
+        stateIt->second.stateType != AnimationStateType::BlendTree)
+    {
+        return;
+    }
+
+    const BlendTreeData& tree = stateIt->second.blendTree;
+    BlendTreeSelection selection = evaluateBlendTree(tree);
+    if (selection.dominantIndex < 0)
+    {
+        return;
+    }
+
+    if (selection.dominantIndex != m_blendDominantChildIndex)
+    {
+        sk_sp<RuntimeAnimationClip> newClip = getBlendChildClip(tree.children[selection.dominantIndex].clipGuid);
+        if (!newClip)
+        {
+            // 新主导剪辑缺失时维持旧剪辑继续播放，不更新权重快照
+            return;
+        }
+
+        // 主导剪辑切换：按归一化相位换算播放时间，帧率/总帧数/循环改随新主导剪辑
+        const float oldDuration = (m_totalFrames > 0 && m_frameRate > 0.0f)
+                                      ? static_cast<float>(m_totalFrames) / m_frameRate
+                                      : 0.0f;
+        const float normalized = oldDuration > 0.0f ? std::clamp(m_currentTime / oldDuration, 0.0f, 1.0f) : 0.0f;
+
+        // 过渡进入本混合树期间主导剪辑变化：过渡终点跟随新主导剪辑，帧索引才能对上
+        if (m_isTransitioning && m_toClip == m_currentClip)
+        {
+            m_toClip = newClip;
+        }
+        m_currentClip = newClip;
+        auto& animData = newClip->getAnimationClip();
+        if (animData.FrameRate > 0.0f)
+        {
+            m_frameRate = animData.FrameRate;
+        }
+        m_totalFrames = 0;
+        for (const auto& [frameIndex, frame] : animData.Frames)
+        {
+            m_totalFrames = std::max(m_totalFrames, frameIndex + 1);
+        }
+        // 与单剪辑路径一致：属性轨道关键帧参与时长计算
+        for (const auto& track : animData.PropertyTracks)
+        {
+            for (const auto& key : track.keyframes)
+            {
+                m_totalFrames = std::max(m_totalFrames, key.frame + 1);
+            }
+        }
+        const float newDuration = (m_totalFrames > 0 && m_frameRate > 0.0f)
+                                      ? static_cast<float>(m_totalFrames) / m_frameRate
+                                      : 0.0f;
+        m_currentTime = normalized * newDuration;
+        m_currentFrameIndex = m_frameRate > 0.0f ? static_cast<int>(m_currentTime * m_frameRate) : 0;
+    }
+
+    m_blendDominantChildIndex = selection.dominantIndex;
+    m_blendSecondaryChildIndex = selection.secondaryIndex;
+    m_blendDominantWeight = selection.dominantWeight;
+
+    {
+        std::lock_guard<std::mutex> lock(m_playbackStatusMutex);
+        m_playbackStatus.isBlendTreeState = true;
+        m_playbackStatus.activeChildIndex = selection.dominantIndex;
+        m_playbackStatus.secondaryChildIndex = selection.secondaryIndex;
+        m_playbackStatus.blendWeight = selection.dominantWeight;
+        m_playbackStatus.blendParameterValue = selection.parameterValue;
+    }
+}
+
+void RuntimeAnimationController::UpdateBlendTreeAnimation(float deltaTime)
+{
+    if (!m_isPlaying || !m_isBlendTreeState)
+    {
+        return;
+    }
+
+    // 参数每帧直接求值，无惯性；主导剪辑变化时保持归一化相位切换
+    refreshBlendTreeSelection();
+
+    if (!m_currentClip || m_totalFrames <= 0 || m_frameRate <= 0.0f)
+    {
+        return;
+    }
+
+    m_currentTime += deltaTime * m_animationSpeed;
+    const float frameDuration = 1.0f / m_frameRate;
+    const float animationDuration = m_totalFrames * frameDuration;
+
+    if (m_currentTime >= animationDuration)
+    {
+        // 循环语义与单剪辑路径一致：非循环剪辑停在末尾供 hasExitTime 过渡判定
+        if (m_currentClip->getAnimationClip().IsLooping)
+        {
+            m_currentTime = fmod(m_currentTime, animationDuration);
+        }
+        else
+        {
+            m_currentTime = animationDuration;
+        }
+    }
+
+    m_currentFrameIndex = static_cast<int>(m_currentTime / frameDuration);
+
+    int keyframeToApply = FindLastKeyframeIndex(m_currentClip->getAnimationClip(), m_currentFrameIndex);
+    if (keyframeToApply != -1)
+    {
+        // 第一期混合语义：加权选择，快照帧仅应用主导剪辑的
+        ApplyAnimationFrame(m_currentClip, keyframeToApply);
+    }
+    // 属性轨道同样以主导剪辑采样（加权选择）。后续升级点：相邻子项剪辑各自
+    // Evaluate 后按 m_blendDominantWeight 插值再写回，需等属性轨道采样接口稳定
+    ApplyPropertyTracks(m_currentClip, m_currentTime / frameDuration);
+}
+
 RuntimeAnimationController::RuntimeAnimationController(AnimationControllerData data)
     : m_animationControllerData(std::move(data))
 {
@@ -373,10 +686,37 @@ RuntimeAnimationController::RuntimeAnimationController(AnimationControllerData d
             m_variables[var.Name] = false;
         }
     }
+
+    for (auto& [stateGuid, state] : m_animationControllerData.States)
+    {
+        if (state.stateType != AnimationStateType::BlendTree)
+        {
+            continue;
+        }
+        // 子项按阈值升序是求值前提，防御手改文件或旧编辑器保存的乱序数据
+        std::stable_sort(state.blendTree.children.begin(), state.blendTree.children.end(),
+                         [](const BlendTreeData::Child& a, const BlendTreeData::Child& b)
+                         {
+                             return a.threshold < b.threshold;
+                         });
+        for (const auto& child : state.blendTree.children)
+        {
+            getBlendChildClip(child.clipGuid);
+        }
+    }
 }
 
 void RuntimeAnimationController::PlayAnimation(const Guid& guid, float speed, float transitionDuration)
 {
+    // 混合树状态的GUID不是剪辑资产，路由到混合树播放（覆盖入口过渡等按GUID播放的入口）
+    auto stateIt = m_animationControllerData.States.find(guid);
+    if (stateIt != m_animationControllerData.States.end() &&
+        stateIt->second.stateType == AnimationStateType::BlendTree)
+    {
+        playBlendTreeState(guid, speed, transitionDuration);
+        return;
+    }
+
     auto loader = AnimationClipLoader();
     sk_sp<RuntimeAnimationClip> clip = loader.LoadAsset(guid);
     playInternal(clip, speed, transitionDuration);
@@ -543,7 +883,14 @@ void RuntimeAnimationController::Update(float deltaTime)
     if (m_isTransitioning)
     {
         UpdateTransition(deltaTime);
-        UpdateFrameBasedAnimation(deltaTime);
+        if (m_isBlendTreeState)
+        {
+            UpdateBlendTreeAnimation(deltaTime);
+        }
+        else
+        {
+            UpdateFrameBasedAnimation(deltaTime);
+        }
         return;
     }
 
@@ -568,16 +915,10 @@ void RuntimeAnimationController::Update(float deltaTime)
 
         if (bestTransition)
         {
-            auto loader = AnimationClipLoader();
-            sk_sp<RuntimeAnimationClip> nextClip = loader.LoadAsset(bestTransition->ToGuid);
-
-            if (nextClip && nextClip->GetSourceGuid() != m_currentAnimationGuid)
+            // 过渡真正触发后消耗触发器，避免同一触发器重复生效
+            auto consumeTriggers = [this](const Transition& transition)
             {
-                LogInfo("过渡触发: 从 {} 切换到目标状态", m_currentAnimationName);
-                playInternal(nextClip, 1.0f, bestTransition->TransitionDuration);
-
-
-                for (const auto& condition : bestTransition->Conditions)
+                for (const auto& condition : transition.Conditions)
                 {
                     if (std::holds_alternative<TriggerCondition>(condition))
                     {
@@ -585,9 +926,42 @@ void RuntimeAnimationController::Update(float deltaTime)
                         m_variables[triggerCond.VarName] = false;
                     }
                 }
+            };
+
+            auto toStateIt = m_animationControllerData.States.find(bestTransition->ToGuid);
+            const bool targetIsBlendTree = toStateIt != m_animationControllerData.States.end() &&
+                toStateIt->second.stateType == AnimationStateType::BlendTree;
+
+            if (targetIsBlendTree)
+            {
+                if (bestTransition->ToGuid != m_currentAnimationGuid)
+                {
+                    LogInfo("过渡触发: 从 {} 切换到混合树状态", m_currentAnimationName);
+                    playBlendTreeState(bestTransition->ToGuid, 1.0f, bestTransition->TransitionDuration);
+                    consumeTriggers(*bestTransition);
+                }
+            }
+            else
+            {
+                auto loader = AnimationClipLoader();
+                sk_sp<RuntimeAnimationClip> nextClip = loader.LoadAsset(bestTransition->ToGuid);
+
+                if (nextClip && nextClip->GetSourceGuid() != m_currentAnimationGuid)
+                {
+                    LogInfo("过渡触发: 从 {} 切换到目标状态", m_currentAnimationName);
+                    playInternal(nextClip, 1.0f, bestTransition->TransitionDuration);
+                    consumeTriggers(*bestTransition);
+                }
             }
         }
     }
 
-    UpdateFrameBasedAnimation(deltaTime);
+    if (m_isBlendTreeState)
+    {
+        UpdateBlendTreeAnimation(deltaTime);
+    }
+    else
+    {
+        UpdateFrameBasedAnimation(deltaTime);
+    }
 }

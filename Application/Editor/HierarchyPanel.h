@@ -55,6 +55,11 @@ private:
     void handleNodeDragDrop(const HierarchyNode& node);
     void handlePrefabDrop(const AssetHandle& handle, RuntimeGameObject* targetParent);
     void handleGameObjectsDrop(const std::vector<Guid>& draggedGuids, RuntimeGameObject* targetParent);
+    void beginRename(const Guid& objectGuid);
+    void drawRenameInput(RuntimeGameObject& gameObject);
+    void cutSelectedGameObjects();
+    const char* getObjectIcon(RuntimeGameObject& gameObject) const;
+    bool isEffectivelyActive(RuntimeGameObject& gameObject) const;
 private:
     std::vector<HierarchyNode> hierarchyCache; 
     std::vector<int> visibleNodeIndices; 
@@ -68,5 +73,8 @@ private:
     int visibleNodeCount; 
     float lastBuildTime; 
     char m_searchBuffer[256] = {0}; 
+    Guid m_renamingGuid; ///< 正在行内重命名的对象（与资产浏览器的 itemToRename 相互独立）
+    char m_renameBuffer[256] = {0}; 
+    bool m_renameFocusPending = false; ///< 重命名输入框待抢占键盘焦点（仅生效一帧）
 };
 #endif

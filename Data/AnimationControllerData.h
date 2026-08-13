@@ -122,6 +122,33 @@ struct Transition
 
 
 /**
+ * @brief 动画状态的类型。
+ */
+enum class AnimationStateType
+{
+    Clip = 0,      ///< 绑定单个动画剪辑，状态GUID即剪辑GUID。
+    BlendTree = 1, ///< 一维混合树，按 float 参数在多个子项剪辑间混合。
+};
+
+/**
+ * @brief 一维混合树数据：绑定一个 float 参数，按阈值组织子项剪辑。
+ */
+struct BlendTreeData
+{
+    /**
+     * @brief 混合树子项：一个剪辑及其对应的参数阈值。
+     */
+    struct Child
+    {
+        Guid clipGuid;          ///< 子项动画剪辑的全局唯一标识符。
+        float threshold = 0.0f; ///< 参数阈值。
+    };
+
+    std::string parameterName;   ///< 绑定的 float 变量名。
+    std::vector<Child> children; ///< 子项列表，编辑器维护为按阈值升序。
+};
+
+/**
  * @brief 表示一个动画状态。
  */
 struct AnimationState
@@ -132,6 +159,8 @@ struct AnimationState
     float editorPosX = 0.0f; ///< 编辑器中节点画布位置X。
     float editorPosY = 0.0f; ///< 编辑器中节点画布位置Y。
     bool hasEditorPosition = false; ///< 旧数据无位置字段时为 false，编辑器回退到网格布局并写回。
+    AnimationStateType stateType = AnimationStateType::Clip; ///< 状态类型；旧数据无此字段时按单剪辑处理。
+    BlendTreeData blendTree; ///< 混合树数据，仅 stateType 为 BlendTree 时有效。
 };
 
 
@@ -507,6 +536,77 @@ namespace YAML
     };
 
     /**
+     * @brief YAML转换器，用于BlendTreeData::Child结构的序列化和反序列化。
+     */
+    template <>
+    struct convert<BlendTreeData::Child>
+    {
+        /**
+         * @brief 将BlendTreeData::Child编码为YAML节点。
+         * @param child 要编码的子项。
+         * @return 表示子项的YAML节点。
+         */
+        static Node encode(const BlendTreeData::Child& child)
+        {
+            Node node;
+            node["ClipGuid"] = child.clipGuid.ToString();
+            node["Threshold"] = child.threshold;
+            return node;
+        }
+
+        /**
+         * @brief 将YAML节点解码为BlendTreeData::Child。
+         * @param node 要解码的YAML节点。
+         * @param child 存储解码结果的子项引用。
+         * @return 如果解码成功则返回true，否则返回false。
+         */
+        static bool decode(const Node& node, BlendTreeData::Child& child)
+        {
+            if (!node.IsMap()) return false;
+            if (node["ClipGuid"])
+                child.clipGuid = Guid::FromString(node["ClipGuid"].as<std::string>());
+            child.threshold = node["Threshold"] ? node["Threshold"].as<float>() : 0.0f;
+            return true;
+        }
+    };
+
+    /**
+     * @brief YAML转换器，用于BlendTreeData结构的序列化和反序列化。
+     */
+    template <>
+    struct convert<BlendTreeData>
+    {
+        /**
+         * @brief 将BlendTreeData编码为YAML节点。
+         * @param tree 要编码的混合树数据。
+         * @return 表示混合树数据的YAML节点。
+         */
+        static Node encode(const BlendTreeData& tree)
+        {
+            Node node;
+            node["ParameterName"] = tree.parameterName;
+            node["Children"] = tree.children;
+            return node;
+        }
+
+        /**
+         * @brief 将YAML节点解码为BlendTreeData。
+         * @param node 要解码的YAML节点。
+         * @param tree 存储解码结果的混合树数据引用。
+         * @return 如果解码成功则返回true，否则返回false。
+         */
+        static bool decode(const Node& node, BlendTreeData& tree)
+        {
+            if (!node.IsMap()) return false;
+            if (node["ParameterName"])
+                tree.parameterName = node["ParameterName"].as<std::string>();
+            if (node["Children"])
+                tree.children = node["Children"].as<std::vector<BlendTreeData::Child>>();
+            return true;
+        }
+    };
+
+    /**
      * @brief YAML转换器，用于AnimationState结构的序列化和反序列化。
      */
     template <>
@@ -528,6 +628,12 @@ namespace YAML
             {
                 node["editorPosX"] = state.editorPosX;
                 node["editorPosY"] = state.editorPosY;
+            }
+            // 仅混合树状态写入类型与混合树字段，单剪辑状态保持旧格式不变
+            if (state.stateType == AnimationStateType::BlendTree)
+            {
+                node["stateType"] = static_cast<int>(state.stateType);
+                node["blendTree"] = state.blendTree;
             }
             return node;
         }
@@ -552,6 +658,11 @@ namespace YAML
                 state.editorPosY = node["editorPosY"].as<float>();
                 state.hasEditorPosition = true;
             }
+            state.stateType = node["stateType"]
+                                  ? static_cast<AnimationStateType>(node["stateType"].as<int>())
+                                  : AnimationStateType::Clip;
+            if (node["blendTree"])
+                state.blendTree = node["blendTree"].as<BlendTreeData>();
             return true;
         }
     };

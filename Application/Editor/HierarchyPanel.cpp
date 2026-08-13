@@ -13,7 +13,19 @@
 #include "RelationshipComponent.h"
 #include "JobSystem.h"
 #include <cctype>
+#include <cstring>
 #include <memory>
+#include "ActivityComponent.h"
+#include "Sprite.h"
+#include "TextComponent.h"
+#include "AudioComponent.h"
+#include "UIComponents.h"
+#include "PointLightComponent.h"
+#include "SpotLightComponent.h"
+#include "DirectionalLightComponent.h"
+#include "AreaLightComponent.h"
+#include "TilemapComponent.h"
+#include "ParticleComponent.h"
 void HierarchyPanel::Initialize(EditorContext* context)
 {
     m_context = context;
@@ -61,6 +73,16 @@ void HierarchyPanel::Update(float deltaTime)
     if (ImGui::IsKeyPressed(ImGuiKey_Delete) && !m_context->selectionList.empty() && m_isFocused)
     {
         m_context->gameObjectsToDelete = m_context->selectionList;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_F2) && m_isFocused && !m_renamingGuid.Valid() &&
+        !m_context->selectionList.empty())
+    {
+        beginRename(m_context->selectionList.front());
+    }
+    if (m_renamingGuid.Valid() && m_context->activeScene &&
+        !m_context->activeScene->FindGameObjectByGuid(m_renamingGuid).IsValid())
+    {
+        m_renamingGuid = Guid();
     }
     PopupManager::GetInstance().Register("HierarchyContextMenu", [this]()
                                          {
@@ -157,7 +179,7 @@ void HierarchyPanel::drawSceneCamera()
     {
         cameraFlags |= ImGuiTreeNodeFlags_Selected;
     }
-    ImGui::TreeNodeEx("场景相机", cameraFlags);
+    ImGui::TreeNodeEx("◉ 场景相机", cameraFlags);
     if (ImGui::IsItemClicked())
     {
         selectSceneCamera();
@@ -429,7 +451,18 @@ void HierarchyPanel::drawVirtualizedNode(const HierarchyNode& node, int virtualI
     float indentWidth = node.depth * 20.0f;
     ImVec2 originalCursorPos = ImGui::GetCursorPos();
     ImGui::SetCursorPosX(originalCursorPos.x + indentWidth);
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (node.objectGuid == m_renamingGuid)
+    {
+        drawRenameInput(gameObject);
+        ImGui::PopID();
+        return;
+    }
+    // 眼睛按钮的横向位置需在绘制树节点前采样（此时可用区宽度尚未被节点消耗）
+    float eyeOffsetX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 24.0f;
+    bool selfActive = !gameObject.HasComponent<ECS::ActivityComponent>() ||
+        gameObject.GetComponent<ECS::ActivityComponent>().isActive;
+    bool effectiveActive = isEffectivelyActive(gameObject);
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_AllowOverlap;
     bool isSelected = std::find(m_context->selectionList.begin(), m_context->selectionList.end(), node.objectGuid) !=
         m_context->selectionList.end();
     if (isSelected)
@@ -448,10 +481,15 @@ void HierarchyPanel::drawVirtualizedNode(const HierarchyNode& node, int virtualI
             flags |= ImGuiTreeNodeFlags_DefaultOpen;
         }
     }
+    std::string label = std::string(getObjectIcon(gameObject)) + " " + node.displayName;
+    if (!effectiveActive)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    }
     bool nodeOpen = false;
     if (node.hasChildren)
     {
-        nodeOpen = ImGui::TreeNodeEx(node.displayName.c_str(), flags);
+        nodeOpen = ImGui::TreeNodeEx(label.c_str(), flags);
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
         {
             ImVec2 itemMin = ImGui::GetItemRectMin();
@@ -465,23 +503,41 @@ void HierarchyPanel::drawVirtualizedNode(const HierarchyNode& node, int virtualI
             else
             {
                 handleNodeSelection(node.objectGuid);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                {
+                    // 双击行 = 请求场景视图聚焦选中对象（与场景视图按 F 等价）
+                    m_context->sceneViewFocusRequest = true;
+                }
             }
         }
     }
     else
     {
-        ImGui::TreeNodeEx(node.displayName.c_str(), flags);
+        ImGui::TreeNodeEx(label.c_str(), flags);
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
         {
             handleNodeSelection(node.objectGuid);
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            {
+                m_context->sceneViewFocusRequest = true;
+            }
         }
     }
+    if (!effectiveActive)
+    {
+        ImGui::PopStyleColor();
+    }
+    bool rowHovered = ImGui::IsItemHovered();
     handleNodeDragDrop(node);
     if (ImGui::BeginPopupContextItem())
     {
         if (!isSelected)
         {
             selectSingleGameObject(node.objectGuid);
+        }
+        if (ImGui::MenuItem("重命名", "F2"))
+        {
+            beginRename(node.objectGuid);
         }
         if (ImGui::MenuItem("创建空子对象"))
         {
@@ -506,6 +562,10 @@ void HierarchyPanel::drawVirtualizedNode(const HierarchyNode& node, int virtualI
                 CopySelectedGameObjects();
             }
         }
+        if (ImGui::MenuItem("剪切"))
+        {
+            cutSelectedGameObjects();
+        }
         if (ImGui::MenuItem("删除"))
         {
             m_context->gameObjectsToDelete = m_context->selectionList;
@@ -515,6 +575,23 @@ void HierarchyPanel::drawVirtualizedNode(const HierarchyNode& node, int virtualI
             PasteGameObjects(&gameObject);
         }
         ImGui::EndPopup();
+    }
+    // 悬停行或已停用的对象显示激活切换（依赖 AllowOverlap 让按钮盖在整行节点之上）
+    if (rowHovered || !selfActive)
+    {
+        ImGui::SameLine(eyeOffsetX);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        if (ImGui::SmallButton(selfActive ? "●" : "○"))
+        {
+            SceneManager::GetInstance().PushUndoState(m_context->activeScene);
+            gameObject.SetActive(!selfActive);
+            SceneManager::GetInstance().MarkCurrentSceneDirty();
+        }
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip(selfActive ? "点击停用对象" : "点击激活对象");
+        }
+        ImGui::PopStyleColor();
     }
     if (nodeOpen)
     {
@@ -1132,6 +1209,108 @@ bool HierarchyPanel::isNodeExpanded(const Guid& objectGuid) const
 void HierarchyPanel::setNodeExpanded(const Guid& objectGuid, bool expanded)
 {
     expandedStates[objectGuid] = expanded;
+}
+void HierarchyPanel::beginRename(const Guid& objectGuid)
+{
+    if (!m_context->activeScene) return;
+    RuntimeGameObject go = m_context->activeScene->FindGameObjectByGuid(objectGuid);
+    if (!go.IsValid()) return;
+    std::string name = go.GetName();
+    size_t copyLen = std::min(name.size(), sizeof(m_renameBuffer) - 1);
+    memcpy(m_renameBuffer, name.c_str(), copyLen);
+    m_renameBuffer[copyLen] = '\0';
+    m_renamingGuid = objectGuid;
+    m_renameFocusPending = true;
+}
+void HierarchyPanel::drawRenameInput(RuntimeGameObject& gameObject)
+{
+    ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x, 60.0f));
+    if (m_renameFocusPending)
+    {
+        ImGui::SetKeyboardFocusHere();
+    }
+    bool committed = ImGui::InputText("##HierarchyRenameInput", m_renameBuffer, sizeof(m_renameBuffer),
+                                      ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+    bool deactivated = ImGui::IsItemDeactivated();
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+    {
+        m_renamingGuid = Guid();
+        m_renameFocusPending = false;
+        return;
+    }
+    if (m_renameFocusPending)
+    {
+        // 焦点抢占尚未生效的首帧，IsItemDeactivated 会误报为失焦，跳过提交判定
+        m_renameFocusPending = false;
+        return;
+    }
+    if (committed || deactivated)
+    {
+        std::string newName = m_renameBuffer;
+        if (!newName.empty() && newName != gameObject.GetName())
+        {
+            SceneManager::GetInstance().PushUndoState(m_context->activeScene);
+            gameObject.SetName(newName);
+            SceneManager::GetInstance().MarkCurrentSceneDirty();
+            needsRebuildCache = true;
+        }
+        m_renamingGuid = Guid();
+    }
+}
+void HierarchyPanel::cutSelectedGameObjects()
+{
+    if (!m_context->activeScene || m_context->selectionList.empty()) return;
+    // 剪切 = 复制到剪贴板 + 删除原对象（删除在 Update 中统一执行并入撤销栈）
+    CopySelectedGameObjects();
+    m_context->gameObjectsToDelete = m_context->selectionList;
+}
+const char* HierarchyPanel::getObjectIcon(RuntimeGameObject& gameObject) const
+{
+    // 场景相机是层级面板的固定节点（见 drawSceneCamera），游戏对象无相机组件可判；
+    // 检测优先级：光源 > 精灵 > 瓦片 > UI > 粒子 > 文本/音频 > 其他
+    if (gameObject.HasComponent<ECS::PointLightComponent>() ||
+        gameObject.HasComponent<ECS::SpotLightComponent>() ||
+        gameObject.HasComponent<ECS::DirectionalLightComponent>() ||
+        gameObject.HasComponent<ECS::AreaLightComponent>())
+    {
+        return "☀";
+    }
+    if (gameObject.HasComponent<ECS::SpriteComponent>()) return "▣";
+    if (gameObject.HasComponent<ECS::TilemapComponent>()) return "▦";
+    if (gameObject.HasComponent<ECS::UILayoutComponent>() ||
+        gameObject.HasComponent<ECS::ButtonComponent>() ||
+        gameObject.HasComponent<ECS::InputTextComponent>() ||
+        gameObject.HasComponent<ECS::ToggleButtonComponent>() ||
+        gameObject.HasComponent<ECS::RadioButtonComponent>() ||
+        gameObject.HasComponent<ECS::CheckBoxComponent>() ||
+        gameObject.HasComponent<ECS::SliderComponent>() ||
+        gameObject.HasComponent<ECS::ComboBoxComponent>() ||
+        gameObject.HasComponent<ECS::ExpanderComponent>() ||
+        gameObject.HasComponent<ECS::ProgressBarComponent>() ||
+        gameObject.HasComponent<ECS::TabControlComponent>() ||
+        gameObject.HasComponent<ECS::ListBoxComponent>())
+    {
+        return "▢";
+    }
+    if (gameObject.HasComponent<ECS::ParticleSystemComponent>()) return "✦";
+    if (gameObject.HasComponent<ECS::TextComponent>()) return "T";
+    if (gameObject.HasComponent<ECS::AudioComponent>()) return "♪";
+    return "○";
+}
+bool HierarchyPanel::isEffectivelyActive(RuntimeGameObject& gameObject) const
+{
+    // 与 Unity activeInHierarchy 一致：自身或任一祖先停用即视为非激活
+    RuntimeGameObject current = gameObject;
+    while (current.IsValid())
+    {
+        if (current.HasComponent<ECS::ActivityComponent>() &&
+            !current.GetComponent<ECS::ActivityComponent>().isActive)
+        {
+            return false;
+        }
+        current = current.GetParent();
+    }
+    return true;
 }
 void HierarchyPanel::expandPathToObject(const Guid& targetGuid)
 {

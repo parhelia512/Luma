@@ -1,6 +1,7 @@
 #ifndef EDITORCONTEXT_H
 #define EDITORCONTEXT_H
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <chrono>
 #include <optional>
@@ -50,6 +51,18 @@ enum class AssetBrowserViewMode
     List, 
     Grid 
 };
+/**
+ * @brief 图案笔刷的单元格：相对锚点（图案左上角）的格偏移 + 瓦片资产与朝向。
+ * 与 ECS::TileInstance 字段等价，独立定义以免 EditorContext 依赖 TilemapComponent 的重头文件。
+ */
+struct TileBrushPatternCell
+{
+    ECS::Vector2i offset; 
+    AssetHandle handle; 
+    uint8_t rotation = 0; ///< 0-3，每步顺时针 90°
+    bool flipX = false; 
+    bool flipY = false; 
+};
 struct EditorContext
 {
     EngineContext* engineContext = nullptr; 
@@ -75,6 +88,7 @@ struct EditorContext
     Guid currentEditingAnimationClipGuid; 
     Guid currentEditingAnimationControllerGuid; 
     int animationEditorUndoCaptureFrame = -1000; ///< 动画编辑器最近声明接管撤销/重做快捷键的 ImGui 帧号（工具栏全局撤销据此让路；面板绘制顺序晚于工具栏，需跨帧标记）
+    int tileEditorUndoCaptureFrame = -1000; ///< 瓦片编辑模式最近声明接管撤销/重做快捷键的 ImGui 帧号（瓦片笔画走面板级增量撤销栈，机制同上）
     std::unique_ptr<DirectoryNode> assetTreeRoot; 
     DirectoryNode* currentAssetDirectory = nullptr; 
     AssetBrowserViewMode assetBrowserViewMode = AssetBrowserViewMode::Grid; 
@@ -86,6 +100,7 @@ struct EditorContext
     std::vector<std::filesystem::path> assetClipboard; 
     Guid objectToFocusInHierarchy; 
     Guid assetToFocusInBrowser; 
+    bool sceneViewFocusRequest = false; ///< 请求场景视图聚焦到当前选中对象（层级面板双击置位，SceneViewPanel 消费，等价按 F）
     std::vector<std::string> droppedFilesQueue; 
     std::string conflictSourcePath; 
     std::string conflictDestPath; 
@@ -105,6 +120,7 @@ struct EditorContext
     Guid currentEditingTilesetGuid; 
     Guid currentEditingRuleTileGuid; 
     AssetHandle activeTileBrush; 
+    std::vector<TileBrushPatternCell> activeTileBrushPattern; ///< 多瓦片图案笔刷，非空时优先于 activeTileBrush 盖章；瓦片编辑模式仍由 activeTileBrush 有效性开启
     sk_sp<RuntimeTexture> activeBrushPreviewImage; 
     SkRect activeBrushPreviewSourceRect; 
     Guid currentEditingBlueprintGuid; 

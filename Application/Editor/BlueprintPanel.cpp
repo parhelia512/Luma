@@ -15,6 +15,7 @@
 #include "Profiler.h"
 #include "Input/Cursor.h"
 #include "Input/Keyboards.h"
+#include "BlueprintEditorNav.h"
 struct PairHash
 {
     template <class T1, class T2>
@@ -27,6 +28,9 @@ struct PairHash
 };
 namespace
 {
+    // 主图上函数占位卡片的固定尺寸（画布单位），函数区域折叠后按此绘制与命中
+    constexpr float kFunctionCardWidth = 260.0f;
+    constexpr float kFunctionCardHeight = 96.0f;
     // C# 类型别名 → 完整类型名，连线校验与配色共用同一套规范化
     std::string_view canonicalPinType(std::string_view typeName)
     {
@@ -105,6 +109,16 @@ namespace
             if (j == needle.size()) return true;
         }
         return false;
+    }
+    // 节点归属图页的唯一访问口（0=主图）：字段本身由 BlueprintData.h 序列化，
+    // 生成器不读取该字段，改动只影响编辑器视图层
+    uint32_t readNodeOwnerFunction(const BlueprintNode& node)
+    {
+        return node.OwnerFunctionID;
+    }
+    void writeNodeOwnerFunction(BlueprintNode& node, uint32_t functionId)
+    {
+        node.OwnerFunctionID = functionId;
     }
     // 平铺搜索结果行：左侧节点名、右侧分类灰字，返回是否被点击
     bool drawFlatNodeMenuItem(const char* name, const char* category, bool enabled)
@@ -189,6 +203,13 @@ void BlueprintPanel::OpenBlueprint(const Guid& blueprintGuid)
     m_currentBlueprintName = m_currentBlueprint->GetBlueprintData().Name;
     strncpy(m_blueprintNameBuffer, m_currentBlueprintName.c_str(), sizeof(m_blueprintNameBuffer));
     m_blueprintNameBuffer[sizeof(m_blueprintNameBuffer) - 1] = '\0';
+    m_currentViewFunction = 0; // 打开蓝图总是从主图开始（归属迁移在 initializeFromBlueprintData 内进行）
+    m_pendingViewFunction = kNoPendingView;
+    m_viewJustSwitched = false;
+    m_pendingNavKind = PendingNavKind::None;
+    m_pendingFocusNodeId = 0;
+    m_findReferences.isOpen = false;
+    m_findReferences.items.clear();
     initializeFromBlueprintData();
     m_undoStack.clear();
     m_redoStack.clear();
@@ -237,6 +258,13 @@ void BlueprintPanel::CloseCurrentBlueprint()
     m_hasMoveCandidate = false;
     m_hasPendingEditSnapshot = false;
     m_pendingLinkPin = ed::PinId(0);
+    m_currentViewFunction = 0;
+    m_pendingViewFunction = kNoPendingView;
+    m_viewJustSwitched = false;
+    m_pendingNavKind = PendingNavKind::None;
+    m_pendingFocusNodeId = 0;
+    m_findReferences.isOpen = false;
+    m_findReferences.items.clear();
     m_currentBlueprint = nullptr;
     m_currentBlueprintGuid = Guid();
     m_currentBlueprintName.clear();
@@ -344,6 +372,7 @@ void BlueprintPanel::Draw()
         drawCreateFunctionPopup();
         drawSelectFunctionWindows();
         drawCreateRegionPopup();
+        drawFindReferencesWindow();
     }
 }
 void BlueprintPanel::updateSelfNodePinTypes()
@@ -461,7 +490,8 @@ void BlueprintPanel::drawMenuBar()
         }
         if (ImGui::BeginMenu("创建"))
         {
-            if (ImGui::MenuItem("创建函数..."))
+            // 子图内禁止创建嵌套函数；普通注释区域各图页均可创建
+            if (ImGui::MenuItem("创建函数...", nullptr, false, m_currentViewFunction == 0))
             {
                 m_isEditingFunction = false;
                 m_functionEditorBuffer = {};
@@ -479,6 +509,12 @@ void BlueprintPanel::drawMenuBar()
         if (ImGui::BeginMenu("视图"))
         {
             ImGui::MenuItem("侧边栏", nullptr, &m_variablesPanelOpen);
+            ImGui::Separator();
+            // 有多选时整理选中节点，否则整理当前图页全部节点
+            if (ImGui::MenuItem("整理节点", nullptr, false, m_currentBlueprint != nullptr))
+            {
+                arrangeNodes();
+            }
             ImGui::EndMenu();
         }
         ImGui::EndMenuBar();
@@ -486,6 +522,8 @@ void BlueprintPanel::drawMenuBar()
 }
 void BlueprintPanel::drawNodeEditor()
 {
+    applyPendingViewSwitch();
+    drawGraphBreadcrumb();
     ed::SetCurrentEditor(m_nodeEditorContext);
     rebuildPinConnections();
     ed::Begin("BlueprintEditor");
@@ -532,6 +570,8 @@ void BlueprintPanel::drawNodeEditor()
     {
         BlueprintNode* sourceData = findSourceDataById(node.sourceDataID);
         if (!sourceData) continue;
+        // 只提交当前视图域内的节点：未提交的节点不绘制、不可命中，但状态仍保留在编辑器上下文中
+        if (readNodeOwnerFunction(*sourceData) != m_currentViewFunction) continue;
         if (sourceData->TargetMemberName == "MakeArray")
         {
             std::string elementType = "System.Object";
@@ -841,10 +881,52 @@ void BlueprintPanel::drawNodeEditor()
     }
     for (const auto& link : m_links)
     {
-        // 连线颜色取源输出引脚的类型色
         const BPin* linkStartPin = findPinById(link.startPinId);
+        const BPin* linkEndPin = findPinById(link.endPinId);
+        // 两端都在当前视图域内才提交（跨域连线已被 canCreateLink 拒绝，此处兜底过滤）
+        if (getPinOwnerFunction(linkStartPin) != m_currentViewFunction ||
+            getPinOwnerFunction(linkEndPin) != m_currentViewFunction)
+        {
+            continue;
+        }
+        // 连线颜色取源输出引脚的类型色
         ImVec4 linkColor = linkStartPin ? getPinTypeColor(linkStartPin->type) : ImVec4(1, 1, 1, 1);
         ed::Link(link.id, link.startPinId, link.endPinId, linkColor);
+    }
+    // 待定导航统一在节点提交完成后应用，保证目标对象已存在于编辑器中；
+    // 优先级：节点居中（查找引用跳转）> 精确矩形（书签）> 内容自适应（切页）
+    if (m_pendingFocusNodeId != 0)
+    {
+        BNode* focusNode = nullptr;
+        for (auto& candidate : m_nodes)
+        {
+            if (candidate.sourceDataID == m_pendingFocusNodeId)
+            {
+                focusNode = &candidate;
+                break;
+            }
+        }
+        if (focusNode)
+        {
+            ed::SelectNode(focusNode->id, false);
+            ed::CenterNodeOnScreen(focusNode->id);
+        }
+        m_pendingFocusNodeId = 0;
+        m_pendingNavKind = PendingNavKind::None;
+        m_viewJustSwitched = false;
+    }
+    else if (m_pendingNavKind == PendingNavKind::Rect)
+    {
+        navigateToViewRect(m_pendingNavRect);
+        m_pendingNavKind = PendingNavKind::None;
+        m_viewJustSwitched = false;
+    }
+    else if (m_viewJustSwitched || m_pendingNavKind == PendingNavKind::Content)
+    {
+        // 本帧已按新视图提交内容，把镜头对准当前域
+        ed::NavigateToContent(0.0f);
+        m_pendingNavKind = PendingNavKind::None;
+        m_viewJustSwitched = false;
     }
     if (ed::BeginCreate())
     {
@@ -912,6 +994,28 @@ void BlueprintPanel::drawNodeEditor()
         }
     }
     ed::EndDelete();
+    // 双击函数入口/函数调用节点（本蓝图函数以 TargetMemberName 标识、无类名）进入对应函数子图
+    if (ed::NodeId doubleClickedNodeId = ed::GetDoubleClickedNode())
+    {
+        BNode* doubleClickedNode = findNodeById(doubleClickedNodeId);
+        BlueprintNode* doubleClickedSource = doubleClickedNode
+                                                 ? findSourceDataById(doubleClickedNode->sourceDataID)
+                                                 : nullptr;
+        if (doubleClickedSource && doubleClickedSource->TargetClassFullName.empty() &&
+            (doubleClickedSource->Type == BlueprintNodeType::FunctionEntry ||
+                doubleClickedSource->Type == BlueprintNodeType::FunctionCall))
+        {
+            const auto& funcs = m_currentBlueprint->GetBlueprintData().Functions;
+            auto it = std::find_if(funcs.begin(), funcs.end(), [&](const BlueprintFunction& f)
+            {
+                return f.Name == doubleClickedSource->TargetMemberName;
+            });
+            if (it != funcs.end())
+            {
+                requestViewSwitch(it->ID);
+            }
+        }
+    }
     // 节点/区域拖动的撤销检测：按下时记录基准与前置快照，松开且发生位移时将该快照入栈
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ed::IsActive())
     {
@@ -988,7 +1092,12 @@ void BlueprintPanel::drawNodeEditor()
         for (auto it = m_regions.rbegin(); it != m_regions.rend(); ++it)
         {
             const auto& region = *it;
-            ImVec2 canvas_br = ImVec2(region.position.x + region.size.x, region.position.y + region.size.y);
+            if (region.ownerFunctionId != m_currentViewFunction) continue; // 不可见区域不响应右键
+            // 函数区域按占位卡片尺寸命中，与绘制保持一致
+            const ImVec2 displaySize = region.functionId != 0
+                                           ? ImVec2(kFunctionCardWidth, kFunctionCardHeight)
+                                           : region.size;
+            ImVec2 canvas_br = ImVec2(region.position.x + displaySize.x, region.position.y + displaySize.y);
             ImRect regionRect(ed::CanvasToScreen(region.position), ed::CanvasToScreen(canvas_br));
             if (regionRect.Contains(ImGui::GetMousePos()))
             {
@@ -1089,6 +1198,14 @@ void BlueprintPanel::drawVariablesPanel()
                 ImGui::Text("变量 %s", var.Name.c_str());
                 ImGui::EndDragDropSource();
             }
+            if (ImGui::BeginPopupContextItem("VariableItemContext"))
+            {
+                if (ImGui::MenuItem("查找引用"))
+                {
+                    openVariableReferences(var.Name);
+                }
+                ImGui::EndPopup();
+            }
             ImGui::SameLine();
             char nameBuffer[256];
             strncpy(nameBuffer, var.Name.c_str(), sizeof(nameBuffer) - 1);
@@ -1137,6 +1254,7 @@ void BlueprintPanel::drawVariablesPanel()
 void BlueprintPanel::drawFunctionsPanel()
 {
     if (!m_currentBlueprint) return;
+    ImGui::BeginDisabled(m_currentViewFunction != 0); // 子图内禁止创建嵌套函数
     if (ImGui::Button("创建函数"))
     {
         m_isEditingFunction = false;
@@ -1151,6 +1269,7 @@ void BlueprintPanel::drawFunctionsPanel()
         m_functionTypeSearchBuffer[0] = '\0';
         m_showCreateFunctionPopup = true;
     }
+    ImGui::EndDisabled();
     ImGui::Separator();
     if (ImGui::BeginChild("FunctionsList"))
     {
@@ -1159,21 +1278,61 @@ void BlueprintPanel::drawFunctionsPanel()
         {
             ImGui::PushID(static_cast<int>(i));
             auto& func = functions[i];
-            std::string signature = func.Name + "()";
+            // 弹出菜单里可能触发删除使 func 引用失效，先拷贝要用的字段
+            const std::string funcName = func.Name;
+            const uint32_t funcId = func.ID;
+            std::string signature = funcName + "()  [" + std::to_string(countNodesOwnedByFunction(funcId)) +
+                " 节点]";
             const float buttons_width = 100.0f;
             float selectableWidth = ImGui::GetContentRegionAvail().x - buttons_width;
             if (selectableWidth < 1.0f) selectableWidth = 1.0f;
-            ImGui::Selectable(signature.c_str(), false, 0, ImVec2(selectableWidth, 0));
+            ImGui::Selectable(signature.c_str(), m_currentViewFunction == funcId, 0, ImVec2(selectableWidth, 0));
             if (ImGui::BeginDragDropSource())
             {
-                ImGui::SetDragDropPayload("BLUEPRINT_FUNCTION_CALL", func.Name.c_str(), func.Name.length() + 1);
-                ImGui::Text("调用函数 %s", func.Name.c_str());
+                ImGui::SetDragDropPayload("BLUEPRINT_FUNCTION_CALL", funcName.c_str(), funcName.length() + 1);
+                ImGui::Text("调用函数 %s", funcName.c_str());
                 ImGui::EndDragDropSource();
             }
-            ImGui::SameLine();
-            if (ImGui::Button(("编辑##" + std::to_string(func.ID)).c_str()))
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
             {
-                m_contextFunctionName = func.Name;
+                requestViewSwitch(funcId); // 双击函数名进入子图
+            }
+            bool wantDelete = false;
+            bool wantEdit = false;
+            if (ImGui::BeginPopupContextItem("FunctionItemContext"))
+            {
+                if (ImGui::MenuItem("进入编辑"))
+                {
+                    requestViewSwitch(funcId);
+                }
+                if (ImGui::MenuItem("查找引用"))
+                {
+                    openFunctionReferences(funcName);
+                }
+                if (ImGui::MenuItem("重命名/修改签名..."))
+                {
+                    wantEdit = true;
+                }
+                if (ImGui::MenuItem("删除函数"))
+                {
+                    wantDelete = true;
+                }
+                ImGui::EndPopup();
+            }
+            if (wantDelete)
+            {
+                deleteFunction(funcName);
+                ImGui::PopID();
+                continue;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(("编辑##" + std::to_string(funcId)).c_str()))
+            {
+                wantEdit = true;
+            }
+            if (wantEdit)
+            {
+                m_contextFunctionName = funcName;
                 m_isEditingFunction = true;
                 m_functionEditorBuffer = func;
                 strncpy(m_functionNameBuffer, m_functionEditorBuffer.Name.c_str(), sizeof(m_functionNameBuffer));
@@ -1182,9 +1341,9 @@ void BlueprintPanel::drawFunctionsPanel()
                 m_showCreateFunctionPopup = true;
             }
             ImGui::SameLine();
-            if (ImGui::Button(("X##" + std::to_string(func.ID)).c_str()))
+            if (ImGui::Button(("X##" + std::to_string(funcId)).c_str()))
             {
-                deleteFunction(func.Name);
+                deleteFunction(funcName);
                 ImGui::PopID();
                 continue;
             }
@@ -1227,6 +1386,27 @@ void BlueprintPanel::deleteFunction(const std::string& functionName)
         std::erase_if(m_regions, [&](const BRegion& region) { return region.functionId == funcIdToDelete; });
         std::erase_if(m_currentBlueprint->GetBlueprintData().CommentRegions,
                       [&](const BlueprintCommentRegion& region) { return region.FunctionID == funcIdToDelete; });
+        // 函数体剩余节点（Return、变量节点等）与子图内的普通注释区域回到主图，避免带着失效归属永久隐藏
+        for (auto& bpNode : m_currentBlueprint->GetBlueprintData().Nodes)
+        {
+            if (readNodeOwnerFunction(bpNode) == funcIdToDelete)
+            {
+                writeNodeOwnerFunction(bpNode, 0);
+            }
+        }
+        for (auto& region : m_regions)
+        {
+            if (region.ownerFunctionId == funcIdToDelete) region.ownerFunctionId = 0;
+        }
+        for (auto& regionData : m_currentBlueprint->GetBlueprintData().CommentRegions)
+        {
+            if (regionData.OwnerFunctionID == funcIdToDelete) regionData.OwnerFunctionID = 0;
+        }
+        if (m_currentViewFunction == funcIdToDelete)
+        {
+            m_currentViewFunction = 0;
+            m_viewJustSwitched = true;
+        }
     }
     std::erase_if(functions, [&](const BlueprintFunction& f) { return f.Name == functionName; });
 }
@@ -1448,6 +1628,7 @@ void BlueprintPanel::drawCreateFunctionPopup()
                 bpNode.TargetMemberName = m_functionEditorBuffer.Name;
                 ImVec2 entryNodePos = {regionData.Position.x + 20, regionData.Position.y + 40};
                 bpNode.Position = {entryNodePos.x, entryNodePos.y};
+                writeNodeOwnerFunction(bpNode, m_functionEditorBuffer.ID);
                 m_currentBlueprint->GetBlueprintData().Nodes.push_back(bpNode);
                 BNode editorNode;
                 editorNode.id = ed::NodeId(bpNode.ID);
@@ -1479,6 +1660,7 @@ void BlueprintPanel::drawCreateFunctionPopup()
                             bpReturnNode.TargetMemberName = std::string(fullName.substr(lastDot + 1));
                         }
                         bpReturnNode.InputDefaults["返回类型"] = m_functionEditorBuffer.ReturnType;
+                        writeNodeOwnerFunction(bpReturnNode, m_functionEditorBuffer.ID);
                         m_currentBlueprint->GetBlueprintData().Nodes.push_back(bpReturnNode);
                         BNode editorReturnNode;
                         editorReturnNode.id = ed::NodeId(bpReturnNode.ID);
@@ -1529,6 +1711,7 @@ void BlueprintPanel::drawCreateRegionPopup()
             regionData.ID = getNextRegionId();
             regionData.Title = m_newRegionTitleBuffer;
             regionData.FunctionID = 0;
+            regionData.OwnerFunctionID = m_currentViewFunction; // 普通注释区域归属当前视图域
             ImVec2 canvasPos = ed::ScreenToCanvas(ImGui::GetMousePos());
             regionData.Position.x = canvasPos.x;
             regionData.Position.y = canvasPos.y;
@@ -1540,6 +1723,7 @@ void BlueprintPanel::drawCreateRegionPopup()
             region.position = ImVec2(regionData.Position.x, regionData.Position.y);
             region.size = ImVec2(regionData.Size.w, regionData.Size.h);
             region.functionId = regionData.FunctionID;
+            region.ownerFunctionId = regionData.OwnerFunctionID;
             region.color = ImVec4(m_newRegionColorBuffer[0], m_newRegionColorBuffer[1], m_newRegionColorBuffer[2],
                                   0.4f);
             m_regions.push_back(region);
@@ -1610,6 +1794,25 @@ void BlueprintPanel::handleShortcutInput()
     {
         deleteSelectedObjects();
     }
+    // 画布书签：Ctrl+1/2/3 设置当前视角，Shift+1/2/3 跳转（Ctrl+Shift 同按视为无效组合）
+    const Key* bookmarkKeys[] = {&Keyboard::Num1, &Keyboard::Num2, &Keyboard::Num3};
+    for (int slot = 0; slot < 3; ++slot)
+    {
+        if (!bookmarkKeys[slot]->IsDown()) continue;
+        if (ctrlDown && !shiftDown)
+        {
+            setBookmark(slot + 1);
+        }
+        else if (shiftDown && !ctrlDown)
+        {
+            jumpToBookmark(slot + 1);
+        }
+    }
+    if (m_currentViewFunction != 0 && Keyboard::Escape.IsDown() &&
+        !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        requestViewSwitch(0); // Esc 返回主图；弹窗打开时让 Esc 先去关闭弹窗
+    }
 }
 void BlueprintPanel::drawSelectFunctionWindows()
 {
@@ -1678,7 +1881,13 @@ void BlueprintPanel::drawRegions()
     const float headerHeight = 30.0f;
     for (const auto& region : m_regions)
     {
-        ImVec2 canvas_br = ImVec2(region.position.x + region.size.x, region.position.y + region.size.y);
+        if (region.ownerFunctionId != m_currentViewFunction) continue; // 只绘制当前图页的区域
+        // 函数区域折叠为占位卡片：函数体节点已按归属隐藏，主图只保留一个可双击进入的入口
+        const bool isFunctionCard = (region.functionId != 0);
+        const ImVec2 displaySize = isFunctionCard
+                                       ? ImVec2(kFunctionCardWidth, kFunctionCardHeight)
+                                       : region.size;
+        ImVec2 canvas_br = ImVec2(region.position.x + displaySize.x, region.position.y + displaySize.y);
         ImVec2 screen_tl = ed::CanvasToScreen(region.position);
         ImVec2 screen_br = ed::CanvasToScreen(canvas_br);
         ImVec2 screenSize = ImVec2(screen_br.x - screen_tl.x, screen_br.y - screen_tl.y);
@@ -1692,10 +1901,23 @@ void BlueprintPanel::drawRegions()
         drawList->AddText(ImVec2(screen_tl.x + (screenSize.x - textSize.x) * 0.5f,
                                  screen_tl.y + (headerHeight - textSize.y) * 0.5f),
                           IM_COL32_WHITE, region.title.c_str());
-        ImVec2 resizeHandlePos = ImVec2(screen_br.x - 15, screen_br.y - 15);
-        drawList->AddTriangleFilled(resizeHandlePos, ImVec2(resizeHandlePos.x + 15, resizeHandlePos.y),
-                                    ImVec2(resizeHandlePos.x + 15, resizeHandlePos.y + 15),
-                                    IM_COL32(255, 255, 255, 128));
+        if (isFunctionCard)
+        {
+            // 描边模拟节点外观，正文提示进入方式
+            drawList->AddRect(screen_tl, screen_br, IM_COL32(255, 255, 255, 90), 8.0f, 0, 1.5f);
+            const char* hint = "双击编辑";
+            ImVec2 hintSize = ImGui::CalcTextSize(hint);
+            drawList->AddText(ImVec2(screen_tl.x + (screenSize.x - hintSize.x) * 0.5f,
+                                     screen_tl.y + headerHeight + (screenSize.y - headerHeight - hintSize.y) * 0.5f),
+                              IM_COL32(255, 255, 255, 170), hint);
+        }
+        else
+        {
+            ImVec2 resizeHandlePos = ImVec2(screen_br.x - 15, screen_br.y - 15);
+            drawList->AddTriangleFilled(resizeHandlePos, ImVec2(resizeHandlePos.x + 15, resizeHandlePos.y),
+                                        ImVec2(resizeHandlePos.x + 15, resizeHandlePos.y + 15),
+                                        IM_COL32(255, 255, 255, 128));
+        }
     }
     ed::Resume();
 }
@@ -1711,11 +1933,40 @@ void BlueprintPanel::handleRegionInteraction()
         for (auto it = m_regions.rbegin(); it != m_regions.rend(); ++it)
         {
             BRegion& region = *it;
-            ImVec2 canvas_br = ImVec2(region.position.x + region.size.x, region.position.y + region.size.y);
+            if (region.ownerFunctionId != m_currentViewFunction) continue; // 不可见区域不参与交互
+            const bool isFunctionCard = (region.functionId != 0);
+            const ImVec2 displaySize = isFunctionCard
+                                           ? ImVec2(kFunctionCardWidth, kFunctionCardHeight)
+                                           : region.size;
+            ImVec2 canvas_br = ImVec2(region.position.x + displaySize.x, region.position.y + displaySize.y);
             ImVec2 screen_tl = ed::CanvasToScreen(region.position);
             ImVec2 screen_br = ed::CanvasToScreen(canvas_br);
             ImRect headerRect(screen_tl, ImVec2(screen_br.x, screen_tl.y + headerHeight));
             ImRect resizeRect(ImVec2(screen_br.x - resizeHandleSize, screen_br.y - resizeHandleSize), screen_br);
+            if (isFunctionCard)
+            {
+                // 占位卡片：双击任意位置进入子图；按住可拖动，函数体（隐藏）节点整体随动保持相对布局
+                ImRect cardRect(screen_tl, screen_br);
+                if (!cardRect.Contains(mousePos)) continue;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                {
+                    requestViewSwitch(region.functionId);
+                    break;
+                }
+                m_regionInteraction.type = ERegionInteractionType::Dragging;
+                m_regionInteraction.activeRegion = &region;
+                m_regionInteraction.startMousePos = canvasMousePos;
+                m_regionInteraction.nodesToDrag.clear();
+                for (auto& node : m_nodes)
+                {
+                    BlueprintNode* nodeSource = findSourceDataById(node.sourceDataID);
+                    if (nodeSource && readNodeOwnerFunction(*nodeSource) == region.functionId)
+                    {
+                        m_regionInteraction.nodesToDrag.push_back(&node);
+                    }
+                }
+                break;
+            }
             if (resizeRect.Contains(mousePos))
             {
                 m_regionInteraction.type = ERegionInteractionType::Resizing;
@@ -1730,12 +1981,13 @@ void BlueprintPanel::handleRegionInteraction()
                 m_regionInteraction.startMousePos = canvasMousePos;
                 m_regionInteraction.nodesToDrag.clear();
                 ImRect regionCanvasRect(region.position, canvas_br);
+                // 普通区域只带上本图页、落在区域矩形内的节点
                 for (auto& node : m_nodes)
                 {
-                    if (regionCanvasRect.Contains(node.position))
-                    {
-                        m_regionInteraction.nodesToDrag.push_back(&node);
-                    }
+                    if (!regionCanvasRect.Contains(node.position)) continue;
+                    BlueprintNode* nodeSource = findSourceDataById(node.sourceDataID);
+                    if (nodeSource && readNodeOwnerFunction(*nodeSource) != region.ownerFunctionId) continue;
+                    m_regionInteraction.nodesToDrag.push_back(&node);
                 }
                 break;
             }
@@ -2122,8 +2374,26 @@ void BlueprintPanel::drawNodeContextMenu()
 {
     if (ImGui::BeginPopup("NodeContextMenu"))
     {
+        const size_t selectedCount = collectSelectedViewNodes().size();
+        if (selectedCount >= 2)
+        {
+            if (ImGui::MenuItem("左对齐")) alignSelectedNodes(NodeAlignMode::Left);
+            if (ImGui::MenuItem("右对齐")) alignSelectedNodes(NodeAlignMode::Right);
+            if (ImGui::MenuItem("顶对齐")) alignSelectedNodes(NodeAlignMode::Top);
+            if (ImGui::MenuItem("底对齐")) alignSelectedNodes(NodeAlignMode::Bottom);
+            ImGui::Separator();
+            // 均布需要至少 3 个节点才有中间项可挪
+            if (ImGui::MenuItem("横向均布", nullptr, false, selectedCount >= 3)) distributeSelectedNodes(true);
+            if (ImGui::MenuItem("纵向均布", nullptr, false, selectedCount >= 3)) distributeSelectedNodes(false);
+            ImGui::Separator();
+        }
+        if (ImGui::MenuItem(selectedCount >= 2 ? "整理选中节点" : "整理节点（全图）"))
+        {
+            arrangeNodes();
+        }
         if (m_contextNodeId)
         {
+            ImGui::Separator();
             if (ImGui::MenuItem("删除节点"))
             {
                 deleteNode(m_contextNodeId);
@@ -2150,7 +2420,18 @@ void BlueprintPanel::drawRegionContextMenu()
 {
     if (ImGui::BeginPopup("RegionContextMenu"))
     {
-        if (ImGui::MenuItem("删除区域"))
+        auto regionIt = std::find_if(m_regions.begin(), m_regions.end(),
+                                     [&](const BRegion& region) { return region.id == m_contextRegionId; });
+        const bool isFunctionCard = regionIt != m_regions.end() && regionIt->functionId != 0;
+        if (isFunctionCard)
+        {
+            // 占位卡片是函数在主图的入口，不提供单独删除；删除函数走函数面板（含节点归属级联处理）
+            if (ImGui::MenuItem("编辑函数图"))
+            {
+                requestViewSwitch(regionIt->functionId);
+            }
+        }
+        else if (ImGui::MenuItem("删除区域"))
         {
             pushUndoSnapshot();
             std::erase_if(m_regions, [&](const BRegion& region) { return region.id == m_contextRegionId; });
@@ -2469,6 +2750,7 @@ void BlueprintPanel::initializeFromBlueprintData()
         region.position = {regionData.Position.x, regionData.Position.y};
         region.size = {regionData.Size.w, regionData.Size.h};
         region.functionId = regionData.FunctionID;
+        region.ownerFunctionId = regionData.OwnerFunctionID;
         ImGuiID hash = ImHashStr(region.title.c_str(), 0, 0);
         region.color = ImPlot::GetColormapColor(((hash & 0xFF)) % ImPlot::GetColormapSize(ImPlotColormap_Deep),
                                                 ImPlotColormap_Deep);
@@ -2476,6 +2758,8 @@ void BlueprintPanel::initializeFromBlueprintData()
         m_regions.push_back(region);
         m_nextRegionId = std::max(m_nextRegionId, region.id + 1);
     }
+    // 区域构建完成后再迁移归属（旧文件按区域几何包含推断），并校验当前视图仍有效
+    migrateNodeOwnership();
 }
 void BlueprintPanel::captureStateToData()
 {
@@ -2545,6 +2829,7 @@ void BlueprintPanel::captureStateToData()
         regionData.ID = region.id;
         regionData.Title = region.title;
         regionData.FunctionID = region.functionId;
+        regionData.OwnerFunctionID = region.ownerFunctionId;
         regionData.Position = {region.position.x, region.position.y};
         regionData.Size = {region.size.x, region.size.y};
         blueprintData.CommentRegions.push_back(regionData);
@@ -2569,6 +2854,7 @@ void BlueprintPanel::createVariableNode(const BlueprintVariable& variable, Bluep
     bpNode.Type = type;
     bpNode.VariableName = variable.Name;
     bpNode.Position = {position.x, position.y};
+    writeNodeOwnerFunction(bpNode, m_currentViewFunction); // 新节点归属当前视图域
     m_currentBlueprint->GetBlueprintData().Nodes.push_back(bpNode);
     BNode editorNode;
     editorNode.id = ed::NodeId(bpNode.ID);
@@ -2612,6 +2898,7 @@ void BlueprintPanel::createNodeFromDefinition(const BlueprintNodeDefinition* def
         bpNode.TargetClassFullName = std::string(fullName.substr(0, lastDot));
         bpNode.TargetMemberName = std::string(fullName.substr(lastDot + 1));
     }
+    writeNodeOwnerFunction(bpNode, m_currentViewFunction); // 新节点归属当前视图域
     m_currentBlueprint->GetBlueprintData().Nodes.push_back(bpNode);
     BNode editorNode;
     editorNode.id = ed::NodeId(bpNode.ID);
@@ -2649,6 +2936,7 @@ void BlueprintPanel::createFunctionCallNode(const BlueprintFunction& func, ImVec
     bpNode.Type = BlueprintNodeType::FunctionCall;
     bpNode.TargetMemberName = func.Name;
     bpNode.Position = {position.x, position.y};
+    writeNodeOwnerFunction(bpNode, m_currentViewFunction); // 新节点归属当前视图域
     m_currentBlueprint->GetBlueprintData().Nodes.push_back(bpNode);
     BNode editorNode;
     editorNode.id = ed::NodeId(bpNode.ID);
@@ -2768,6 +3056,8 @@ bool BlueprintPanel::canCreateLink(const BPin* startPin, const BPin* endPin) con
     if (!startPin || !endPin || startPin == endPin) return false;
     if (startPin->nodeId == endPin->nodeId) return false;
     if (startPin->kind == endPin->kind) return false;
+    // 主图与函数子图之间不允许连线，函数边界只能通过 Entry/Return 表达
+    if (getPinOwnerFunction(startPin) != getPinOwnerFunction(endPin)) return false;
     const BPin* pOut = (startPin->kind == ed::PinKind::Output) ? startPin : endPin;
     const BPin* pIn = (startPin->kind == ed::PinKind::Output) ? endPin : startPin;
     if (pIn->isConnected) return false;
@@ -2885,11 +3175,147 @@ bool BlueprintPanel::doesEventNodeExist(const std::string& fullName)
     }
     return false;
 }
-Blueprint BlueprintPanel::makeSnapshot()
+const BlueprintFunction* BlueprintPanel::findFunctionById(uint32_t functionId) const
 {
-    // 先把编辑器实况（位置、连线、动态引脚、区域）同步进数据，再取全量副本
+    if (!m_currentBlueprint || functionId == 0) return nullptr;
+    const auto& funcs = m_currentBlueprint->GetBlueprintData().Functions;
+    auto it = std::find_if(funcs.begin(), funcs.end(),
+                           [functionId](const BlueprintFunction& f) { return f.ID == functionId; });
+    return it != funcs.end() ? &(*it) : nullptr;
+}
+uint32_t BlueprintPanel::getPinOwnerFunction(const BPin* pin) const
+{
+    if (!pin || !m_currentBlueprint) return 0;
+    for (const auto& node : m_nodes)
+    {
+        if (node.id != pin->nodeId) continue;
+        const auto& bpNodes = m_currentBlueprint->GetBlueprintData().Nodes;
+        auto it = std::find_if(bpNodes.begin(), bpNodes.end(),
+                               [&node](const BlueprintNode& bpNode) { return bpNode.ID == node.sourceDataID; });
+        return it != bpNodes.end() ? readNodeOwnerFunction(*it) : 0;
+    }
+    return 0;
+}
+int BlueprintPanel::countNodesOwnedByFunction(uint32_t functionId) const
+{
+    if (!m_currentBlueprint) return 0;
+    int count = 0;
+    for (const auto& bpNode : m_currentBlueprint->GetBlueprintData().Nodes)
+    {
+        if (readNodeOwnerFunction(bpNode) == functionId) count++;
+    }
+    return count;
+}
+void BlueprintPanel::requestViewSwitch(uint32_t functionId)
+{
+    m_pendingViewFunction = functionId;
+}
+void BlueprintPanel::applyPendingViewSwitch()
+{
+    if (m_pendingViewFunction == kNoPendingView) return;
+    uint32_t target = m_pendingViewFunction;
+    m_pendingViewFunction = kNoPendingView;
+    if (target != 0 && !findFunctionById(target))
+    {
+        target = 0; // 目标函数已不存在（如被撤销/删除），退回主图
+    }
+    if (target == m_currentViewFunction) return;
+    m_currentViewFunction = target;
+    m_viewJustSwitched = true;
+    // 残留选择集属于旧视图域，若不清空会被 Delete/复制隔空命中
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    ed::ClearSelection();
+    m_regionInteraction.type = ERegionInteractionType::None;
+    m_regionInteraction.activeRegion = nullptr;
+    m_regionInteraction.nodesToDrag.clear();
+}
+void BlueprintPanel::drawGraphBreadcrumb()
+{
+    if (m_currentViewFunction == 0)
+    {
+        ImGui::TextDisabled("主图");
+        return;
+    }
+    if (ImGui::SmallButton("主图##Breadcrumb"))
+    {
+        requestViewSwitch(0);
+    }
+    ImGui::SameLine();
+    const BlueprintFunction* func = findFunctionById(m_currentViewFunction);
+    ImGui::Text("> %s", func ? func->Name.c_str() : "未知函数");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Esc 返回主图)");
+}
+void BlueprintPanel::migrateNodeOwnership()
+{
+    auto& blueprintData = m_currentBlueprint->GetBlueprintData();
+    // 版本 0 的旧数据没有 OwnerFunctionID，需按几何位置推断一次；
+    // 版本 1 起 owner==0 即明确表示主图，不能再按区域包含改写
+    const bool legacyData = blueprintData.GraphSchemaVersion < 1;
+    for (auto& bpNode : blueprintData.Nodes)
+    {
+        if (bpNode.Type == BlueprintNodeType::FunctionEntry)
+        {
+            // 入口节点归属始终以函数名反查为准（改名时 TargetMemberName 已同步）
+            const auto& funcs = blueprintData.Functions;
+            auto it = std::find_if(funcs.begin(), funcs.end(), [&bpNode](const BlueprintFunction& f)
+            {
+                return f.Name == bpNode.TargetMemberName;
+            });
+            writeNodeOwnerFunction(bpNode, it != funcs.end() ? it->ID : 0);
+            continue;
+        }
+        uint32_t owner = readNodeOwnerFunction(bpNode);
+        if (owner != 0)
+        {
+            if (!findFunctionById(owner))
+            {
+                writeNodeOwnerFunction(bpNode, 0); // 归属的函数已不存在，节点回到主图
+            }
+            continue;
+        }
+        if (!legacyData) continue;
+        // 旧文件迁移：落在某函数注释区域内的节点视为该函数的节点（沿用原坐标，不重排）
+        for (const auto& region : m_regions)
+        {
+            if (region.functionId == 0) continue;
+            if (bpNode.Position.x >= region.position.x && bpNode.Position.y >= region.position.y &&
+                bpNode.Position.x <= region.position.x + region.size.x &&
+                bpNode.Position.y <= region.position.y + region.size.y)
+            {
+                writeNodeOwnerFunction(bpNode, region.functionId);
+                break;
+            }
+        }
+    }
+    // 区域归属的函数已不存在时回到主图（数据与编辑器镜像一并修正）
+    for (auto& regionData : blueprintData.CommentRegions)
+    {
+        if (regionData.OwnerFunctionID != 0 && !findFunctionById(regionData.OwnerFunctionID))
+        {
+            regionData.OwnerFunctionID = 0;
+        }
+    }
+    for (auto& region : m_regions)
+    {
+        if (region.ownerFunctionId != 0 && !findFunctionById(region.ownerFunctionId))
+        {
+            region.ownerFunctionId = 0;
+        }
+    }
+    blueprintData.GraphSchemaVersion = 1;
+    if (m_currentViewFunction != 0 && !findFunctionById(m_currentViewFunction))
+    {
+        m_currentViewFunction = 0; // 撤销/重做可能移除了正在查看的函数
+        m_viewJustSwitched = true;
+    }
+}
+BlueprintPanel::UndoRecord BlueprintPanel::makeSnapshot()
+{
+    // 先把编辑器实况（位置、连线、动态引脚、区域）同步进数据，再取全量副本；
+    // 快照同时记录所在图页，撤销/重做时把视图带回修改现场
     captureStateToData();
-    return m_currentBlueprint->GetBlueprintData();
+    return {m_currentBlueprint->GetBlueprintData(), m_currentViewFunction};
 }
 void BlueprintPanel::pushUndoSnapshot()
 {
@@ -2898,7 +3324,7 @@ void BlueprintPanel::pushUndoSnapshot()
     if (ImGui::GetFrameCount() == m_lastUndoPushFrame) return;
     pushUndoSnapshotDirect(makeSnapshot());
 }
-void BlueprintPanel::pushUndoSnapshotDirect(Blueprint&& snapshot)
+void BlueprintPanel::pushUndoSnapshotDirect(UndoRecord&& snapshot)
 {
     if (!m_currentBlueprint) return;
     m_undoStack.push_back(std::move(snapshot));
@@ -2909,12 +3335,20 @@ void BlueprintPanel::pushUndoSnapshotDirect(Blueprint&& snapshot)
     m_redoStack.clear();
     m_lastUndoPushFrame = ImGui::GetFrameCount();
 }
-void BlueprintPanel::restoreFromSnapshot(const Blueprint& snapshot)
+void BlueprintPanel::restoreFromSnapshot(const UndoRecord& snapshot)
 {
-    m_currentBlueprint->GetBlueprintData() = snapshot;
-    m_currentBlueprintName = snapshot.Name;
+    m_currentBlueprint->GetBlueprintData() = snapshot.data;
+    m_currentBlueprintName = snapshot.data.Name;
     strncpy(m_blueprintNameBuffer, m_currentBlueprintName.c_str(), sizeof(m_blueprintNameBuffer));
     m_blueprintNameBuffer[sizeof(m_blueprintNameBuffer) - 1] = '\0';
+    // 撤销跨图页的修改时切回快照所在图页，避免"看不见的变化"；
+    // 若该函数在快照里已不存在，initializeFromBlueprintData 内的迁移会兜底退回主图
+    if (m_currentViewFunction != snapshot.activeGraphId)
+    {
+        m_currentViewFunction = snapshot.activeGraphId;
+        m_viewJustSwitched = true;
+    }
+    m_pendingViewFunction = kNoPendingView;
     // 与打开蓝图相同的重建路径，编辑器状态完全由数据再生
     initializeFromBlueprintData();
     m_hasMoveCandidate = false;
@@ -2924,7 +3358,7 @@ void BlueprintPanel::performUndo()
 {
     if (!m_currentBlueprint || m_undoStack.empty()) return;
     m_redoStack.push_back(makeSnapshot());
-    Blueprint snapshot = std::move(m_undoStack.back());
+    UndoRecord snapshot = std::move(m_undoStack.back());
     m_undoStack.pop_back();
     restoreFromSnapshot(snapshot);
 }
@@ -2937,7 +3371,7 @@ void BlueprintPanel::performRedo()
     {
         m_undoStack.pop_front();
     }
-    Blueprint snapshot = std::move(m_redoStack.back());
+    UndoRecord snapshot = std::move(m_redoStack.back());
     m_redoStack.pop_back();
     restoreFromSnapshot(snapshot);
 }
@@ -2982,6 +3416,12 @@ void BlueprintPanel::deleteSelectedObjects()
     }
     for (ed::NodeId nodeId : selectedNodes)
     {
+        BNode* node = findNodeById(nodeId);
+        BlueprintNode* sourceData = node ? findSourceDataById(node->sourceDataID) : nullptr;
+        if (sourceData && readNodeOwnerFunction(*sourceData) != m_currentViewFunction)
+        {
+            continue; // 其他视图域的残留选择不参与删除
+        }
         deleteNode(nodeId); // 函数入口节点由 deleteNode 内部保护
     }
     ed::ClearSelection();
@@ -3007,6 +3447,7 @@ bool BlueprintPanel::collectSelectionForClipboard(std::vector<ClipboardNode>& ou
         BlueprintNode* sourceData = findSourceDataById(node->sourceDataID);
         if (!sourceData) continue;
         if (sourceData->Type == BlueprintNodeType::FunctionEntry) continue; // 入口节点不参与复制
+        if (readNodeOwnerFunction(*sourceData) != m_currentViewFunction) continue; // 只复制当前视图域内的节点
         sourceIdToIndex[sourceData->ID] = static_cast<int>(outNodes.size());
         outNodes.push_back({*sourceData, ImVec2(0, 0)});
     }
@@ -3067,6 +3508,8 @@ void BlueprintPanel::pasteFromClipboard(const std::vector<ClipboardNode>& nodes,
         newNode.ID = getNextNodeId();
         newNode.Position.x = basePosition.x + clipNode.relativePosition.x;
         newNode.Position.y = basePosition.y + clipNode.relativePosition.y;
+        // 粘贴目标域=当前视图：覆盖剪贴板里带来的旧归属，支持跨图页复制粘贴
+        writeNodeOwnerFunction(newNode, m_currentViewFunction);
         blueprintData.Nodes.push_back(newNode);
         newNodeIds[i] = newNode.ID;
     }
@@ -3105,4 +3548,421 @@ void BlueprintPanel::duplicateSelection()
     ImVec2 topLeft;
     if (!collectSelectionForClipboard(nodes, links, topLeft)) return;
     pasteFromClipboard(nodes, links, ImVec2(topLeft.x + 40.0f, topLeft.y + 40.0f));
+}
+std::vector<BlueprintPanel::BNode*> BlueprintPanel::collectSelectedViewNodes()
+{
+    std::vector<BNode*> result;
+    if (!m_currentBlueprint) return result;
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    int selectedCount = ed::GetSelectedObjectCount();
+    if (selectedCount <= 0) return result;
+    std::vector<ed::NodeId> selectedNodes(selectedCount);
+    int nodeCount = ed::GetSelectedNodes(selectedNodes.data(), selectedCount);
+    selectedNodes.resize(std::max(nodeCount, 0));
+    for (ed::NodeId nodeId : selectedNodes)
+    {
+        BNode* node = findNodeById(nodeId);
+        BlueprintNode* sourceData = node ? findSourceDataById(node->sourceDataID) : nullptr;
+        if (!sourceData || readNodeOwnerFunction(*sourceData) != m_currentViewFunction)
+        {
+            continue; // 其他图页的残留选择不参与本页布局操作
+        }
+        result.push_back(node);
+    }
+    return result;
+}
+void BlueprintPanel::alignSelectedNodes(NodeAlignMode mode)
+{
+    std::vector<BNode*> nodes = collectSelectedViewNodes();
+    if (nodes.size() < 2) return;
+    pushUndoSnapshot();
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    // 以选区包围盒的对应边为基准
+    float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+    for (const BNode* node : nodes)
+    {
+        const ImVec2 size = ed::GetNodeSize(node->id);
+        minX = std::min(minX, node->position.x);
+        minY = std::min(minY, node->position.y);
+        maxX = std::max(maxX, node->position.x + size.x);
+        maxY = std::max(maxY, node->position.y + size.y);
+    }
+    for (BNode* node : nodes)
+    {
+        const ImVec2 size = ed::GetNodeSize(node->id);
+        ImVec2 pos = node->position;
+        switch (mode)
+        {
+        case NodeAlignMode::Left: pos.x = minX;
+            break;
+        case NodeAlignMode::Right: pos.x = maxX - size.x;
+            break;
+        case NodeAlignMode::Top: pos.y = minY;
+            break;
+        case NodeAlignMode::Bottom: pos.y = maxY - size.y;
+            break;
+        }
+        node->position = pos;
+        ed::SetNodePosition(node->id, pos);
+    }
+}
+void BlueprintPanel::distributeSelectedNodes(bool horizontal)
+{
+    std::vector<BNode*> nodes = collectSelectedViewNodes();
+    if (nodes.size() < 3) return;
+    pushUndoSnapshot();
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    // 首尾节点不动，中间节点重排使相邻间隙相等
+    std::sort(nodes.begin(), nodes.end(), [horizontal](const BNode* a, const BNode* b)
+    {
+        return horizontal ? a->position.x < b->position.x : a->position.y < b->position.y;
+    });
+    float totalSize = 0.0f;
+    for (const BNode* node : nodes)
+    {
+        const ImVec2 size = ed::GetNodeSize(node->id);
+        totalSize += horizontal ? size.x : size.y;
+    }
+    const ImVec2 lastSize = ed::GetNodeSize(nodes.back()->id);
+    const float spanStart = horizontal ? nodes.front()->position.x : nodes.front()->position.y;
+    const float spanEnd = horizontal
+                              ? nodes.back()->position.x + lastSize.x
+                              : nodes.back()->position.y + lastSize.y;
+    const float gap = (spanEnd - spanStart - totalSize) / static_cast<float>(nodes.size() - 1);
+    float cursor = spanStart;
+    for (BNode* node : nodes)
+    {
+        const ImVec2 size = ed::GetNodeSize(node->id);
+        ImVec2 pos = node->position;
+        if (horizontal) pos.x = cursor;
+        else pos.y = cursor;
+        node->position = pos;
+        ed::SetNodePosition(node->id, pos);
+        cursor += (horizontal ? size.x : size.y) + gap;
+    }
+}
+void BlueprintPanel::arrangeNodes()
+{
+    if (!m_currentBlueprint) return;
+    ed::SetCurrentEditor(m_nodeEditorContext);
+    // 有效多选（>=2）时整理选中节点，否则整理当前图页全部节点
+    std::vector<BNode*> targets = collectSelectedViewNodes();
+    if (targets.size() < 2)
+    {
+        targets.clear();
+        for (auto& node : m_nodes)
+        {
+            BlueprintNode* sourceData = findSourceDataById(node.sourceDataID);
+            if (sourceData && readNodeOwnerFunction(*sourceData) == m_currentViewFunction)
+            {
+                targets.push_back(&node);
+            }
+        }
+    }
+    if (targets.size() < 2) return;
+    pushUndoSnapshot();
+    const int count = static_cast<int>(targets.size());
+    std::unordered_map<uint64_t, int> indexOfNode;
+    for (int i = 0; i < count; ++i)
+    {
+        indexOfNode[targets[i]->id.Get()] = i;
+    }
+    // 目标集合内部的有向边（输出端 → 输入端），exec 与数据连线同权参与分层
+    struct ArrangeEdge
+    {
+        int from = 0;
+        int to = 0;
+    };
+    std::vector<ArrangeEdge> edges;
+    for (const auto& link : m_links)
+    {
+        const BPin* startPin = findPinById(link.startPinId);
+        const BPin* endPin = findPinById(link.endPinId);
+        if (!startPin || !endPin) continue;
+        auto fromIt = indexOfNode.find(startPin->nodeId.Get());
+        auto toIt = indexOfNode.find(endPin->nodeId.Get());
+        if (fromIt == indexOfNode.end() || toIt == indexOfNode.end()) continue;
+        if (fromIt->second == toIt->second) continue;
+        edges.push_back({fromIt->second, toIt->second});
+    }
+    // 分列：沿有向边做最长路松弛，轮数受限以容忍数据环
+    std::vector<int> column(count, 0);
+    for (int round = 0; round < count; ++round)
+    {
+        bool changed = false;
+        for (const ArrangeEdge& edge : edges)
+        {
+            if (column[edge.to] < column[edge.from] + 1)
+            {
+                column[edge.to] = column[edge.from] + 1;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+    // 纯数据节点（无任何 Exec 引脚）贴到最早消费者的前一列，避免全部堆在第 0 列
+    for (int i = 0; i < count; ++i)
+    {
+        const BNode* node = targets[i];
+        bool hasExecPin = false;
+        for (const auto& pin : node->inputPins)
+        {
+            if (pin.type == "Exec")
+            {
+                hasExecPin = true;
+                break;
+            }
+        }
+        if (!hasExecPin)
+        {
+            for (const auto& pin : node->outputPins)
+            {
+                if (pin.type == "Exec")
+                {
+                    hasExecPin = true;
+                    break;
+                }
+            }
+        }
+        if (hasExecPin) continue;
+        int minConsumer = count; // 列号必小于节点数，count 作"无消费者"哨兵
+        for (const ArrangeEdge& edge : edges)
+        {
+            if (edge.from == i) minConsumer = std::min(minConsumer, column[edge.to]);
+        }
+        if (minConsumer != count)
+        {
+            column[i] = std::max(0, minConsumer - 1);
+        }
+    }
+    int maxColumn = 0;
+    for (int c : column) maxColumn = std::max(maxColumn, c);
+    std::vector<std::vector<int>> columns(static_cast<size_t>(maxColumn) + 1);
+    for (int i = 0; i < count; ++i)
+    {
+        columns[column[i]].push_back(i);
+    }
+    // 同列排序：有前驱的按前驱行号重心，无前驱的保持原 y 相对次序
+    std::vector<float> rowOrder(count, 0.0f);
+    for (auto& columnNodes : columns)
+    {
+        std::sort(columnNodes.begin(), columnNodes.end(), [&](int a, int b)
+        {
+            return targets[a]->position.y < targets[b]->position.y;
+        });
+        std::vector<std::pair<float, int>> keyed;
+        keyed.reserve(columnNodes.size());
+        for (size_t r = 0; r < columnNodes.size(); ++r)
+        {
+            const int index = columnNodes[r];
+            float sum = 0.0f;
+            int predCount = 0;
+            for (const ArrangeEdge& edge : edges)
+            {
+                if (edge.to == index && column[edge.from] < column[index])
+                {
+                    sum += rowOrder[edge.from];
+                    ++predCount;
+                }
+            }
+            keyed.emplace_back(predCount > 0 ? sum / static_cast<float>(predCount) : static_cast<float>(r), index);
+        }
+        std::stable_sort(keyed.begin(), keyed.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t r = 0; r < keyed.size(); ++r)
+        {
+            columnNodes[r] = keyed[r].second;
+            rowOrder[keyed[r].second] = static_cast<float>(r);
+        }
+    }
+    // 布局原点取目标集原包围盒左上角，整理后整体位置大致不变
+    ImVec2 origin(FLT_MAX, FLT_MAX);
+    for (const BNode* node : targets)
+    {
+        origin.x = std::min(origin.x, node->position.x);
+        origin.y = std::min(origin.y, node->position.y);
+    }
+    constexpr float kColumnSpacing = 250.0f;
+    constexpr float kRowSpacing = 120.0f;
+    float columnX = origin.x;
+    for (const auto& columnNodes : columns)
+    {
+        float y = origin.y;
+        float maxWidth = 0.0f;
+        for (int index : columnNodes)
+        {
+            BNode* node = targets[index];
+            const ImVec2 pos(columnX, y);
+            node->position = pos;
+            ed::SetNodePosition(node->id, pos);
+            const ImVec2 size = ed::GetNodeSize(node->id);
+            maxWidth = std::max(maxWidth, size.x);
+            // 行距 120 起步，超高节点按实际高度让位避免重叠
+            y += std::max(kRowSpacing, size.y + 24.0f);
+        }
+        // 列距 250 起步，超宽节点会把下一列推远
+        columnX += std::max(kColumnSpacing, maxWidth + 40.0f);
+    }
+}
+void BlueprintPanel::setBookmark(int slot)
+{
+    if (!m_currentBlueprint) return;
+    auto& bookmarks = m_currentBlueprint->GetBlueprintData().Bookmarks;
+    auto it = std::find_if(bookmarks.begin(), bookmarks.end(),
+                           [slot](const BlueprintBookmark& bookmark) { return bookmark.Slot == slot; });
+    if (it == bookmarks.end())
+    {
+        bookmarks.emplace_back();
+        it = std::prev(bookmarks.end());
+        it->Slot = slot;
+    }
+    it->GraphID = m_currentViewFunction;
+    const ImVec4 rect = captureCurrentViewRect();
+    it->ViewRect.x = rect.x;
+    it->ViewRect.y = rect.y;
+    it->ViewRect.w = rect.z - rect.x;
+    it->ViewRect.h = rect.w - rect.y;
+    LogInfo("画布书签 {} 已设置（{}）", slot, graphDisplayName(m_currentViewFunction));
+}
+void BlueprintPanel::jumpToBookmark(int slot)
+{
+    if (!m_currentBlueprint) return;
+    const auto& bookmarks = m_currentBlueprint->GetBlueprintData().Bookmarks;
+    auto it = std::find_if(bookmarks.begin(), bookmarks.end(),
+                           [slot](const BlueprintBookmark& bookmark) { return bookmark.Slot == slot; });
+    if (it == bookmarks.end() || it->ViewRect.w <= 0.0f || it->ViewRect.h <= 0.0f) return;
+    if (it->GraphID != 0 && !findFunctionById(it->GraphID))
+    {
+        LogWarn("画布书签 {} 指向的函数已被删除", slot);
+        return;
+    }
+    requestViewSwitch(it->GraphID); // 目标与当前页相同时切换为空操作
+    m_pendingFocusNodeId = 0;
+    m_pendingNavKind = PendingNavKind::Rect;
+    m_pendingNavRect = ImVec4(it->ViewRect.x, it->ViewRect.y,
+                              it->ViewRect.x + it->ViewRect.w, it->ViewRect.y + it->ViewRect.h);
+}
+ImVec4 BlueprintPanel::captureCurrentViewRect() const
+{
+    return BlueprintEditorNav::GetViewRect(m_nodeEditorContext);
+}
+void BlueprintPanel::navigateToViewRect(const ImVec4& rect)
+{
+    if (rect.z - rect.x <= 0.0f || rect.w - rect.y <= 0.0f) return;
+    BlueprintEditorNav::NavigateToRect(m_nodeEditorContext, rect, 0.25f);
+}
+std::string BlueprintPanel::graphDisplayName(uint32_t graphId) const
+{
+    if (graphId == 0) return "主图";
+    const BlueprintFunction* func = findFunctionById(graphId);
+    return func ? ("函数 " + func->Name) : "未知图页";
+}
+void BlueprintPanel::openVariableReferences(const std::string& variableName)
+{
+    if (!m_currentBlueprint) return;
+    m_findReferences.items.clear();
+    m_findReferences.title = "变量 \"" + variableName + "\" 的引用";
+    for (const auto& bpNode : m_currentBlueprint->GetBlueprintData().Nodes)
+    {
+        const bool isVariableNode = bpNode.Type == BlueprintNodeType::VariableGet ||
+            bpNode.Type == BlueprintNodeType::VariableSet;
+        if (!isVariableNode || bpNode.VariableName != variableName) continue;
+        ReferenceItem item;
+        item.nodeID = bpNode.ID;
+        item.graphId = readNodeOwnerFunction(bpNode);
+        item.nodeTitle = (bpNode.Type == BlueprintNodeType::VariableGet ? "获取 " : "设置 ") + variableName;
+        item.graphTitle = graphDisplayName(item.graphId);
+        m_findReferences.items.push_back(std::move(item));
+    }
+    m_findReferences.isOpen = true;
+}
+void BlueprintPanel::openFunctionReferences(const std::string& functionName)
+{
+    if (!m_currentBlueprint) return;
+    m_findReferences.items.clear();
+    m_findReferences.title = "函数 \"" + functionName + "\" 的引用";
+    for (const auto& bpNode : m_currentBlueprint->GetBlueprintData().Nodes)
+    {
+        std::string title;
+        if (bpNode.Type == BlueprintNodeType::FunctionCall &&
+            bpNode.TargetClassFullName.empty() && bpNode.TargetMemberName == functionName)
+        {
+            title = "调用 " + functionName;
+        }
+        else
+        {
+            // 函数选择引脚（FunctionSelection）以默认值存函数名，也算引用
+            const auto* definition = BlueprintNodeRegistry::GetInstance().GetDefinition(
+                bpNode.TargetClassFullName + "." + bpNode.TargetMemberName);
+            if (definition)
+            {
+                for (const auto& pinDef : definition->InputPins)
+                {
+                    if (pinDef.Type != "FunctionSelection") continue;
+                    auto defaultIt = bpNode.InputDefaults.find(pinDef.Name);
+                    if (defaultIt != bpNode.InputDefaults.end() && defaultIt->second == functionName)
+                    {
+                        title = definition->DisplayName + "（引脚 " + pinDef.Name + "）";
+                        break;
+                    }
+                }
+            }
+        }
+        if (title.empty()) continue;
+        ReferenceItem item;
+        item.nodeID = bpNode.ID;
+        item.graphId = readNodeOwnerFunction(bpNode);
+        item.nodeTitle = std::move(title);
+        item.graphTitle = graphDisplayName(item.graphId);
+        m_findReferences.items.push_back(std::move(item));
+    }
+    m_findReferences.isOpen = true;
+}
+void BlueprintPanel::drawFindReferencesWindow()
+{
+    if (!m_findReferences.isOpen || !m_currentBlueprint) return;
+    ImGui::SetNextWindowSize(ImVec2(400, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("查找引用##BlueprintFindReferences", &m_findReferences.isOpen))
+    {
+        ImGui::TextUnformatted(m_findReferences.title.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("（%d 处）", static_cast<int>(m_findReferences.items.size()));
+        ImGui::Separator();
+        if (m_findReferences.items.empty())
+        {
+            ImGui::TextDisabled("没有找到引用。");
+        }
+        else
+        {
+            if (ImGui::BeginChild("##ReferenceList"))
+            {
+                for (size_t i = 0; i < m_findReferences.items.size(); ++i)
+                {
+                    const ReferenceItem& item = m_findReferences.items[i];
+                    ImGui::PushID(static_cast<int>(i));
+                    const std::string label = item.nodeTitle + "  [" + item.graphTitle + "]##ref";
+                    if (ImGui::Selectable(label.c_str()))
+                    {
+                        jumpToNode(item.nodeID);
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndChild();
+        }
+    }
+    ImGui::End();
+}
+void BlueprintPanel::jumpToNode(uint32_t nodeDataId)
+{
+    BlueprintNode* sourceData = findSourceDataById(nodeDataId);
+    if (!sourceData)
+    {
+        LogWarn("引用的节点已不存在（ID={}），请重新查找", nodeDataId);
+        return;
+    }
+    // 先切到节点所在图页（同页为空操作），居中在节点提交后的待定导航中执行
+    requestViewSwitch(readNodeOwnerFunction(*sourceData));
+    m_pendingNavKind = PendingNavKind::None;
+    m_pendingFocusNodeId = nodeDataId;
 }

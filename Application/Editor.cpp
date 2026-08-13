@@ -693,6 +693,18 @@ void Editor::Render()
         PROFILE_SCOPE("ImGui::NewFrame");
         m_imguiRenderer->NewFrame();
     }
+    {
+        static ImVec2 s_lastDisplaySize{0.0f, 0.0f};
+        const ImVec2 ds = ImGui::GetIO().DisplaySize;
+        if (ds.x != s_lastDisplaySize.x || ds.y != s_lastDisplaySize.y)
+        {
+            s_lastDisplaySize = ds;
+            const ImGuiViewport* vp = ImGui::GetMainViewport();
+            LogInfo("ImGui 尺寸变化: DisplaySize={}x{}, vpSize={}x{}, vpWork={}x{}, scale={}x{}",
+                    ds.x, ds.y, vp->Size.x, vp->Size.y, vp->WorkSize.x, vp->WorkSize.y,
+                    ImGui::GetIO().DisplayFramebufferScale.x, ImGui::GetIO().DisplayFramebufferScale.y);
+        }
+    }
     const ImGuiID dockspaceId = ImGui::DockSpaceOverViewport(ImGui::GetMainViewport()->ID, ImGui::GetMainViewport(),
                                                              ImGuiDockNodeFlags_PassthruCentralNode);
     // 首次见到该 dockspace（全新安装，节点为空）或用户请求重置布局时，构建默认布局。

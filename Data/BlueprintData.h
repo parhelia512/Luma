@@ -48,6 +48,7 @@ struct BlueprintNode
     std::string TargetMemberName; ///< [FunctionCall, Event] 目标函数、事件或属性的名称。
     std::string VariableName; ///< [VariableGet, VariableSet] 目标变量的名称。
     bool IsStatic = false; ///< [FunctionCall] 指示目标函数是否为静态。
+    uint32_t OwnerFunctionID = 0; ///< 节点所属图页：0=主图，否则为函数ID（函数子图）；旧数据缺省视为主图。
     // 用于存储未连接的输入引脚的默认值
     std::unordered_map<std::string, std::string> InputDefaults;
 
@@ -92,6 +93,7 @@ struct BlueprintCommentRegion
     uint32_t ID;
     std::string Title;
     uint32_t FunctionID = 0;
+    uint32_t OwnerFunctionID = 0; ///< 区域所属图页：0=主图，否则为函数ID。
 
     struct
     {
@@ -102,6 +104,20 @@ struct BlueprintCommentRegion
     {
         float w = 100.0f, h = 100.0f;
     } Size;
+};
+
+/**
+ * @brief 画布视角书签：记录某图页上的可见区域，用于快捷键快速跳转。
+ */
+struct BlueprintBookmark
+{
+    int Slot = 0; ///< 书签槽位（1-3）。
+    uint32_t GraphID = 0; ///< 书签所在图页：0=主图，否则为函数ID。
+
+    struct
+    {
+        float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+    } ViewRect; ///< 画布坐标系下的可见矩形（同时编码位置与缩放）。
 };
 
 /**
@@ -117,6 +133,8 @@ struct Blueprint
     std::vector<BlueprintCommentRegion> CommentRegions; ///< 蓝图中的注释区域。
     std::vector<BlueprintNode> Nodes; ///< 蓝图中所有的节点。
     std::vector<BlueprintLink> Links; ///< 蓝图中所有的连接。
+    std::vector<BlueprintBookmark> Bookmarks; ///< 画布视角书签。
+    int GraphSchemaVersion = 0; ///< 图页数据版本：0=旧数据（节点归属需按区域推断迁移），1=已含 OwnerFunctionID。
 };
 
 
@@ -203,6 +221,37 @@ namespace YAML
     };
 
     template <>
+    struct convert<BlueprintBookmark>
+    {
+        static Node encode(const BlueprintBookmark& rhs)
+        {
+            Node node;
+            node["Slot"] = rhs.Slot;
+            node["GraphID"] = rhs.GraphID;
+            node["ViewRect"]["x"] = rhs.ViewRect.x;
+            node["ViewRect"]["y"] = rhs.ViewRect.y;
+            node["ViewRect"]["w"] = rhs.ViewRect.w;
+            node["ViewRect"]["h"] = rhs.ViewRect.h;
+            return node;
+        }
+
+        static bool decode(const Node& node, BlueprintBookmark& rhs)
+        {
+            if (!node.IsMap() || !node["Slot"]) return false;
+            rhs.Slot = node["Slot"].as<int>();
+            rhs.GraphID = node["GraphID"] ? node["GraphID"].as<uint32_t>() : 0;
+            if (node["ViewRect"])
+            {
+                rhs.ViewRect.x = node["ViewRect"]["x"].as<float>();
+                rhs.ViewRect.y = node["ViewRect"]["y"].as<float>();
+                rhs.ViewRect.w = node["ViewRect"]["w"].as<float>();
+                rhs.ViewRect.h = node["ViewRect"]["h"].as<float>();
+            }
+            return true;
+        }
+    };
+
+    template <>
     struct convert<BlueprintCommentRegion>
     {
         static Node encode(const BlueprintCommentRegion& rhs)
@@ -211,6 +260,7 @@ namespace YAML
             node["ID"] = rhs.ID;
             node["Title"] = rhs.Title;
             node["FunctionID"] = rhs.FunctionID;
+            if (rhs.OwnerFunctionID != 0) node["OwnerFunctionID"] = rhs.OwnerFunctionID;
             node["Position"]["x"] = rhs.Position.x;
             node["Position"]["y"] = rhs.Position.y;
             node["Size"]["w"] = rhs.Size.w;
@@ -224,6 +274,7 @@ namespace YAML
             rhs.ID = node["ID"].as<uint32_t>();
             rhs.Title = node["Title"].as<std::string>();
             rhs.FunctionID = node["FunctionID"] ? node["FunctionID"].as<uint32_t>() : 0;
+            rhs.OwnerFunctionID = node["OwnerFunctionID"] ? node["OwnerFunctionID"].as<uint32_t>() : 0;
             if (node["Position"])
             {
                 rhs.Position.x = node["Position"]["x"].as<float>();
@@ -277,6 +328,7 @@ namespace YAML
             if (!rhs.TargetMemberName.empty()) node["TargetMemberName"] = rhs.TargetMemberName;
             if (!rhs.VariableName.empty()) node["VariableName"] = rhs.VariableName;
             if (!rhs.InputDefaults.empty()) node["InputDefaults"] = rhs.InputDefaults;
+            if (rhs.OwnerFunctionID != 0) node["OwnerFunctionID"] = rhs.OwnerFunctionID; // 主图节点不写出，保持旧格式
             node["IsStatic"] = rhs.IsStatic;
 
             node["Position"]["x"] = rhs.Position.x;
@@ -296,6 +348,7 @@ namespace YAML
             rhs.TargetClassFullName = node["TargetClassFullName"] ? node["TargetClassFullName"].as<std::string>() : "";
             rhs.TargetMemberName = node["TargetMemberName"] ? node["TargetMemberName"].as<std::string>() : "";
             rhs.VariableName = node["VariableName"] ? node["VariableName"].as<std::string>() : "";
+            rhs.OwnerFunctionID = node["OwnerFunctionID"] ? node["OwnerFunctionID"].as<uint32_t>() : 0; // 旧数据一律视为主图
             if (node["IsStatic"])
             {
                 rhs.IsStatic = node["IsStatic"].as<bool>();
@@ -352,6 +405,8 @@ namespace YAML
             if (!rhs.Links.empty()) node["Links"] = rhs.Links;
             if (!rhs.Functions.empty()) node["Functions"] = rhs.Functions;
             if (!rhs.CommentRegions.empty()) node["CommentRegions"] = rhs.CommentRegions;
+            if (!rhs.Bookmarks.empty()) node["Bookmarks"] = rhs.Bookmarks;
+            node["GraphSchemaVersion"] = rhs.GraphSchemaVersion;
             return node;
         }
 
@@ -369,6 +424,8 @@ namespace YAML
             if (node["CommentRegions"])
                 rhs.CommentRegions = node["CommentRegions"].as<std::vector<
                     BlueprintCommentRegion>>();
+            if (node["Bookmarks"]) rhs.Bookmarks = node["Bookmarks"].as<std::vector<BlueprintBookmark>>();
+            rhs.GraphSchemaVersion = node["GraphSchemaVersion"] ? node["GraphSchemaVersion"].as<int>() : 0;
 
             return true;
         }

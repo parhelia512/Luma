@@ -12,7 +12,11 @@
 #include "../Utils/Profiler.h"
 #include "Renderer/Camera.h"
 #include "../Resources/Loaders/PrefabLoader.h"
+#include "../Resources/Loaders/TileLoader.h"
+#include "../Resources/Loaders/RuleTileLoader.h"
+#include "../Resources/Loaders/TextureLoader.h"
 #include "../Resources/RuntimeAsset/RuntimePrefab.h"
+#include "../Resources/RuntimeAsset/RuntimeTexture.h"
 #include "../SceneManager.h"
 #include "../Utils/Logger.h"
 #include <imgui.h>
@@ -38,6 +42,7 @@
 #include "../Components/AmbientZoneComponent.h"
 #include "../Components/LightProbeComponent.h"
 #include <unordered_set>
+#include <limits>
 #ifndef PIXELS_PER_METER
 #define PIXELS_PER_METER 32.0f;
 #endif
@@ -1408,6 +1413,8 @@ void SceneViewPanel::drawTilemapGrid(ImDrawList* drawList, const ECS::TransformC
                                      const ECS::TilemapComponent& tilemap, const ImVec2& viewportScreenPos,
                                      const ImVec2& viewportSize)
 {
+    // 瓦片编辑模式的每帧快捷键入口（旋转翻转、复制剪切、瓦片级撤销），与网格可见性无关
+    handleTileEditHotkeys();
     const float zoomX = m_editorCameraProperties.zoom.x();
     const float zoomY = m_editorCameraProperties.zoom.y();
     const float halfW = viewportSize.x * 0.5f / zoomX;
@@ -1557,20 +1564,21 @@ void SceneViewPanel::computeTileFillRegion(const ECS::TilemapComponent& tilemap,
     outCoords.clear();
     // 连通填充上限，防止空白区域无界扩散
     constexpr size_t kMaxFillCells = 10000;
-    // 格子内容标识：kind 0 空 / 1 普通瓦片 / 2 规则瓦片
-    auto cellContent = [&tilemap](const ECS::Vector2i& coord) -> std::pair<int, Guid>
+    // 格子内容标识：kind 0 空 / 1 普通瓦片 / 2 规则瓦片；实例含朝向，旋转翻转不同视为不同内容
+    auto cellContent = [&tilemap](const ECS::Vector2i& coord) -> std::pair<int, ECS::TileInstance>
     {
         auto itRule = tilemap.ruleTiles.find(coord);
-        if (itRule != tilemap.ruleTiles.end() && itRule->second.Valid()) return {2, itRule->second.assetGuid};
+        if (itRule != tilemap.ruleTiles.end() && itRule->second.Valid()) return {2, itRule->second};
         auto itNormal = tilemap.normalTiles.find(coord);
-        if (itNormal != tilemap.normalTiles.end() && itNormal->second.Valid()) return {1, itNormal->second.assetGuid};
-        return {0, Guid()};
+        if (itNormal != tilemap.normalTiles.end() && itNormal->second.Valid()) return {1, itNormal->second};
+        return {0, ECS::TileInstance{}};
     };
-    const std::pair<int, Guid> target = cellContent(anchor);
+    const std::pair<int, ECS::TileInstance> target = cellContent(anchor);
     const AssetHandle& brush = m_context->activeTileBrush;
     const int brushKind = brush.assetType == AssetType::RuleTile ? 2 : (brush.assetType == AssetType::Tile ? 1 : 0);
-    // 目标区域已是笔刷内容时填充是空操作
-    if (target.first == brushKind && target.second == brush.assetGuid) return;
+    const ECS::TileInstance brushInstance{brush, m_brushRotation, m_brushFlipX, m_brushFlipY};
+    // 目标区域已是笔刷内容（含朝向一致）时填充是空操作
+    if (target.first == brushKind && target.second == brushInstance) return;
     std::unordered_set<ECS::Vector2i, ECS::Vector2iHash> visited;
     visited.insert(anchor);
     outCoords.push_back(anchor);
@@ -1613,12 +1621,22 @@ void SceneViewPanel::drawTileToolbar(ImDrawList* drawList, const ImVec2& viewpor
         {TileTool::Rect, "矩形(Shift)"},
         {TileTool::Fill, "填充(G)"},
         {TileTool::Picker, "吸管(I)"},
+        {TileTool::Select, "选择"},
     };
     constexpr int itemCount = static_cast<int>(sizeof(items) / sizeof(items[0]));
     const float padX = 10.0f;
     const float padY = 5.0f;
     const float gap = 4.0f;
     const float lineHeight = ImGui::GetTextLineHeight();
+    // 当前笔刷朝向指示：旋转角度 + 翻转标记（Z/X/H/V 调整），作为工具条附加段显示
+    std::string orientLabel = std::to_string(static_cast<int>(m_brushRotation) * 90) + "°";
+    if (m_brushFlipX) orientLabel += " H";
+    if (m_brushFlipY) orientLabel += " V";
+    if (!m_context->activeTileBrushPattern.empty())
+    {
+        orientLabel += " [图案]";
+    }
+    const float orientWidth = ImGui::CalcTextSize(orientLabel.c_str()).x + padX * 2.0f;
     float widths[itemCount];
     float totalWidth = gap * (itemCount - 1);
     for (int i = 0; i < itemCount; ++i)
@@ -1626,6 +1644,7 @@ void SceneViewPanel::drawTileToolbar(ImDrawList* drawList, const ImVec2& viewpor
         widths[i] = ImGui::CalcTextSize(items[i].label).x + padX * 2.0f;
         totalWidth += widths[i];
     }
+    totalWidth += gap + orientWidth;
     const float barHeight = lineHeight + padY * 2.0f;
     const ImVec2 barMin = {
         viewportScreenPos.x + (viewportSize.x - totalWidth) * 0.5f,
@@ -1660,19 +1679,63 @@ void SceneViewPanel::drawTileToolbar(ImDrawList* drawList, const ImVec2& viewpor
         }
         x += widths[i] + gap;
     }
+    // 朝向指示段：只读展示，不参与点击
+    const ImVec2 orientMin = {x, barMin.y};
+    const ImVec2 orientMax = {x + orientWidth, barMin.y + barHeight};
+    drawList->AddRectFilled(orientMin, orientMax, IM_COL32(40, 40, 40, 200), 4.0f);
+    drawList->AddText(ImVec2(x + padX, barMin.y + padY), IM_COL32(255, 220, 120, 255), orientLabel.c_str());
 }
 void SceneViewPanel::drawTileBrushPreview(ImDrawList* drawList, const ECS::TransformComponent& tilemapTransform,
                                           const ECS::TilemapComponent& tilemap)
 {
     if (!m_context->activeTileBrush.Valid()) return;
-    // 悬停工具条时隐藏格子预览（进行中的笔画虚影仍保留）
-    if (m_tileToolbarHovered && !m_isPainting) return;
     const ECS::Vector2i gridCoord = mouseTileCoord(tilemapTransform, tilemap);
     const TileTool tool = effectiveTileTool();
+    // 场景瓦片选区（拖框中或已确认）常驻显示，不受工具条悬停影响
+    if (m_tileSelectDragging || m_tileSelectionValid)
+    {
+        const ECS::Vector2i selMin = {
+            std::min(m_tileSelectStart.x, m_tileSelectEnd.x), std::min(m_tileSelectStart.y, m_tileSelectEnd.y)
+        };
+        const ECS::Vector2i selMax = {
+            std::max(m_tileSelectStart.x, m_tileSelectEnd.x), std::max(m_tileSelectStart.y, m_tileSelectEnd.y)
+        };
+        ImVec2 regionMin, regionMax, cellMin, cellMax;
+        tileCellScreenRect(tilemapTransform, tilemap, selMin, regionMin, cellMax);
+        tileCellScreenRect(tilemapTransform, tilemap, selMax, cellMin, regionMax);
+        drawList->AddRectFilled(regionMin, regionMax, IM_COL32(80, 160, 255, 40));
+        drawList->AddRect(regionMin, regionMax, IM_COL32(80, 160, 255, 220), 0.0f, 0, 2.0f);
+    }
+    // 悬停工具条时隐藏格子预览（进行中的笔画/拖框虚影仍保留）
+    if (m_tileToolbarHovered && !m_isPainting && !m_tilePickerDragging) return;
+    if (tool == TileTool::Select)
+    {
+        // 选择工具只描边悬停格，不显示笔刷虚影
+        ImVec2 screenMin, screenMax;
+        tileCellScreenRect(tilemapTransform, tilemap, gridCoord, screenMin, screenMax);
+        drawList->AddRect(screenMin, screenMax, IM_COL32(80, 160, 255, 200), 0.0f, 0, 1.5f);
+        return;
+    }
     const bool erasing = ImGui::GetIO().KeyAlt || tool == TileTool::Eraser;
     const ImU32 previewColor = erasing ? IM_COL32(255, 80, 80, 100) : IM_COL32(80, 255, 80, 100);
     if (tool == TileTool::Picker)
     {
+        if (m_tilePickerDragging)
+        {
+            // 拖框拾取中：整块显示待拾取区域
+            const ECS::Vector2i pickMin = {
+                std::min(m_tilePickerStart.x, m_tilePickerEnd.x), std::min(m_tilePickerStart.y, m_tilePickerEnd.y)
+            };
+            const ECS::Vector2i pickMax = {
+                std::max(m_tilePickerStart.x, m_tilePickerEnd.x), std::max(m_tilePickerStart.y, m_tilePickerEnd.y)
+            };
+            ImVec2 regionMin, regionMax, cellMin, cellMax;
+            tileCellScreenRect(tilemapTransform, tilemap, pickMin, regionMin, cellMax);
+            tileCellScreenRect(tilemapTransform, tilemap, pickMax, cellMin, regionMax);
+            drawList->AddRectFilled(regionMin, regionMax, IM_COL32(255, 220, 80, 40));
+            drawList->AddRect(regionMin, regionMax, IM_COL32(255, 220, 80, 220), 0.0f, 0, 2.0f);
+            return;
+        }
         ImVec2 screenMin, screenMax;
         tileCellScreenRect(tilemapTransform, tilemap, gridCoord, screenMin, screenMax);
         drawList->AddRectFilled(screenMin, screenMax, IM_COL32(255, 220, 80, 60));
@@ -1706,8 +1769,77 @@ void SceneViewPanel::drawTileBrushPreview(ImDrawList* drawList, const ECS::Trans
         drawList->AddRect(screenMin, screenMax, IM_COL32(80, 255, 80, 220), 0.0f, 0, 2.0f);
         return;
     }
+    if (!erasing && tool == TileTool::Brush && !m_context->activeTileBrushPattern.empty())
+    {
+        // 图案笔刷：整图案真图虚影；拖拽中锚点吸附到图案尺寸网格，与实际盖章位置一致
+        const ECS::Vector2i anchor = m_isPainting ? patternSnappedAnchor(gridCoord) : gridCoord;
+        const ImVec2 clipMin = drawList->GetClipRectMin();
+        const ImVec2 clipMax = drawList->GetClipRectMax();
+        for (const auto& cell : m_context->activeTileBrushPattern)
+        {
+            if (!cell.handle.Valid()) continue;
+            ImVec2 cellMin, cellMax;
+            tileCellScreenRect(tilemapTransform, tilemap,
+                               {anchor.x + cell.offset.x, anchor.y + cell.offset.y}, cellMin, cellMax);
+            if (cellMax.x < clipMin.x || cellMin.x > clipMax.x ||
+                cellMax.y < clipMin.y || cellMin.y > clipMax.y)
+            {
+                continue;
+            }
+            drawTileGhostCell(drawList, cellMin, cellMax, cell.handle,
+                              cell.rotation, cell.flipX, cell.flipY, IM_COL32(255, 255, 255, 180));
+        }
+        ImVec2 anchorMin, anchorMax;
+        tileCellScreenRect(tilemapTransform, tilemap, anchor, anchorMin, anchorMax);
+        drawList->AddRect(anchorMin, anchorMax, IM_COL32(80, 255, 80, 220), 0.0f, 0, 2.0f);
+        return;
+    }
     ImVec2 screenMin, screenMax;
     tileCellScreenRect(tilemapTransform, tilemap, gridCoord, screenMin, screenMax);
+    if (!erasing && m_context->activeBrushPreviewImage && m_context->activeBrushPreviewImage->getImage() &&
+        m_context->activeBrushPreviewImage->getNutTexture())
+    {
+        // 单瓦片贴图虚影：按当前朝向重排 UV 角点，翻转先于旋转（与渲染端 rotate*scale 的矩阵顺序一致）
+        const auto& image = m_context->activeBrushPreviewImage;
+        const float texW = static_cast<float>(image->getImage()->width());
+        const float texH = static_cast<float>(image->getImage()->height());
+        if (texW > 0.0f && texH > 0.0f)
+        {
+            const SkRect& src = m_context->activeBrushPreviewSourceRect;
+            ImVec2 uv[4] = {
+                {src.left() / texW, src.top() / texH},
+                {src.right() / texW, src.top() / texH},
+                {src.right() / texW, src.bottom() / texH},
+                {src.left() / texW, src.bottom() / texH}
+            };
+            if (m_brushFlipX)
+            {
+                std::swap(uv[0], uv[1]);
+                std::swap(uv[3], uv[2]);
+            }
+            if (m_brushFlipY)
+            {
+                std::swap(uv[0], uv[3]);
+                std::swap(uv[1], uv[2]);
+            }
+            // 屏幕角 i 取图像角 (i - rotation)：图像随笔刷旋转步数顺时针转动
+            ImVec2 rotatedUv[4];
+            const int rotationSteps = m_brushRotation & 3;
+            for (int i = 0; i < 4; ++i)
+            {
+                rotatedUv[i] = uv[(i - rotationSteps + 4) & 3];
+            }
+            ImTextureID texId = m_context->imguiRenderer->GetOrCreateTextureIdFor(
+                image->getNutTexture()->GetTexture());
+            drawList->AddImageQuad(texId,
+                                   ImVec2(screenMin.x, screenMin.y), ImVec2(screenMax.x, screenMin.y),
+                                   ImVec2(screenMax.x, screenMax.y), ImVec2(screenMin.x, screenMax.y),
+                                   rotatedUv[0], rotatedUv[1], rotatedUv[2], rotatedUv[3],
+                                   IM_COL32(255, 255, 255, 180));
+            drawList->AddRect(screenMin, screenMax, IM_COL32(80, 255, 80, 200), 0.0f, 0, 1.5f);
+            return;
+        }
+    }
     drawList->AddRectFilled(screenMin, screenMax, previewColor);
 }
 void SceneViewPanel::drawEditorGrid(const ImVec2& viewportScreenPos, const ImVec2& viewportSize)
@@ -1780,29 +1912,105 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
     const ECS::Vector2i gridCoord = mouseTileCoord(tilemapTransform, tilemap);
     const TileTool tool = effectiveTileTool();
     const bool isErasing = ImGui::GetIO().KeyAlt || tool == TileTool::Eraser;
+    // I 键吸管属临时覆盖，拖框中途松开 I 会切走工具：残留的拖框状态作废，避免下次误触发区域拾取
+    if (tool != TileTool::Picker && m_tilePickerDragging)
+    {
+        m_tilePickerDragging = false;
+    }
+    if (tool == TileTool::Select)
+    {
+        // 选择工具：拖出瓦片矩形选区；Ctrl+C/X 与 Esc 由 handleTileEditHotkeys 处理
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !m_tileToolbarHovered)
+        {
+            m_tileSelectDragging = true;
+            m_tileSelectionValid = false;
+            m_tileSelectStart = gridCoord;
+            m_tileSelectEnd = gridCoord;
+        }
+        if (m_tileSelectDragging && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+        {
+            m_tileSelectEnd = gridCoord;
+        }
+        if (m_tileSelectDragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        {
+            m_tileSelectDragging = false;
+            m_tileSelectEnd = gridCoord;
+            m_tileSelectionValid = true;
+        }
+        return;
+    }
+    if (tool == TileTool::Picker)
+    {
+        // 吸管：单击拾取单格内容（含朝向）；按住拖框则把区域拾取为图案笔刷（Godot pattern 式）。
+        // 松开时按起止格判定，未拖出第二格即单格拾取
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !m_tileToolbarHovered)
+        {
+            m_tilePickerDragging = true;
+            m_tilePickerStart = gridCoord;
+            m_tilePickerEnd = gridCoord;
+        }
+        if (m_tilePickerDragging && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+        {
+            m_tilePickerEnd = gridCoord;
+        }
+        if (m_tilePickerDragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        {
+            m_tilePickerDragging = false;
+            m_tilePickerEnd = gridCoord;
+            pickTileRegionAsPattern(tilemap, m_tilePickerStart, m_tilePickerEnd);
+        }
+        return;
+    }
+    // 单瓦片笔刷携带的朝向状态（图案笔刷的单元格各自携带朝向）
+    const ECS::TileInstance brushInstance{
+        m_context->activeTileBrush, m_brushRotation, m_brushFlipX, m_brushFlipY
+    };
+    // 图案盖章仅走普通笔刷路径；直线/矩形/填充退回单瓦片，避免逐格重复盖章的歧义
+    const bool patternActive = !isErasing && tool == TileTool::Brush &&
+        !m_context->activeTileBrushPattern.empty();
     auto publishTilemapUpdate = [&]()
     {
         EventBus::GetInstance().Publish(ComponentUpdatedEvent{
             m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
         });
     };
-    // 底层写入：不去重、不发事件，供笔画与油漆桶共用
+    // 底层写入：不去重、不发事件，供笔画与油漆桶共用；写入前记录该格的笔画前状态供增量撤销
+    auto writeInstanceAt = [&](const ECS::Vector2i& coord, const ECS::TileInstance& inst)
+    {
+        recordTileCellBefore(tilemap, coord);
+        if (inst.handle.assetType == AssetType::RuleTile)
+        {
+            tilemap.ruleTiles[coord] = inst;
+            tilemap.normalTiles.erase(coord);
+        }
+        else
+        {
+            tilemap.normalTiles[coord] = inst;
+            tilemap.ruleTiles.erase(coord);
+        }
+    };
     auto applyBrushAt = [&](const ECS::Vector2i& coord)
     {
         if (isErasing)
         {
+            recordTileCellBefore(tilemap, coord);
             tilemap.normalTiles.erase(coord);
             tilemap.ruleTiles.erase(coord);
         }
-        else if (m_context->activeTileBrush.assetType == AssetType::RuleTile)
+        else if (m_context->activeTileBrush.assetType == AssetType::RuleTile ||
+            m_context->activeTileBrush.assetType == AssetType::Tile)
         {
-            tilemap.ruleTiles[coord] = m_context->activeTileBrush;
-            tilemap.normalTiles.erase(coord);
+            writeInstanceAt(coord, brushInstance);
         }
-        else if (m_context->activeTileBrush.assetType == AssetType::Tile)
+    };
+    // 以锚点格盖章整个图案；空洞（无效句柄）不写入也不擦除
+    auto stampPatternAt = [&](const ECS::Vector2i& anchor)
+    {
+        for (const auto& cell : m_context->activeTileBrushPattern)
         {
-            tilemap.normalTiles[coord] = m_context->activeTileBrush;
-            tilemap.ruleTiles.erase(coord);
+            if (!cell.handle.Valid()) continue;
+            writeInstanceAt({anchor.x + cell.offset.x, anchor.y + cell.offset.y},
+                            ECS::TileInstance{cell.handle, cell.rotation, cell.flipX, cell.flipY});
         }
     };
     auto paintTile = [&](const ECS::Vector2i& coord)
@@ -1811,8 +2019,9 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
         m_paintedCoordsThisStroke.insert(coord);
         const bool brushPaintable = m_context->activeTileBrush.assetType == AssetType::RuleTile ||
             m_context->activeTileBrush.assetType == AssetType::Tile;
-        if (!isErasing && !brushPaintable) return;
-        applyBrushAt(coord);
+        if (!isErasing && !brushPaintable && !patternActive) return;
+        if (patternActive) stampPatternAt(coord);
+        else applyBrushAt(coord);
         m_fillPreviewValid = false;
         publishTilemapUpdate();
     };
@@ -1820,24 +2029,6 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
     {
         // 点击工具条属于 UI 操作，不落到画布
         if (m_tileToolbarHovered) return;
-        if (tool == TileTool::Picker)
-        {
-            // 吸管：拾取格子内容为当前笔刷，TilesetPanel 的选中态与预览随 activeTileBrush 自动同步
-            auto itRule = tilemap.ruleTiles.find(gridCoord);
-            if (itRule != tilemap.ruleTiles.end() && itRule->second.Valid())
-            {
-                m_context->activeTileBrush = itRule->second;
-            }
-            else
-            {
-                auto itNormal = tilemap.normalTiles.find(gridCoord);
-                if (itNormal != tilemap.normalTiles.end() && itNormal->second.Valid())
-                {
-                    m_context->activeTileBrush = itNormal->second;
-                }
-            }
-            return;
-        }
         if (tool == TileTool::Fill)
         {
             // 油漆桶：单击即完成，不进入笔画状态；区域为空说明是无效填充（目标已是笔刷内容）
@@ -1854,11 +2045,12 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
             }
             if (!region.empty())
             {
-                SceneManager::GetInstance().PushUndoState(m_context->activeScene);
+                beginTileStroke(tilemapGo);
                 for (const auto& coord : region)
                 {
                     applyBrushAt(coord);
                 }
+                endTileStroke(tilemap);
                 m_fillPreviewValid = false;
                 publishTilemapUpdate();
             }
@@ -1867,7 +2059,7 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
         m_isPainting = true;
         m_paintedCoordsThisStroke.clear();
         m_paintStartCoord = gridCoord;
-        SceneManager::GetInstance().PushUndoState(m_context->activeScene);
+        beginTileStroke(tilemapGo);
         paintTile(gridCoord);
     }
     if (m_isPainting && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
@@ -1875,7 +2067,8 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
         // 直线/矩形拖拽阶段只显示虚影，松开时统一提交
         if (tool == TileTool::Brush || tool == TileTool::Eraser)
         {
-            paintTile(gridCoord);
+            // 图案笔刷拖拽按图案宽高步进平铺：锚点吸附到以起点格为原点的图案尺寸网格
+            paintTile(patternActive ? patternSnappedAnchor(gridCoord) : gridCoord);
         }
     }
     if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
@@ -1893,17 +2086,444 @@ void SceneViewPanel::handleTilePainting(RuntimeGameObject& tilemapGo)
                 }
             }
             publishTilemapUpdate();
+            // 笔画结束：把本笔画的格子增量压入瓦片撤销栈（不再做全场景快照）
+            endTileStroke(tilemap);
         }
         m_isPainting = false;
     }
 }
+void SceneViewPanel::handleTileEditHotkeys()
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    if (m_strokeRecording && !m_isPainting)
+    {
+        // 笔画被外部中断（如拖拽中失焦被强制复位）：兜底结算已写入的格子，
+        // 避免增量记录丢失；需在焦点检查之前执行，中断本身往往伴随失焦
+        RuntimeGameObject strokeGo = m_context->activeScene->FindGameObjectByGuid(m_strokeTilemapGuid);
+        if (strokeGo.IsValid() && strokeGo.HasComponent<ECS::TilemapComponent>())
+        {
+            endTileStroke(strokeGo.GetComponent<ECS::TilemapComponent>());
+        }
+        else
+        {
+            m_strokeRecording = false;
+            m_strokeBeforeStates.clear();
+        }
+    }
+    if (!m_context->engineContext->isSceneViewFocused)
+    {
+        // 失焦时中断拖框选择，已确认的选区保留
+        m_tileSelectDragging = false;
+        return;
+    }
+    if (io.WantTextInput) return;
+    // Z/X 旋转（逆/顺时针）、H/V 翻转；排除 Ctrl 组合（Ctrl+Z 撤销、Ctrl+X 剪切）
+    if (!io.KeyCtrl)
+    {
+        if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) applyTileBrushOrientationOp(TileOrientOp::RotateCCW);
+        if (ImGui::IsKeyPressed(ImGuiKey_X, false)) applyTileBrushOrientationOp(TileOrientOp::RotateCW);
+        if (ImGui::IsKeyPressed(ImGuiKey_H, false)) applyTileBrushOrientationOp(TileOrientOp::FlipH);
+        if (ImGui::IsKeyPressed(ImGuiKey_V, false)) applyTileBrushOrientationOp(TileOrientOp::FlipV);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+    {
+        // Esc 先取消选区，其次退出图案笔刷回到单瓦片
+        if (m_tileSelectDragging || m_tileSelectionValid)
+        {
+            m_tileSelectDragging = false;
+            m_tileSelectionValid = false;
+        }
+        else if (!m_context->activeTileBrushPattern.empty())
+        {
+            m_context->activeTileBrushPattern.clear();
+        }
+    }
+    if (m_tileSelectionValid && io.KeyCtrl && !io.KeyShift && !io.KeyAlt)
+    {
+        if (ImGui::IsKeyPressed(ImGuiKey_C, false)) copyTileSelectionToPattern(false);
+        if (ImGui::IsKeyPressed(ImGuiKey_X, false)) copyTileSelectionToPattern(true);
+    }
+    if (!m_tileUndoStack.empty() || !m_tileRedoStack.empty())
+    {
+        // 瓦片栈非空时声明接管撤销/重做快捷键，工具栏全局撤销在 <=1 帧窗口内退避；
+        // 两栈皆空则不设标记，Ctrl+Z 放行给全局撤销
+        m_context->tileEditorUndoCaptureFrame = ImGui::GetFrameCount();
+    }
+    if (!ImGui::IsAnyItemActive())
+    {
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
+        {
+            undoTileStroke();
+        }
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z) ||
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y))
+        {
+            redoTileStroke();
+        }
+    }
+}
+void SceneViewPanel::applyTileBrushOrientationOp(TileOrientOp op)
+{
+    // 朝向复合约定：单元格变换 = 先翻转后旋转（与渲染端 rotate * scale 的矩阵顺序一致）。
+    // 该约定下追加旋转只需累加步数；追加镜像会取反已有旋转并翻转对应轴。
+    auto composeInstance = [op](uint8_t& rotation, bool& flipX, bool& flipY)
+    {
+        switch (op)
+        {
+        case TileOrientOp::RotateCW:
+            rotation = static_cast<uint8_t>((rotation + 1) & 3);
+            break;
+        case TileOrientOp::RotateCCW:
+            rotation = static_cast<uint8_t>((rotation + 3) & 3);
+            break;
+        case TileOrientOp::FlipH:
+            rotation = static_cast<uint8_t>((4 - rotation) & 3);
+            flipX = !flipX;
+            break;
+        case TileOrientOp::FlipV:
+            rotation = static_cast<uint8_t>((4 - rotation) & 3);
+            flipY = !flipY;
+            break;
+        }
+    };
+    composeInstance(m_brushRotation, m_brushFlipX, m_brushFlipY);
+    auto& pattern = m_context->activeTileBrushPattern;
+    if (!pattern.empty())
+    {
+        // 图案整体变换：格偏移按同一操作重映射（Y 轴向下的网格，顺时针 90° 即 (x,y)->(-y,x)），
+        // 再平移回“左上角为 (0,0)”的锚点约定
+        int minX = std::numeric_limits<int>::max();
+        int minY = std::numeric_limits<int>::max();
+        for (auto& cell : pattern)
+        {
+            const ECS::Vector2i o = cell.offset;
+            switch (op)
+            {
+            case TileOrientOp::RotateCW: cell.offset = {-o.y, o.x};
+                break;
+            case TileOrientOp::RotateCCW: cell.offset = {o.y, -o.x};
+                break;
+            case TileOrientOp::FlipH: cell.offset = {-o.x, o.y};
+                break;
+            case TileOrientOp::FlipV: cell.offset = {o.x, -o.y};
+                break;
+            }
+            composeInstance(cell.rotation, cell.flipX, cell.flipY);
+            minX = std::min(minX, cell.offset.x);
+            minY = std::min(minY, cell.offset.y);
+        }
+        for (auto& cell : pattern)
+        {
+            cell.offset = {cell.offset.x - minX, cell.offset.y - minY};
+        }
+    }
+    m_fillPreviewValid = false;
+}
+void SceneViewPanel::copyTileSelectionToPattern(bool cut)
+{
+    if (!m_tileSelectionValid) return;
+    if (m_context->selectionType != SelectionType::GameObject || m_context->selectionList.size() != 1) return;
+    RuntimeGameObject tilemapGo = m_context->activeScene->FindGameObjectByGuid(m_context->selectionList[0]);
+    if (!tilemapGo.IsValid() || !tilemapGo.HasComponent<ECS::TilemapComponent>()) return;
+    auto& tilemap = tilemapGo.GetComponent<ECS::TilemapComponent>();
+    const int minX = std::min(m_tileSelectStart.x, m_tileSelectEnd.x);
+    const int maxX = std::max(m_tileSelectStart.x, m_tileSelectEnd.x);
+    const int minY = std::min(m_tileSelectStart.y, m_tileSelectEnd.y);
+    const int maxY = std::max(m_tileSelectStart.y, m_tileSelectEnd.y);
+    std::vector<TileBrushPatternCell> pattern;
+    for (int y = minY; y <= maxY; ++y)
+    {
+        for (int x = minX; x <= maxX; ++x)
+        {
+            const TileCellState state = captureTileCellState(tilemap, {x, y});
+            // 规则瓦片优先，与吸管/填充的格子内容判定一致；空格不进图案，相对排布由 offset 保留
+            const ECS::TileInstance& inst = state.rule.Valid() ? state.rule : state.normal;
+            if (!inst.Valid()) continue;
+            pattern.push_back({{x - minX, y - minY}, inst.handle, inst.rotation, inst.flipX, inst.flipY});
+        }
+    }
+    if (cut)
+    {
+        // 剪切 = 拷贝 + 清除选区，清除作为一次笔画进入瓦片撤销栈
+        beginTileStroke(tilemapGo);
+        for (int y = minY; y <= maxY; ++y)
+        {
+            for (int x = minX; x <= maxX; ++x)
+            {
+                const ECS::Vector2i coord = {x, y};
+                recordTileCellBefore(tilemap, coord);
+                tilemap.normalTiles.erase(coord);
+                tilemap.ruleTiles.erase(coord);
+            }
+        }
+        endTileStroke(tilemap);
+        m_fillPreviewValid = false;
+        EventBus::GetInstance().Publish(ComponentUpdatedEvent{
+            m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
+        });
+    }
+    // 全空区域没有可盖章的内容，保持现有笔刷不变
+    if (pattern.empty()) return;
+    m_context->activeTileBrushPattern = std::move(pattern);
+    // 图案单元格已各自携带朝向，重置追加朝向避免双重变换
+    m_brushRotation = 0;
+    m_brushFlipX = false;
+    m_brushFlipY = false;
+}
+SceneViewPanel::TileCellState SceneViewPanel::captureTileCellState(const ECS::TilemapComponent& tilemap,
+                                                                   const ECS::Vector2i& coord)
+{
+    TileCellState state;
+    auto itNormal = tilemap.normalTiles.find(coord);
+    if (itNormal != tilemap.normalTiles.end()) state.normal = itNormal->second;
+    auto itRule = tilemap.ruleTiles.find(coord);
+    if (itRule != tilemap.ruleTiles.end()) state.rule = itRule->second;
+    return state;
+}
+void SceneViewPanel::applyTileCellState(ECS::TilemapComponent& tilemap, const ECS::Vector2i& coord,
+                                        const TileCellState& state)
+{
+    if (state.normal.Valid()) tilemap.normalTiles[coord] = state.normal;
+    else tilemap.normalTiles.erase(coord);
+    if (state.rule.Valid()) tilemap.ruleTiles[coord] = state.rule;
+    else tilemap.ruleTiles.erase(coord);
+}
+void SceneViewPanel::beginTileStroke(RuntimeGameObject& tilemapGo)
+{
+    m_strokeRecording = true;
+    m_strokeTilemapGuid = tilemapGo.GetGuid();
+    m_strokeBeforeStates.clear();
+}
+void SceneViewPanel::recordTileCellBefore(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& coord)
+{
+    if (!m_strokeRecording) return;
+    // 同一笔画内只保留最早的前状态
+    if (m_strokeBeforeStates.count(coord)) return;
+    m_strokeBeforeStates.emplace(coord, captureTileCellState(tilemap, coord));
+}
+void SceneViewPanel::endTileStroke(const ECS::TilemapComponent& tilemap)
+{
+    if (!m_strokeRecording) return;
+    m_strokeRecording = false;
+    TileUndoRecord record;
+    record.tilemapGuid = m_strokeTilemapGuid;
+    record.entries.reserve(m_strokeBeforeStates.size());
+    for (const auto& [coord, before] : m_strokeBeforeStates)
+    {
+        TileCellState after = captureTileCellState(tilemap, coord);
+        // 前后一致的格子（如重复涂同一瓦片）不进记录
+        if (before.normal == after.normal && before.rule == after.rule) continue;
+        record.entries.push_back({coord, before, after});
+    }
+    m_strokeBeforeStates.clear();
+    if (record.entries.empty()) return;
+    m_tileUndoStack.push_back(std::move(record));
+    constexpr size_t kMaxTileUndoStrokes = 128;
+    while (m_tileUndoStack.size() > kMaxTileUndoStrokes)
+    {
+        m_tileUndoStack.pop_front();
+    }
+    m_tileRedoStack.clear();
+    // 瓦片笔画不再走全场景快照，脏标记需自行维护
+    SceneManager::GetInstance().MarkCurrentSceneDirty();
+}
+void SceneViewPanel::undoTileStroke()
+{
+    if (m_tileUndoStack.empty()) return;
+    TileUndoRecord record = std::move(m_tileUndoStack.back());
+    m_tileUndoStack.pop_back();
+    if (applyTileUndoRecord(record, true))
+    {
+        m_tileRedoStack.push_back(std::move(record));
+    }
+}
+void SceneViewPanel::redoTileStroke()
+{
+    if (m_tileRedoStack.empty()) return;
+    TileUndoRecord record = std::move(m_tileRedoStack.back());
+    m_tileRedoStack.pop_back();
+    if (applyTileUndoRecord(record, false))
+    {
+        m_tileUndoStack.push_back(std::move(record));
+    }
+}
+bool SceneViewPanel::applyTileUndoRecord(const TileUndoRecord& record, bool useBefore)
+{
+    // 目标 Tilemap 可能已不存在（如全局撤销重建场景后被删除），此时丢弃记录
+    RuntimeGameObject tilemapGo = m_context->activeScene->FindGameObjectByGuid(record.tilemapGuid);
+    if (!tilemapGo.IsValid() || !tilemapGo.HasComponent<ECS::TilemapComponent>()) return false;
+    auto& tilemap = tilemapGo.GetComponent<ECS::TilemapComponent>();
+    for (const auto& entry : record.entries)
+    {
+        applyTileCellState(tilemap, entry.coord, useBefore ? entry.before : entry.after);
+    }
+    m_fillPreviewValid = false;
+    SceneManager::GetInstance().MarkCurrentSceneDirty();
+    EventBus::GetInstance().Publish(ComponentUpdatedEvent{
+        m_context->activeScene->GetRegistry(), tilemapGo.GetEntityHandle()
+    });
+    return true;
+}
+ECS::Vector2i SceneViewPanel::patternSnappedAnchor(const ECS::Vector2i& coord) const
+{
+    int width = 1;
+    int height = 1;
+    for (const auto& cell : m_context->activeTileBrushPattern)
+    {
+        width = std::max(width, cell.offset.x + 1);
+        height = std::max(height, cell.offset.y + 1);
+    }
+    // 负方向同样向下取整的地板除法，反向拖拽也按整图案步进
+    auto floorDiv = [](int a, int b)
+    {
+        return a >= 0 ? a / b : -((-a + b - 1) / b);
+    };
+    return {
+        m_paintStartCoord.x + floorDiv(coord.x - m_paintStartCoord.x, width) * width,
+        m_paintStartCoord.y + floorDiv(coord.y - m_paintStartCoord.y, height) * height
+    };
+}
+void SceneViewPanel::pickTileRegionAsPattern(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& from,
+                                             const ECS::Vector2i& to)
+{
+    const int minX = std::min(from.x, to.x);
+    const int maxX = std::max(from.x, to.x);
+    const int minY = std::min(from.y, to.y);
+    const int maxY = std::max(from.y, to.y);
+    // 规则瓦片优先，与选区复制/填充的格子内容判定一致；空格不进图案，相对排布由 offset 保留
+    std::vector<TileBrushPatternCell> pattern;
+    for (int y = minY; y <= maxY; ++y)
+    {
+        for (int x = minX; x <= maxX; ++x)
+        {
+            const TileCellState state = captureTileCellState(tilemap, {x, y});
+            const ECS::TileInstance& inst = state.rule.Valid() ? state.rule : state.normal;
+            if (!inst.Valid()) continue;
+            pattern.push_back({{x - minX, y - minY}, inst.handle, inst.rotation, inst.flipX, inst.flipY});
+        }
+    }
+    // 全空区域不改变现有笔刷
+    if (pattern.empty()) return;
+    if (pattern.size() == 1)
+    {
+        // 区域内仅一个瓦片时退化为单格拾取（含朝向），TilesetPanel 选中态随 activeTileBrush 同步
+        m_context->activeTileBrush = pattern[0].handle;
+        m_brushRotation = pattern[0].rotation;
+        m_brushFlipX = pattern[0].flipX;
+        m_brushFlipY = pattern[0].flipY;
+        m_context->activeTileBrushPattern.clear();
+        return;
+    }
+    // 瓦片编辑模式由 activeTileBrush 有效性开启，用图案首格句柄保底
+    m_context->activeTileBrush = pattern[0].handle;
+    m_context->activeTileBrushPattern = std::move(pattern);
+    // 图案单元格已各自携带朝向，重置追加朝向避免双重变换
+    m_brushRotation = 0;
+    m_brushFlipX = false;
+    m_brushFlipY = false;
+    // 笔刷内容变化后油漆桶预览需重算
+    m_fillPreviewValid = false;
+}
+const SceneViewPanel::TileGhostImage& SceneViewPanel::getTileGhostImage(const AssetHandle& handle)
+{
+    auto cached = m_tileGhostCache.find(handle.assetGuid);
+    if (cached != m_tileGhostCache.end()) return cached->second;
+    TileGhostImage ghost;
+    // 与 TilesetPanel 缩略图一致的提取逻辑：RuleTile 取默认瓦片，精灵瓦片取纹理与源矩形 UV
+    AssetHandle finalTileHandle;
+    if (handle.assetType == AssetType::Tile)
+    {
+        finalTileHandle = handle;
+    }
+    else if (handle.assetType == AssetType::RuleTile)
+    {
+        RuleTileLoader ruleTileLoader;
+        sk_sp<RuntimeRuleTile> ruleTile = ruleTileLoader.LoadAsset(handle.assetGuid);
+        if (ruleTile)
+        {
+            finalTileHandle = ruleTile->GetData().defaultTileHandle;
+        }
+    }
+    if (finalTileHandle.Valid())
+    {
+        TileLoader tileLoader;
+        sk_sp<RuntimeTile> tileAsset = tileLoader.LoadAsset(finalTileHandle.assetGuid);
+        if (tileAsset && std::holds_alternative<SpriteTileData>(tileAsset->GetData()))
+        {
+            const auto& spriteData = std::get<SpriteTileData>(tileAsset->GetData());
+            if (spriteData.textureHandle.Valid())
+            {
+                TextureLoader textureLoader(*m_context->graphicsBackend);
+                ghost.texture = textureLoader.LoadAsset(spriteData.textureHandle.assetGuid);
+                if (ghost.texture && ghost.texture->getImage() &&
+                    spriteData.sourceRect.Width() > 0 && spriteData.sourceRect.Height() > 0)
+                {
+                    const float texW = static_cast<float>(ghost.texture->getImage()->width());
+                    const float texH = static_cast<float>(ghost.texture->getImage()->height());
+                    if (texW > 0.0f && texH > 0.0f)
+                    {
+                        ghost.uv0 = ImVec2(spriteData.sourceRect.x / texW, spriteData.sourceRect.y / texH);
+                        ghost.uv1 = ImVec2((spriteData.sourceRect.x + spriteData.sourceRect.Width()) / texW,
+                                           (spriteData.sourceRect.y + spriteData.sourceRect.Height()) / texH);
+                    }
+                }
+            }
+        }
+    }
+    return m_tileGhostCache.emplace(handle.assetGuid, std::move(ghost)).first->second;
+}
+void SceneViewPanel::drawTileGhostCell(ImDrawList* drawList, const ImVec2& screenMin, const ImVec2& screenMax,
+                                       const AssetHandle& handle, uint8_t rotation, bool flipX, bool flipY, ImU32 tint)
+{
+    const TileGhostImage& ghost = getTileGhostImage(handle);
+    if (!ghost.texture || !ghost.texture->getNutTexture())
+    {
+        // 提取不到贴图（预制体瓦片、缺失资产等）退回半透明占位块
+        drawList->AddRectFilled(screenMin, screenMax, IM_COL32(80, 255, 80, 100));
+        return;
+    }
+    // UV 角点按朝向重排：翻转先于旋转，与渲染端 rotate * scale 的矩阵顺序一致
+    ImVec2 uv[4] = {
+        {ghost.uv0.x, ghost.uv0.y},
+        {ghost.uv1.x, ghost.uv0.y},
+        {ghost.uv1.x, ghost.uv1.y},
+        {ghost.uv0.x, ghost.uv1.y}
+    };
+    if (flipX)
+    {
+        std::swap(uv[0], uv[1]);
+        std::swap(uv[3], uv[2]);
+    }
+    if (flipY)
+    {
+        std::swap(uv[0], uv[3]);
+        std::swap(uv[1], uv[2]);
+    }
+    // 屏幕角 i 取图像角 (i - rotation)：图像随旋转步数顺时针转动
+    ImVec2 rotatedUv[4];
+    const int rotationSteps = rotation & 3;
+    for (int i = 0; i < 4; ++i)
+    {
+        rotatedUv[i] = uv[(i - rotationSteps + 4) & 3];
+    }
+    ImTextureID texId = m_context->imguiRenderer->GetOrCreateTextureIdFor(
+        ghost.texture->getNutTexture()->GetTexture());
+    drawList->AddImageQuad(texId,
+                           ImVec2(screenMin.x, screenMin.y), ImVec2(screenMax.x, screenMin.y),
+                           ImVec2(screenMax.x, screenMax.y), ImVec2(screenMin.x, screenMax.y),
+                           rotatedUv[0], rotatedUv[1], rotatedUv[2], rotatedUv[3], tint);
+}
 void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, const ImVec2& viewportSize)
 {
     // F 键聚焦：场景视图处于聚焦或悬停状态（isSceneViewFocused 即两者之或）且未在输入文本时，
-    // 将编辑器相机位置直接设为所有选中对象世界坐标的平均值，不调整缩放
-    if (m_context->engineContext->isSceneViewFocused &&
-        !ImGui::GetIO().WantTextInput &&
-        ImGui::IsKeyPressed(ImGuiKey_F, false) &&
+    // 将编辑器相机位置直接设为所有选中对象世界坐标的平均值，不调整缩放；
+    // 层级面板双击对象通过 sceneViewFocusRequest 走同一逻辑（外部请求不要求本面板处于聚焦态）
+    const bool externalFocusRequest = m_context->sceneViewFocusRequest;
+    m_context->sceneViewFocusRequest = false;
+    if (((m_context->engineContext->isSceneViewFocused &&
+          !ImGui::GetIO().WantTextInput &&
+          ImGui::IsKeyPressed(ImGuiKey_F, false)) ||
+         externalFocusRequest) &&
         m_context->selectionType == SelectionType::GameObject &&
         !m_context->selectionList.empty())
     {
@@ -1932,6 +2552,9 @@ void SceneViewPanel::handleNavigationAndPick(const ImVec2& viewportScreenPos, co
     if (!m_context->engineContext->isSceneViewFocused || !isHovered)
     {
         m_isDragging = m_isEditingCollider = m_isPainting = false;
+        // 瓦片拖框（吸管/选择）随 hover 丢失取消；已中断笔画由 handleTileEditHotkeys 兜底结算
+        m_tilePickerDragging = false;
+        m_tileSelectDragging = false;
         m_activeColliderHandle.Reset();
         m_draggedObjects.clear();
         m_potentialDragEntity = entt::null;

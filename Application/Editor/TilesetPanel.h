@@ -30,6 +30,16 @@ private:
         ImVec2 uv0 = ImVec2(0.0f, 0.0f);
         ImVec2 uv1 = ImVec2(1.0f, 1.0f);
     };
+    /**
+     * @brief 单帧内缩略图按钮的屏幕矩形与其在网格中的序号，供拖选命中测试。
+     */
+    struct ThumbnailRect
+    {
+        AssetHandle handle; 
+        ImVec2 min; 
+        ImVec2 max; 
+        int index; 
+    };
     void openTileset(Guid tilesetGuid);
     void closeCurrentTileset();
     void saveCurrentTileset();
@@ -37,6 +47,8 @@ private:
     void handleDropTarget();
     void createTileAssetFromSource(const AssetHandle& sourceAssetHandle);
     const TileThumbnail& getOrCreateThumbnail(const AssetHandle& handle);
+    void buildPatternFromThumbnailSelection(const std::vector<ThumbnailRect>& thumbRects, int columnCount,
+                                            const ImVec2& rectMin, const ImVec2& rectMax);
     EditorContext* m_context = nullptr; 
     Guid m_currentTilesetGuid; 
     sk_sp<RuntimeTileset> m_currentTileset = nullptr; 
@@ -47,5 +59,8 @@ private:
     AssetHandle m_lastActiveBrushHandle; 
     void updateBrushPreview();
     float m_thumbnailSize = 64.0f; 
+    bool m_thumbDragPending = false; ///< 左键已在内容区按下，等待越过位移阈值升级为拖选。
+    bool m_thumbDragSelecting = false; ///< 拖选矩形进行中，抑制单击选择。
+    ImVec2 m_thumbDragStart; ///< 拖选起点（屏幕坐标）。
 };
 #endif

@@ -266,6 +266,14 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
                                                             coord.y * tilemap.cellSize.y);
                     const SkPoint anchoredPos = ComputeAnchoredCenter(localTransform, worldWidth, worldHeight);
                     localTransform.position = ECS::Vector2f(anchoredPos.x(), anchoredPos.y());
+                    // 放置实例的旋转翻转烘进每瓦片局部变换：旋转按顺时针 90° 步进累加（弧度），
+                    // 翻转以负缩放表示，二者均绕瓦片中心生效
+                    if (resolvedTile.rotation != 0)
+                    {
+                        localTransform.rotation += static_cast<float>(resolvedTile.rotation) * 1.57079632679f;
+                    }
+                    if (resolvedTile.flipX) { localTransform.scale.x = -localTransform.scale.x; }
+                    if (resolvedTile.flipY) { localTransform.scale.y = -localTransform.scale.y; }
                     cache.localTiles.emplace_back(Renderable{
                         .entityId = entity,
                         .zIndex = renderer.zIndex,

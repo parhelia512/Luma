@@ -56,6 +56,32 @@ private:
     PendingCloseAction m_pendingCloseAction = PendingCloseAction::None; 
     Guid m_pendingOpenClipGuid; ///< 挂起的待切换剪辑
     int m_confirmPopupVisibleFrame = -1000; ///< 确认弹窗最近可见的 ImGui 帧号（检测弹窗被 X 关闭视作取消）
+    // —— 属性轨道编辑状态 ——
+    bool m_curveEditMode = false; ///< 轨道区显示模式：false=Dopesheet 关键帧行，true=曲线视图
+    bool m_recordMode = false; ///< 录制模式：目标对象属性变化时自动在播放头帧写关键帧
+    int m_selectedTrackIndex = -1; ///< 当前选中的属性轨道下标
+    std::set<int> m_selectedTrackKeys; ///< 选中轨道内被选中的关键帧帧号集合
+    bool m_isDraggingTrackKey = false; ///< Dopesheet 中正在水平拖动轨道关键帧
+    int m_trackDragHandleFrame = -1; ///< 轨道关键帧拖拽起始命中的帧号
+    int m_trackDragTargetFrame = -1; ///< 轨道关键帧拖拽当前指向的帧号
+    bool m_isDraggingCurveKey = false; ///< 曲线视图中正在垂直拖动关键帧改值
+    int m_curveDragKeyFrame = -1; ///< 曲线拖拽目标关键帧帧号
+    float m_curveDragStartValue = 0.0f; ///< 曲线拖拽起始值
+    float m_curveDragStartMouseY = 0.0f; ///< 曲线拖拽起始鼠标 Y
+    float m_curveDragRangeMin = 0.0f; ///< 拖拽期间冻结的曲线值域下界（避免视图随值缩放抖动）
+    float m_curveDragRangeMax = 1.0f; ///< 拖拽期间冻结的曲线值域上界
+    bool m_isDraggingTangent = false; ///< 曲线视图中正在拖动 Bezier 切线柄
+    int m_tangentDragKeyFrame = -1; ///< 切线拖拽目标关键帧帧号
+    bool m_tangentDragIsOut = false; ///< 拖拽的是出切线柄（false=入切线柄）
+    float m_tangentDragStartValue = 0.0f; ///< 拖拽起始的切线斜率，松开时无变化则不压撤销栈
+    AnimationClip m_trackDragPreState; ///< 曲线连续拖拽前的剪辑快照，松开时压撤销栈
+    bool m_hasTrackDragPreState = false; 
+    int m_trackContextMenuTrack = -1; ///< 轨道区右键命中的轨道下标
+    int m_trackContextMenuKey = -1; ///< 轨道区右键命中的关键帧帧号（未命中为 -1）
+    int m_trackContextMenuFrame = -1; ///< 轨道区右键落点帧
+    bool m_addTrackPopupOpen = false; 
+    std::vector<std::pair<std::string, std::string>> m_addTrackCandidates; ///< 可动画属性候选：组件名 + 属性路径
+    std::unordered_map<std::string, float> m_recordValueCache; ///< 录制对比缓存："组件/属性路径" -> 上次读取值
     void openAnimationClipFromContext(const Guid& clipGuid);
     void closeCurrentClipFromContext();
     void createNewAnimation();
@@ -96,6 +122,22 @@ private:
     void stopPreviewPlayback();
     void copySelectedFrames();
     void pasteFramesAt(int targetFrame);
+    void drawPropertyTrackSection();
+    void drawTrackContextMenu();
+    void drawAddTrackPopup();
+    void openAddTrackPopup();
+    void createPropertyTrack(const std::string& componentName, const std::string& propertyPath);
+    void removePropertyTrack(int trackIndex);
+    void removeSelectedTrackKeys();
+    void insertTrackKeyAt(int trackIndex, int frame);
+    void applyTangentPresetToSelectedKeys(int preset);
+    static void applyTangentPreset(PropertyTrack& track, size_t keyIndex, int preset);
+    void updateRecording();
+    void refreshRecordCache();
+    /// 收集录制监听目标：已有轨道涉及的属性 ∪ Transform 常用属性（组件名 + 属性路径）
+    std::vector<std::pair<std::string, std::string>> collectRecordTargets() const;
+    void applyPropertyTracksToObject(float frameTime);
+    void resetPropertyTrackEditState();
     void drawUnsavedChangesPopup();
     void executePendingCloseAction();
     void discardCurrentClipChanges();

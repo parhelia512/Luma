@@ -38,6 +38,8 @@ private:
         ed::PinId inputPinId;            
         ed::PinId outputPinId;           
         float speed = 1.0f;              
+        AnimationStateType stateType = AnimationStateType::Clip; 
+        BlendTreeData blendTree;         
     };
     struct ALink
     {
@@ -68,6 +70,9 @@ private:
     bool m_deleteVarConfirmOpen = false;
     int m_pendingDeleteVarIndex = -1;
     std::string m_pendingDeleteVarName;
+    bool m_blendTreeWindowOpen = false;
+    ed::NodeId m_blendTreeNodeId = 0;
+    float m_blendTreePreviewValue = 0.0f;
     void initializeFromControllerData();
     void saveToControllerData();
     void drawNodeEditor();
@@ -81,10 +86,16 @@ private:
     void drawStatePropertiesWindow();
     void drawVariableDeleteConfirmWindow();
     void openStatePropertiesWindow(const ANode& node);
+    void drawBlendTreeEditorWindow();
+    void openBlendTreeEditorWindow(const ANode& node);
+    void sortBlendTreeChildren(BlendTreeData& tree);
+    std::string getClipDisplayName(const Guid& clipGuid) const;
+    bool tryGetRuntimePlaybackStatus(RuntimeAnimationController::PlaybackStatus& outStatus);
     ANode* findNodeByStateGuid(const Guid& stateGuid);
     ALink* findLinkById(ed::LinkId linkId);
     ANode* findNodeById(ed::NodeId nodeId);
     void createStateNode(const std::string& name, ImVec2 position, bool isEntry = false, bool isDefault = false);
+    void createBlendTreeNode(const std::string& name, ImVec2 position);
     void deleteNode(ed::NodeId nodeId);
     void deleteLink(ed::LinkId linkId);
     void handleShortcutInput();

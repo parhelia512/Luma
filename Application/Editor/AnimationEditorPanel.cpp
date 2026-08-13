@@ -4,7 +4,10 @@
 #include "../Utils/PopupManager.h"
 #include <imgui.h>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include "../Resources/RuntimeAsset/RuntimeScene.h"
+#include "AnimationTrackSampler.h"
 #include "AssetManager.h"
 #include "ComponentRegistry.h"
 #include "Profiler.h"
@@ -61,6 +64,8 @@ void AnimationEditorPanel::Update(float deltaTime)
     updateTargetObject();
     if (m_currentClip)
     {
+        // 录制对比先于预览应用：预览写入通过缓存刷新吸收，不会被误判为用户修改
+        updateRecording();
         updatePlayback(deltaTime);
     }
 }
@@ -107,11 +112,19 @@ void AnimationEditorPanel::openAnimationClipFromContext(const Guid& clipGuid)
     {
         m_totalFrames = std::max(m_totalFrames, frameIndex + 1);
     }
+    for (const auto& track : m_currentClip->getAnimationClip().PropertyTracks)
+    {
+        for (const auto& key : track.keyframes)
+        {
+            m_totalFrames = std::max(m_totalFrames, key.frame + 1);
+        }
+    }
     m_multiSelectedFrames.clear();
     m_frameEditWindowOpen = false;
     m_isDirty = false;
     m_undoStack.clear();
     m_redoStack.clear();
+    resetPropertyTrackEditState();
     LogInfo("打开动画切片进行编辑: {}", m_currentClipName);
 }
 void AnimationEditorPanel::closeCurrentClipFromContext()
@@ -134,6 +147,7 @@ void AnimationEditorPanel::closeCurrentClipFromContext()
     m_isDirty = false;
     m_undoStack.clear();
     m_redoStack.clear();
+    resetPropertyTrackEditState();
 }
 void AnimationEditorPanel::createNewAnimation()
 {
@@ -305,6 +319,7 @@ void AnimationEditorPanel::drawControlPanel()
         if (ImGui::Button("应用"))
         {
             applyFrameToObject(m_currentFrame);
+            applyPropertyTracksToObject(static_cast<float>(m_currentFrame));
         }
     }
 }
@@ -653,6 +668,12 @@ void AnimationEditorPanel::drawTimeline()
         drawList->AddTriangleFilled(trianglePoints[0], trianglePoints[1], trianglePoints[2],
                                     IM_COL32(255, 255, 255, 255));
     }
+    if (m_recordMode && m_currentClip)
+    {
+        // 录制状态给时间轴画布叠加红色描边提示
+        drawList->AddRect(canvasPos, ImVec2(canvasPos.x + canvasSize.x, canvasPos.y + canvasSize.y),
+                          IM_COL32(220, 40, 40, 255), 0.0f, 0, 2.0f);
+    }
     if (ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("DRAG_DROP_ASSET_HANDLES_MULTI"))
@@ -732,6 +753,7 @@ void AnimationEditorPanel::drawTimeline()
         }
         ImGui::EndDragDropTarget();
     }
+    drawPropertyTrackSection();
     ImGui::SetNextItemWidth(120);
     ImGui::SliderFloat("缩放", &m_timelineZoom, 0.1f, 5.0f, "%.1fx");
     ImGui::SameLine();
@@ -765,6 +787,8 @@ void AnimationEditorPanel::updatePlayback(float deltaTime)
     if (hasValidTargetObject() && m_currentClip)
     {
         applyFrameToObject(m_currentFrame);
+        // 属性轨道用连续时间采样，播放中帧间也能平滑插值
+        applyPropertyTracksToObject(m_currentTime * m_frameRate);
     }
 }
 void AnimationEditorPanel::seekToFrame(int frameIndex)
@@ -785,6 +809,7 @@ void AnimationEditorPanel::seekToFrame(int frameIndex)
     if (hasValidTargetObject() && m_currentClip)
     {
         applyFrameToObject(m_currentFrame);
+        applyPropertyTracksToObject(static_cast<float>(m_currentFrame));
     }
 }
 void AnimationEditorPanel::addKeyFrame(int frameIndex)
@@ -856,6 +881,8 @@ AnimationClip AnimationEditorPanel::cloneClipData(const AnimationClip& source)
     {
         result.Frames[frameIndex] = cloneFrameData(frame);
     }
+    // 属性轨道是纯值类型，vector 拷贝即深拷贝
+    result.PropertyTracks = source.PropertyTracks;
     return result;
 }
 void AnimationEditorPanel::pushUndoSnapshot()
@@ -903,6 +930,13 @@ void AnimationEditorPanel::afterClipDataRestored()
     {
         m_totalFrames = std::max(m_totalFrames, frameIndex + 1);
     }
+    for (const auto& track : clipData.PropertyTracks)
+    {
+        for (const auto& key : track.keyframes)
+        {
+            m_totalFrames = std::max(m_totalFrames, key.frame + 1);
+        }
+    }
     m_currentFrame = std::clamp(m_currentFrame, 0, m_totalFrames - 1);
     // 丢弃指向已不存在关键帧的选中项
     for (auto it = m_multiSelectedFrames.begin(); it != m_multiSelectedFrames.end();)
@@ -915,6 +949,26 @@ void AnimationEditorPanel::afterClipDataRestored()
         {
             ++it;
         }
+    }
+    // 轨道选中状态同样可能因撤销/重做失效
+    if (m_selectedTrackIndex >= static_cast<int>(clipData.PropertyTracks.size()))
+    {
+        m_selectedTrackIndex = -1;
+        m_selectedTrackKeys.clear();
+    }
+    else if (m_selectedTrackIndex >= 0)
+    {
+        const auto& keys = clipData.PropertyTracks[m_selectedTrackIndex].keyframes;
+        for (auto it = m_selectedTrackKeys.begin(); it != m_selectedTrackKeys.end();)
+        {
+            const bool exists = std::any_of(keys.begin(), keys.end(),
+                                            [frame = *it](const PropertyKey& key) { return key.frame == frame; });
+            it = exists ? std::next(it) : m_selectedTrackKeys.erase(it);
+        }
+    }
+    if (m_recordMode)
+    {
+        refreshRecordCache();
     }
     markDirty();
 }
@@ -954,6 +1008,1243 @@ void AnimationEditorPanel::pasteFramesAt(int targetFrame)
     }
     markDirty();
     LogInfo("粘贴 {} 个关键帧到第 {} 帧", m_copiedFrames.size(), targetFrame);
+}
+void AnimationEditorPanel::drawPropertyTrackSection()
+{
+    if (!m_currentClip)
+        return;
+    ImGui::Spacing();
+    const bool recordOn = m_recordMode;
+    if (recordOn)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.15f, 0.15f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.65f, 0.10f, 0.10f, 1.0f));
+    }
+    if (ImGui::Button("● 录制"))
+    {
+        m_recordMode = !m_recordMode;
+        if (m_recordMode)
+        {
+            refreshRecordCache();
+        }
+    }
+    if (recordOn)
+    {
+        ImGui::PopStyleColor(3);
+    }
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("录制模式：修改目标物体属性时，自动在播放头帧写入关键帧\n监听已有轨道属性与 Transform 常用属性（位置/旋转/缩放），无轨道时自动创建");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(m_curveEditMode ? "关键帧视图" : "曲线视图"))
+    {
+        m_curveEditMode = !m_curveEditMode;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("添加属性轨道"))
+    {
+        openAddTrackPopup();
+    }
+    auto& clipData = m_currentClip->getAnimationClip();
+    ImGui::SameLine();
+    ImGui::TextDisabled("属性轨道: %zu", clipData.PropertyTracks.size());
+    if (clipData.PropertyTracks.empty())
+        return;
+
+    const float sidebarWidth = 190.0f;
+    const float rowHeight = 22.0f;
+    const int trackCount = static_cast<int>(clipData.PropertyTracks.size());
+    const float pixelsPerFrame = 20.0f * m_timelineZoom;
+    const float areaHeight = m_curveEditMode
+                                 ? std::max(180.0f, rowHeight * static_cast<float>(trackCount))
+                                 : rowHeight * static_cast<float>(trackCount);
+    const ImVec2 areaPos = ImGui::GetCursorScreenPos();
+    // 面板极窄时保证画布最小宽度，避免零尺寸 InvisibleButton 触发断言
+    const ImVec2 areaSize = ImVec2(std::max(ImGui::GetContentRegionAvail().x, sidebarWidth + 60.0f), areaHeight);
+    const float laneX = areaPos.x + sidebarWidth;
+    const float areaRight = areaPos.x + areaSize.x;
+    const float laneWidth = std::max(0.0f, areaSize.x - sidebarWidth);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(areaPos, ImVec2(areaRight, areaPos.y + areaSize.y), IM_COL32(45, 45, 45, 255));
+    drawList->AddRectFilled(areaPos, ImVec2(laneX, areaPos.y + areaSize.y), IM_COL32(36, 36, 36, 255));
+    auto frameToX = [&](float frame) { return laneX + frame * pixelsPerFrame - m_timelineScrollX; };
+    // 网格竖线与上方时间轴共用滚动/缩放，保证帧对齐
+    if (pixelsPerFrame > 0.0f)
+    {
+        const int gridStart = std::max(0, static_cast<int>(m_timelineScrollX / pixelsPerFrame));
+        const int gridEnd = std::min(m_totalFrames,
+                                     static_cast<int>((m_timelineScrollX + laneWidth) / pixelsPerFrame) + 2);
+        for (int frame = gridStart; frame < gridEnd; ++frame)
+        {
+            const float x = frameToX(static_cast<float>(frame));
+            if (x < laneX || x > areaRight)
+                continue;
+            const ImU32 lineColor = (frame % 10 == 0) ? IM_COL32(85, 85, 85, 255) : IM_COL32(62, 62, 62, 255);
+            drawList->AddLine(ImVec2(x, areaPos.y), ImVec2(x, areaPos.y + areaSize.y), lineColor);
+        }
+    }
+    // 侧栏轨道行
+    for (int i = 0; i < trackCount; ++i)
+    {
+        const auto& track = clipData.PropertyTracks[i];
+        const float rowY = areaPos.y + static_cast<float>(i) * rowHeight;
+        if (i == m_selectedTrackIndex)
+        {
+            drawList->AddRectFilled(ImVec2(areaPos.x, rowY), ImVec2(laneX, rowY + rowHeight),
+                                    IM_COL32(70, 95, 140, 255));
+        }
+        const std::string label = track.targetComponent + "." + track.propertyPath;
+        drawList->PushClipRect(ImVec2(areaPos.x, rowY), ImVec2(laneX - 4.0f, rowY + rowHeight), true);
+        drawList->AddText(ImVec2(areaPos.x + 6.0f, rowY + 4.0f), IM_COL32(215, 215, 215, 255), label.c_str());
+        drawList->PopClipRect();
+        // 曲线模式下行分隔线只画在侧栏，避免切割曲线画布
+        const float separatorRight = m_curveEditMode ? laneX : areaRight;
+        drawList->AddLine(ImVec2(areaPos.x, rowY + rowHeight), ImVec2(separatorRight, rowY + rowHeight),
+                          IM_COL32(56, 56, 56, 255));
+    }
+    drawList->AddLine(ImVec2(laneX, areaPos.y), ImVec2(laneX, areaPos.y + areaSize.y), IM_COL32(80, 80, 80, 255));
+
+    ImGui::SetCursorScreenPos(areaPos);
+    ImGui::InvisibleButton("##PropertyTrackCanvas", areaSize);
+    const bool areaHovered = ImGui::IsItemHovered();
+    const ImVec2 mousePos = ImGui::GetIO().MousePos;
+    const bool mouseInLane = areaHovered && mousePos.x >= laneX;
+    const bool mouseInSidebar = areaHovered && mousePos.x < laneX;
+    const int hoveredRow = static_cast<int>((mousePos.y - areaPos.y) / rowHeight);
+    int hoveredTrackFrame = (pixelsPerFrame > 0.0f)
+                                ? static_cast<int>(round((mousePos.x - laneX + m_timelineScrollX) / pixelsPerFrame))
+                                : 0;
+    hoveredTrackFrame = std::clamp(hoveredTrackFrame, 0, m_totalFrames - 1);
+    if (mouseInSidebar && hoveredRow >= 0 && hoveredRow < trackCount)
+    {
+        const auto& track = clipData.PropertyTracks[hoveredRow];
+        ImGui::SetTooltip("%s.%s", track.targetComponent.c_str(), track.propertyPath.c_str());
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            if (m_selectedTrackIndex != hoveredRow)
+            {
+                m_selectedTrackKeys.clear();
+            }
+            m_selectedTrackIndex = hoveredRow;
+        }
+    }
+    auto drawDiamond = [&](const ImVec2& center, float radius, ImU32 color)
+    {
+        drawList->AddQuadFilled(ImVec2(center.x, center.y - radius), ImVec2(center.x + radius, center.y),
+                                ImVec2(center.x, center.y + radius), ImVec2(center.x - radius, center.y), color);
+    };
+
+    int hitTrack = -1;
+    int hitKeyFrame = -1;
+    if (!m_curveEditMode)
+    {
+        // —— Dopesheet：每轨道一行，关键帧画菱形 ——
+        for (int i = 0; i < trackCount; ++i)
+        {
+            const auto& track = clipData.PropertyTracks[i];
+            const float centerY = areaPos.y + static_cast<float>(i) * rowHeight + rowHeight * 0.5f;
+            for (const auto& key : track.keyframes)
+            {
+                const float x = frameToX(static_cast<float>(key.frame));
+                if (x < laneX - 6.0f || x > areaRight + 6.0f)
+                    continue;
+                const bool selected = (i == m_selectedTrackIndex && m_selectedTrackKeys.count(key.frame));
+                drawDiamond(ImVec2(x, centerY), 5.0f,
+                            selected ? IM_COL32(255, 220, 60, 255) : IM_COL32(120, 190, 255, 255));
+                if (mouseInLane && std::abs(mousePos.x - x) <= 6.0f &&
+                    std::abs(mousePos.y - centerY) <= rowHeight * 0.5f)
+                {
+                    hitTrack = i;
+                    hitKeyFrame = key.frame;
+                }
+            }
+        }
+        if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && mouseInLane)
+        {
+            if (hitKeyFrame != -1)
+            {
+                if (m_selectedTrackIndex != hitTrack)
+                {
+                    m_selectedTrackKeys.clear();
+                }
+                m_selectedTrackIndex = hitTrack;
+                if (ImGui::GetIO().KeyCtrl)
+                {
+                    if (m_selectedTrackKeys.count(hitKeyFrame))
+                        m_selectedTrackKeys.erase(hitKeyFrame);
+                    else
+                        m_selectedTrackKeys.insert(hitKeyFrame);
+                }
+                else if (!m_selectedTrackKeys.count(hitKeyFrame))
+                {
+                    m_selectedTrackKeys.clear();
+                    m_selectedTrackKeys.insert(hitKeyFrame);
+                }
+                m_isDraggingTrackKey = true;
+                m_trackDragHandleFrame = hitKeyFrame;
+                m_trackDragTargetFrame = hitKeyFrame;
+            }
+            else if (hoveredRow >= 0 && hoveredRow < trackCount)
+            {
+                if (ImGui::GetIO().KeyCtrl)
+                {
+                    // Ctrl+点击空白处在该帧直接加 key（Unity 习惯），双击同样可用
+                    insertTrackKeyAt(hoveredRow, hoveredTrackFrame);
+                }
+                else
+                {
+                    m_selectedTrackIndex = hoveredRow;
+                    m_selectedTrackKeys.clear();
+                }
+            }
+        }
+        if (mouseInLane && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+            hitKeyFrame == -1 && hoveredRow >= 0 && hoveredRow < trackCount)
+        {
+            insertTrackKeyAt(hoveredRow, hoveredTrackFrame);
+        }
+        if (m_isDraggingTrackKey && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+        {
+            m_trackDragTargetFrame = hoveredTrackFrame;
+            const int delta = m_trackDragTargetFrame - m_trackDragHandleFrame;
+            if (delta != 0 && m_selectedTrackIndex >= 0 && m_selectedTrackIndex < trackCount)
+            {
+                const float centerY = areaPos.y + static_cast<float>(m_selectedTrackIndex) * rowHeight +
+                    rowHeight * 0.5f;
+                for (int frame : m_selectedTrackKeys)
+                {
+                    drawDiamond(ImVec2(frameToX(static_cast<float>(frame + delta)), centerY), 5.0f,
+                                IM_COL32(255, 220, 60, 128));
+                }
+            }
+        }
+        if (m_isDraggingTrackKey && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        {
+            const int delta = m_trackDragTargetFrame - m_trackDragHandleFrame;
+            if (delta != 0 && m_selectedTrackIndex >= 0 && m_selectedTrackIndex < trackCount &&
+                !m_selectedTrackKeys.empty())
+            {
+                PropertyTrack& track = clipData.PropertyTracks[m_selectedTrackIndex];
+                bool collision = false;
+                for (int frame : m_selectedTrackKeys)
+                {
+                    const int dest = frame + delta;
+                    if (dest < 0)
+                    {
+                        collision = true;
+                        break;
+                    }
+                    // 目标位置已有未选中的关键帧则视为碰撞（整体平移不会产生选中间碰撞）
+                    for (const auto& key : track.keyframes)
+                    {
+                        if (key.frame == dest && !m_selectedTrackKeys.count(key.frame))
+                        {
+                            collision = true;
+                            break;
+                        }
+                    }
+                    if (collision)
+                        break;
+                }
+                if (!collision)
+                {
+                    // 先按下标收集再改帧号，避免移动过程中的帧号误匹配
+                    std::vector<size_t> movedIndices;
+                    for (size_t k = 0; k < track.keyframes.size(); ++k)
+                    {
+                        if (m_selectedTrackKeys.count(track.keyframes[k].frame))
+                        {
+                            movedIndices.push_back(k);
+                        }
+                    }
+                    pushUndoSnapshot();
+                    std::set<int> newSelection;
+                    for (size_t idx : movedIndices)
+                    {
+                        track.keyframes[idx].frame += delta;
+                        newSelection.insert(track.keyframes[idx].frame);
+                    }
+                    AnimationTrackSampler::SortKeys(track);
+                    m_selectedTrackKeys = std::move(newSelection);
+                    for (int frame : m_selectedTrackKeys)
+                    {
+                        m_totalFrames = std::max(m_totalFrames, frame + 1);
+                    }
+                    markDirty();
+                }
+                else
+                {
+                    LogWarn("移动轨道关键帧失败：目标位置冲突或越界");
+                }
+            }
+            m_isDraggingTrackKey = false;
+        }
+    }
+    else
+    {
+        // —— 曲线视图：绘制选中轨道的值-时间曲线 ——
+        if (m_selectedTrackIndex < 0 || m_selectedTrackIndex >= trackCount)
+        {
+            m_selectedTrackIndex = 0;
+            m_selectedTrackKeys.clear();
+        }
+        PropertyTrack& track = clipData.PropertyTracks[m_selectedTrackIndex];
+        float minValue;
+        float maxValue;
+        if (m_isDraggingCurveKey)
+        {
+            minValue = m_curveDragRangeMin;
+            maxValue = m_curveDragRangeMax;
+        }
+        else
+        {
+            minValue = std::numeric_limits<float>::max();
+            maxValue = std::numeric_limits<float>::lowest();
+            for (const auto& key : track.keyframes)
+            {
+                minValue = std::min(minValue, key.value);
+                maxValue = std::max(maxValue, key.value);
+            }
+            if (track.keyframes.empty())
+            {
+                minValue = 0.0f;
+                maxValue = 1.0f;
+            }
+            if (maxValue - minValue < 1e-4f)
+            {
+                minValue -= 1.0f;
+                maxValue += 1.0f;
+            }
+            const float padding = (maxValue - minValue) * 0.15f;
+            minValue -= padding;
+            maxValue += padding;
+        }
+        auto valueToY = [&](float value)
+        {
+            return areaPos.y + (1.0f - (value - minValue) / (maxValue - minValue)) * areaSize.y;
+        };
+        for (int gi = 0; gi <= 4; ++gi)
+        {
+            const float value = minValue + (maxValue - minValue) * static_cast<float>(gi) / 4.0f;
+            const float y = valueToY(value);
+            drawList->AddLine(ImVec2(laneX, y), ImVec2(areaRight, y), IM_COL32(62, 62, 62, 255));
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.2f", value);
+            drawList->AddText(ImVec2(laneX + 4.0f, std::min(y, areaPos.y + areaSize.y - 16.0f)),
+                              IM_COL32(150, 150, 150, 255), buf);
+        }
+        if (!track.keyframes.empty() && laneWidth > 1.0f && pixelsPerFrame > 0.0f)
+        {
+            const float step = 3.0f;
+            float prevX = laneX;
+            float prevY = valueToY(AnimationTrackSampler::Evaluate(track, m_timelineScrollX / pixelsPerFrame));
+            for (float px = step; px <= laneWidth; px += step)
+            {
+                const float frameTime = (px + m_timelineScrollX) / pixelsPerFrame;
+                const float x = laneX + px;
+                const float y = valueToY(AnimationTrackSampler::Evaluate(track, frameTime));
+                drawList->AddLine(ImVec2(prevX, prevY), ImVec2(x, y), IM_COL32(130, 220, 130, 255), 1.5f);
+                prevX = x;
+                prevY = y;
+            }
+        }
+        for (const auto& key : track.keyframes)
+        {
+            const float x = frameToX(static_cast<float>(key.frame));
+            if (x < laneX - 6.0f || x > areaRight + 6.0f)
+                continue;
+            const float y = valueToY(key.value);
+            const bool selected = m_selectedTrackKeys.count(key.frame) != 0;
+            drawList->AddCircleFilled(ImVec2(x, y), 5.0f,
+                                      selected ? IM_COL32(255, 220, 60, 255) : IM_COL32(160, 230, 160, 255));
+            if (selected || (m_isDraggingCurveKey && key.frame == m_curveDragKeyFrame))
+            {
+                char buf[48];
+                snprintf(buf, sizeof(buf), "%d: %.3f", key.frame, key.value);
+                drawList->AddText(ImVec2(x + 8.0f, y - 16.0f), IM_COL32(255, 255, 180, 255), buf);
+            }
+            if (mouseInLane && std::abs(mousePos.x - x) <= 7.0f && std::abs(mousePos.y - y) <= 7.0f)
+            {
+                hitTrack = m_selectedTrackIndex;
+                hitKeyFrame = key.frame;
+            }
+        }
+        // —— Bezier 切线柄：选中的 CubicBezier 关键帧两侧显示可拖动手柄 ——
+        const float pixelScaleY = areaSize.y / (maxValue - minValue);
+        int hitTangentKeyFrame = -1;
+        bool hitTangentIsOut = false;
+        for (const auto& key : track.keyframes)
+        {
+            if (key.interp != AnimInterpMode::CubicBezier || !m_selectedTrackKeys.count(key.frame))
+                continue;
+            const float x = frameToX(static_cast<float>(key.frame));
+            const float y = valueToY(key.value);
+            if (x < laneX - 60.0f || x > areaRight + 60.0f)
+                continue;
+            // 斜率（值/帧）换算为像素空间方向，归一化到固定柄长，保证任意缩放下手柄可点
+            auto handleEnd = [&](float tangent, bool outSide)
+            {
+                float dirX = pixelsPerFrame;
+                float dirY = -tangent * pixelScaleY;
+                const float length = std::sqrt(dirX * dirX + dirY * dirY);
+                if (length > 1e-5f)
+                {
+                    dirX /= length;
+                    dirY /= length;
+                }
+                const float sign = outSide ? 1.0f : -1.0f;
+                constexpr float kHandleLength = 42.0f;
+                return ImVec2(x + dirX * kHandleLength * sign, y + dirY * kHandleLength * sign);
+            };
+            const ImVec2 inEnd = handleEnd(key.inTangent, false);
+            const ImVec2 outEnd = handleEnd(key.outTangent, true);
+            drawList->AddLine(ImVec2(x, y), inEnd, IM_COL32(200, 160, 255, 200));
+            drawList->AddLine(ImVec2(x, y), outEnd, IM_COL32(200, 160, 255, 200));
+            drawList->AddCircleFilled(inEnd, 4.0f, IM_COL32(200, 160, 255, 255));
+            drawList->AddCircleFilled(outEnd, 4.0f, IM_COL32(200, 160, 255, 255));
+            if (mouseInLane)
+            {
+                if (std::abs(mousePos.x - inEnd.x) <= 6.0f && std::abs(mousePos.y - inEnd.y) <= 6.0f)
+                {
+                    hitTangentKeyFrame = key.frame;
+                    hitTangentIsOut = false;
+                }
+                else if (std::abs(mousePos.x - outEnd.x) <= 6.0f && std::abs(mousePos.y - outEnd.y) <= 6.0f)
+                {
+                    hitTangentKeyFrame = key.frame;
+                    hitTangentIsOut = true;
+                }
+            }
+        }
+        if (mouseInLane && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hitTangentKeyFrame != -1)
+        {
+            m_isDraggingTangent = true;
+            m_tangentDragKeyFrame = hitTangentKeyFrame;
+            m_tangentDragIsOut = hitTangentIsOut;
+            for (const auto& key : track.keyframes)
+            {
+                if (key.frame == hitTangentKeyFrame)
+                {
+                    m_tangentDragStartValue = hitTangentIsOut ? key.outTangent : key.inTangent;
+                    break;
+                }
+            }
+            m_trackDragPreState = cloneClipData(clipData);
+            m_hasTrackDragPreState = true;
+        }
+        if (m_isDraggingTangent && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+        {
+            for (auto& key : track.keyframes)
+            {
+                if (key.frame != m_tangentDragKeyFrame)
+                    continue;
+                const float keyX = frameToX(static_cast<float>(key.frame));
+                const float keyY = valueToY(key.value);
+                // 鼠标相对关键帧的位移换算回 值/帧 斜率；水平分量钳制在手柄一侧，避免斜率爆炸
+                float dxFrames = (pixelsPerFrame > 0.0f) ? (mousePos.x - keyX) / pixelsPerFrame : 0.0f;
+                const float dyValue = (keyY - mousePos.y) / pixelScaleY;
+                constexpr float kMinDxFrames = 0.05f;
+                if (m_tangentDragIsOut)
+                {
+                    dxFrames = std::max(dxFrames, kMinDxFrames);
+                }
+                else
+                {
+                    dxFrames = std::min(dxFrames, -kMinDxFrames);
+                }
+                const float slope = std::clamp(dyValue / dxFrames, -1000.0f, 1000.0f);
+                if (m_tangentDragIsOut)
+                {
+                    key.outTangent = slope;
+                }
+                else
+                {
+                    key.inTangent = slope;
+                }
+                break;
+            }
+        }
+        if (m_isDraggingTangent && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        {
+            m_isDraggingTangent = false;
+            bool tangentChanged = false;
+            for (const auto& key : track.keyframes)
+            {
+                if (key.frame == m_tangentDragKeyFrame)
+                {
+                    const float current = m_tangentDragIsOut ? key.outTangent : key.inTangent;
+                    tangentChanged = std::abs(current - m_tangentDragStartValue) > 1e-6f;
+                    break;
+                }
+            }
+            if (m_hasTrackDragPreState && tangentChanged)
+            {
+                pushUndoSnapshotFrom(std::move(m_trackDragPreState));
+                markDirty();
+            }
+            m_hasTrackDragPreState = false;
+        }
+        if (mouseInLane && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && hitKeyFrame != -1 &&
+            hitTangentKeyFrame == -1)
+        {
+            if (!ImGui::GetIO().KeyCtrl && !m_selectedTrackKeys.count(hitKeyFrame))
+            {
+                m_selectedTrackKeys.clear();
+            }
+            m_selectedTrackKeys.insert(hitKeyFrame);
+            m_isDraggingCurveKey = true;
+            m_curveDragKeyFrame = hitKeyFrame;
+            m_curveDragStartMouseY = mousePos.y;
+            m_curveDragRangeMin = minValue;
+            m_curveDragRangeMax = maxValue;
+            for (const auto& key : track.keyframes)
+            {
+                if (key.frame == hitKeyFrame)
+                {
+                    m_curveDragStartValue = key.value;
+                    break;
+                }
+            }
+            // 连续拖值只在松开时压一次撤销：先克隆拖拽前状态
+            m_trackDragPreState = cloneClipData(clipData);
+            m_hasTrackDragPreState = true;
+        }
+        if (m_isDraggingCurveKey && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+        {
+            // 垂直位移换算为值增量（向上为正），值域用拖拽起始时冻结的区间
+            const float deltaValue = (m_curveDragStartMouseY - mousePos.y) / areaSize.y * (maxValue - minValue);
+            for (auto& key : track.keyframes)
+            {
+                if (key.frame == m_curveDragKeyFrame)
+                {
+                    key.value = m_curveDragStartValue + deltaValue;
+                    break;
+                }
+            }
+        }
+        if (m_isDraggingCurveKey && ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        {
+            m_isDraggingCurveKey = false;
+            bool valueChanged = false;
+            for (const auto& key : track.keyframes)
+            {
+                if (key.frame == m_curveDragKeyFrame)
+                {
+                    valueChanged = std::abs(key.value - m_curveDragStartValue) > 1e-6f;
+                    break;
+                }
+            }
+            if (m_hasTrackDragPreState && valueChanged)
+            {
+                pushUndoSnapshotFrom(std::move(m_trackDragPreState));
+                markDirty();
+            }
+            m_hasTrackDragPreState = false;
+        }
+        // 空白处双击或 Ctrl+点击均可加 key，取该时刻曲线值以保形
+        if (mouseInLane && hitKeyFrame == -1 && hitTangentKeyFrame == -1 &&
+            (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) ||
+             (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetIO().KeyCtrl)))
+        {
+            insertTrackKeyAt(m_selectedTrackIndex, hoveredTrackFrame);
+        }
+    }
+    // 右键菜单：命中关键帧弹关键帧菜单，否则弹轨道菜单
+    if (areaHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+    {
+        if (hitKeyFrame != -1)
+        {
+            if (m_selectedTrackIndex != hitTrack)
+            {
+                m_selectedTrackKeys.clear();
+            }
+            m_selectedTrackIndex = hitTrack;
+            if (!m_selectedTrackKeys.count(hitKeyFrame))
+            {
+                m_selectedTrackKeys.clear();
+                m_selectedTrackKeys.insert(hitKeyFrame);
+            }
+            m_trackContextMenuTrack = hitTrack;
+        }
+        else if (m_curveEditMode)
+        {
+            m_trackContextMenuTrack = m_selectedTrackIndex;
+        }
+        else
+        {
+            m_trackContextMenuTrack = (hoveredRow >= 0 && hoveredRow < trackCount) ? hoveredRow : -1;
+        }
+        m_trackContextMenuKey = hitKeyFrame;
+        m_trackContextMenuFrame = hoveredTrackFrame;
+        if (m_trackContextMenuTrack != -1)
+        {
+            ImGui::OpenPopup("PropertyTrackContextMenu");
+        }
+    }
+    drawTrackContextMenu();
+    // 播放头竖线延伸到轨道区
+    const float playheadX = frameToX(static_cast<float>(m_currentFrame));
+    if (playheadX >= laneX && playheadX <= areaRight)
+    {
+        drawList->AddLine(ImVec2(playheadX, areaPos.y), ImVec2(playheadX, areaPos.y + areaSize.y),
+                          IM_COL32(255, 255, 255, 170), 2.0f);
+    }
+    if (m_recordMode)
+    {
+        // 录制状态给轨道区叠加红色描边提示
+        drawList->AddRect(areaPos, ImVec2(areaRight, areaPos.y + areaSize.y), IM_COL32(220, 40, 40, 255),
+                          0.0f, 0, 2.0f);
+    }
+}
+void AnimationEditorPanel::drawTrackContextMenu()
+{
+    if (!ImGui::BeginPopup("PropertyTrackContextMenu"))
+        return;
+    if (!m_currentClip)
+    {
+        ImGui::EndPopup();
+        return;
+    }
+    auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    if (m_trackContextMenuTrack < 0 || m_trackContextMenuTrack >= static_cast<int>(tracks.size()))
+    {
+        ImGui::EndPopup();
+        return;
+    }
+    if (m_trackContextMenuKey != -1)
+    {
+        ImGui::TextDisabled("插值预设");
+        if (ImGui::MenuItem("自动平滑"))
+        {
+            applyTangentPresetToSelectedKeys(0);
+        }
+        if (ImGui::MenuItem("线性"))
+        {
+            applyTangentPresetToSelectedKeys(1);
+        }
+        if (ImGui::MenuItem("阶梯"))
+        {
+            applyTangentPresetToSelectedKeys(2);
+        }
+        if (ImGui::MenuItem("缓入 (EaseIn)"))
+        {
+            applyTangentPresetToSelectedKeys(3);
+        }
+        if (ImGui::MenuItem("缓出 (EaseOut)"))
+        {
+            applyTangentPresetToSelectedKeys(4);
+        }
+        if (ImGui::MenuItem("缓入缓出 (EaseInOut)"))
+        {
+            applyTangentPresetToSelectedKeys(5);
+        }
+        ImGui::Separator();
+        const std::string deleteLabel = m_selectedTrackKeys.size() > 1
+                                            ? std::format("删除选中的 {} 个关键帧", m_selectedTrackKeys.size())
+                                            : "删除关键帧";
+        if (ImGui::MenuItem(deleteLabel.c_str()))
+        {
+            removeSelectedTrackKeys();
+        }
+    }
+    else
+    {
+        if (ImGui::MenuItem("在此添加关键帧"))
+        {
+            insertTrackKeyAt(m_trackContextMenuTrack, m_trackContextMenuFrame);
+        }
+    }
+    ImGui::Separator();
+    if (ImGui::MenuItem("删除轨道"))
+    {
+        removePropertyTrack(m_trackContextMenuTrack);
+    }
+    ImGui::EndPopup();
+}
+void AnimationEditorPanel::openAddTrackPopup()
+{
+    if (!m_currentClip)
+        return;
+    if (!hasValidTargetObject())
+    {
+        LogWarn("请先设置有效的目标物体，再添加属性轨道");
+        return;
+    }
+    m_addTrackCandidates.clear();
+    auto scene = SceneManager::GetInstance().GetCurrentScene();
+    auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
+    auto& registry = ComponentRegistry::GetInstance();
+    auto& sceneRegistry = scene->GetRegistry();
+    const auto entityHandle = targetObject.GetEntityHandle();
+    for (const auto& componentName : registry.GetAllRegisteredNames())
+    {
+        const auto* componentInfo = registry.Get(componentName);
+        if (!componentInfo || !componentInfo->isExposedInEditor ||
+            !componentInfo->has(sceneRegistry, entityHandle))
+        {
+            continue;
+        }
+        for (const auto& prop : componentInfo->properties)
+        {
+            if (!prop.isExposedInEditor || !prop.get || !prop.set)
+            {
+                continue;
+            }
+            // 按属性实际类型拆分可动画的 float 标量通道（Unity 同款：多分量拆多轨）
+            const std::any value = prop.get(sceneRegistry, entityHandle);
+            if (std::any_cast<float>(&value) || std::any_cast<int>(&value))
+            {
+                m_addTrackCandidates.emplace_back(componentName, prop.name);
+            }
+            else if (std::any_cast<ECS::Vector2f>(&value))
+            {
+                m_addTrackCandidates.emplace_back(componentName, prop.name + ".x");
+                m_addTrackCandidates.emplace_back(componentName, prop.name + ".y");
+            }
+            else if (std::any_cast<ECS::Color>(&value))
+            {
+                m_addTrackCandidates.emplace_back(componentName, prop.name + ".r");
+                m_addTrackCandidates.emplace_back(componentName, prop.name + ".g");
+                m_addTrackCandidates.emplace_back(componentName, prop.name + ".b");
+                m_addTrackCandidates.emplace_back(componentName, prop.name + ".a");
+            }
+            else if (std::any_cast<bool>(&value))
+            {
+                m_addTrackCandidates.emplace_back(componentName, prop.name);
+            }
+        }
+    }
+    std::stable_sort(m_addTrackCandidates.begin(), m_addTrackCandidates.end(),
+                     [](const auto& a, const auto& b)
+                     {
+                         const bool aIsTransform = a.first == "TransformComponent";
+                         const bool bIsTransform = b.first == "TransformComponent";
+                         if (aIsTransform != bIsTransform)
+                         {
+                             return aIsTransform;
+                         }
+                         return a.first < b.first;
+                     });
+    m_addTrackPopupOpen = true;
+}
+void AnimationEditorPanel::drawAddTrackPopup()
+{
+    if (!ImGui::Begin("添加属性轨道", &m_addTrackPopupOpen, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::End();
+        return;
+    }
+    if (!m_currentClip)
+    {
+        m_addTrackPopupOpen = false;
+        ImGui::End();
+        return;
+    }
+    ImGui::Text("选择要动画化的属性:");
+    ImGui::Separator();
+    if (m_addTrackCandidates.empty())
+    {
+        ImGui::TextDisabled("目标物体没有可动画的数值属性");
+    }
+    const auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    std::string lastComponent;
+    for (size_t i = 0; i < m_addTrackCandidates.size(); ++i)
+    {
+        const auto& [componentName, propertyPath] = m_addTrackCandidates[i];
+        if (componentName != lastComponent)
+        {
+            if (!lastComponent.empty())
+            {
+                ImGui::Separator();
+            }
+            ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "%s", componentName.c_str());
+            lastComponent = componentName;
+        }
+        bool alreadyExists = false;
+        for (const auto& track : tracks)
+        {
+            if (track.targetComponent == componentName && track.propertyPath == propertyPath)
+            {
+                alreadyExists = true;
+                break;
+            }
+        }
+        ImGui::PushID(static_cast<int>(i));
+        if (alreadyExists)
+        {
+            ImGui::TextDisabled("  %s (已添加)", propertyPath.c_str());
+        }
+        else if (ImGui::Selectable(("  " + propertyPath).c_str()))
+        {
+            createPropertyTrack(componentName, propertyPath);
+        }
+        ImGui::PopID();
+    }
+    ImGui::Separator();
+    if (ImGui::Button("关闭"))
+    {
+        m_addTrackPopupOpen = false;
+    }
+    ImGui::End();
+}
+void AnimationEditorPanel::createPropertyTrack(const std::string& componentName, const std::string& propertyPath)
+{
+    if (!m_currentClip)
+        return;
+    auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    for (int i = 0; i < static_cast<int>(tracks.size()); ++i)
+    {
+        if (tracks[i].targetComponent == componentName && tracks[i].propertyPath == propertyPath)
+        {
+            m_selectedTrackIndex = i;
+            return;
+        }
+    }
+    pushUndoSnapshot();
+    PropertyTrack track;
+    track.targetComponent = componentName;
+    track.propertyPath = propertyPath;
+    // 在播放头帧记录一个初始关键帧，取对象当前值
+    PropertyKey key;
+    key.frame = m_currentFrame;
+    if (hasValidTargetObject())
+    {
+        auto scene = SceneManager::GetInstance().GetCurrentScene();
+        auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
+        float currentValue = 0.0f;
+        if (AnimationTrackSampler::GetValue(scene->GetRegistry(), targetObject.GetEntityHandle(),
+                                            componentName, propertyPath, currentValue))
+        {
+            key.value = currentValue;
+        }
+        if (AnimationTrackSampler::IsBoolProperty(scene->GetRegistry(), targetObject.GetEntityHandle(),
+                                                  componentName, propertyPath))
+        {
+            // bool 属性不可插值，默认阶梯
+            key.interp = AnimInterpMode::Step;
+        }
+    }
+    track.keyframes.push_back(key);
+    tracks.push_back(std::move(track));
+    m_selectedTrackIndex = static_cast<int>(tracks.size()) - 1;
+    m_selectedTrackKeys.clear();
+    m_selectedTrackKeys.insert(key.frame);
+    if (m_recordMode)
+    {
+        refreshRecordCache();
+    }
+    markDirty();
+    LogInfo("添加属性轨道: {}.{}", componentName, propertyPath);
+}
+void AnimationEditorPanel::removePropertyTrack(int trackIndex)
+{
+    if (!m_currentClip)
+        return;
+    auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    if (trackIndex < 0 || trackIndex >= static_cast<int>(tracks.size()))
+        return;
+    pushUndoSnapshot();
+    LogInfo("删除属性轨道: {}.{}", tracks[trackIndex].targetComponent, tracks[trackIndex].propertyPath);
+    tracks.erase(tracks.begin() + trackIndex);
+    if (m_selectedTrackIndex == trackIndex)
+    {
+        m_selectedTrackIndex = -1;
+        m_selectedTrackKeys.clear();
+    }
+    else if (m_selectedTrackIndex > trackIndex)
+    {
+        --m_selectedTrackIndex;
+    }
+    markDirty();
+}
+void AnimationEditorPanel::removeSelectedTrackKeys()
+{
+    if (!m_currentClip || m_selectedTrackKeys.empty())
+        return;
+    auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    if (m_selectedTrackIndex < 0 || m_selectedTrackIndex >= static_cast<int>(tracks.size()))
+    {
+        // 选中轨道已失效时清空残留选中，避免 Delete 快捷键被持续拦截
+        m_selectedTrackKeys.clear();
+        return;
+    }
+    pushUndoSnapshot();
+    auto& keys = tracks[m_selectedTrackIndex].keyframes;
+    std::erase_if(keys, [this](const PropertyKey& key) { return m_selectedTrackKeys.count(key.frame) != 0; });
+    LogInfo("删除 {} 个轨道关键帧", m_selectedTrackKeys.size());
+    m_selectedTrackKeys.clear();
+    markDirty();
+}
+void AnimationEditorPanel::insertTrackKeyAt(int trackIndex, int frame)
+{
+    if (!m_currentClip)
+        return;
+    auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    if (trackIndex < 0 || trackIndex >= static_cast<int>(tracks.size()))
+        return;
+    frame = std::max(0, frame);
+    PropertyTrack& track = tracks[trackIndex];
+    for (const auto& key : track.keyframes)
+    {
+        if (key.frame == frame)
+        {
+            // 同帧已有关键帧则只切换选中
+            m_selectedTrackIndex = trackIndex;
+            m_selectedTrackKeys.clear();
+            m_selectedTrackKeys.insert(frame);
+            return;
+        }
+    }
+    pushUndoSnapshot();
+    PropertyKey key;
+    key.frame = frame;
+    if (!track.keyframes.empty())
+    {
+        // 取该时刻的曲线值，插入后不改变现有曲线形状；插值模式继承前一关键帧
+        key.value = AnimationTrackSampler::Evaluate(track, static_cast<float>(frame));
+        const PropertyKey* prevKey = nullptr;
+        for (const auto& existing : track.keyframes)
+        {
+            if (existing.frame <= frame && (!prevKey || existing.frame > prevKey->frame))
+            {
+                prevKey = &existing;
+            }
+        }
+        key.interp = prevKey ? prevKey->interp : track.keyframes.front().interp;
+    }
+    else if (hasValidTargetObject())
+    {
+        auto scene = SceneManager::GetInstance().GetCurrentScene();
+        auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
+        float currentValue = 0.0f;
+        if (AnimationTrackSampler::GetValue(scene->GetRegistry(), targetObject.GetEntityHandle(),
+                                            track.targetComponent, track.propertyPath, currentValue))
+        {
+            key.value = currentValue;
+        }
+        if (AnimationTrackSampler::IsBoolProperty(scene->GetRegistry(), targetObject.GetEntityHandle(),
+                                                  track.targetComponent, track.propertyPath))
+        {
+            key.interp = AnimInterpMode::Step;
+        }
+    }
+    track.keyframes.push_back(key);
+    AnimationTrackSampler::SortKeys(track);
+    m_selectedTrackIndex = trackIndex;
+    m_selectedTrackKeys.clear();
+    m_selectedTrackKeys.insert(frame);
+    m_totalFrames = std::max(m_totalFrames, frame + 1);
+    markDirty();
+}
+void AnimationEditorPanel::applyTangentPreset(PropertyTrack& track, size_t keyIndex, int preset)
+{
+    if (keyIndex >= track.keyframes.size())
+        return;
+    auto& keys = track.keyframes;
+    PropertyKey& key = keys[keyIndex];
+    if (preset == 1)
+    {
+        key.interp = AnimInterpMode::Linear;
+        return;
+    }
+    if (preset == 2)
+    {
+        key.interp = AnimInterpMode::Step;
+        return;
+    }
+    auto slopeBetween = [](const PropertyKey& a, const PropertyKey& b)
+    {
+        const float frameSpan = static_cast<float>(b.frame - a.frame);
+        return (frameSpan != 0.0f) ? (b.value - a.value) / frameSpan : 0.0f;
+    };
+    if (preset >= 3 && preset <= 5)
+    {
+        // 缓动预设作用于本关键帧到下一关键帧的区间，通过 Hermite 切线精确表达：
+        // EaseIn: m0=0, m1=2Δ → v0+Δt²；EaseOut: m0=2Δ, m1=0 → v0+Δ(1-(1-t)²)；
+        // EaseInOut: m0=m1=0 → 平滑步 v0+Δt²(3-2t)
+        key.interp = AnimInterpMode::CubicBezier;
+        if (keyIndex + 1 >= keys.size())
+        {
+            // 最后一个关键帧没有出段，只标记模式
+            key.outTangent = 0.0f;
+            return;
+        }
+        PropertyKey& next = keys[keyIndex + 1];
+        const float chord = slopeBetween(key, next);
+        if (preset == 3)
+        {
+            key.outTangent = 0.0f;
+            next.inTangent = 2.0f * chord;
+        }
+        else if (preset == 4)
+        {
+            key.outTangent = 2.0f * chord;
+            next.inTangent = 0.0f;
+        }
+        else
+        {
+            key.outTangent = 0.0f;
+            next.inTangent = 0.0f;
+        }
+        return;
+    }
+    // 自动平滑：Catmull-Rom 风格取相邻关键帧连线斜率，端点用单侧斜率
+    key.interp = AnimInterpMode::CubicBezier;
+    float slope = 0.0f;
+    if (keys.size() >= 2)
+    {
+        if (keyIndex == 0)
+        {
+            slope = slopeBetween(keys[0], keys[1]);
+        }
+        else if (keyIndex == keys.size() - 1)
+        {
+            slope = slopeBetween(keys[keys.size() - 2], keys[keys.size() - 1]);
+        }
+        else
+        {
+            slope = slopeBetween(keys[keyIndex - 1], keys[keyIndex + 1]);
+        }
+    }
+    key.inTangent = slope;
+    key.outTangent = slope;
+}
+void AnimationEditorPanel::applyTangentPresetToSelectedKeys(int preset)
+{
+    if (!m_currentClip || m_selectedTrackKeys.empty())
+        return;
+    auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    if (m_selectedTrackIndex < 0 || m_selectedTrackIndex >= static_cast<int>(tracks.size()))
+        return;
+    pushUndoSnapshot();
+    PropertyTrack& track = tracks[m_selectedTrackIndex];
+    for (size_t k = 0; k < track.keyframes.size(); ++k)
+    {
+        if (m_selectedTrackKeys.count(track.keyframes[k].frame))
+        {
+            applyTangentPreset(track, k, preset);
+        }
+    }
+    markDirty();
+}
+std::vector<std::pair<std::string, std::string>> AnimationEditorPanel::collectRecordTargets() const
+{
+    std::vector<std::pair<std::string, std::string>> targets;
+    if (!m_currentClip)
+        return targets;
+    const auto& tracks = m_currentClip->getAnimationClip().PropertyTracks;
+    targets.reserve(tracks.size() + 5);
+    for (const auto& track : tracks)
+    {
+        targets.emplace_back(track.targetComponent, track.propertyPath);
+    }
+    // Transform 常用属性即使没有轨道也纳入监听，检测到变化时自动建轨（Unity 录制语义）
+    static constexpr const char* kTransformRecordPaths[] = {
+        "position.x", "position.y", "rotation", "scale.x", "scale.y"
+    };
+    for (const char* path : kTransformRecordPaths)
+    {
+        const bool exists = std::any_of(targets.begin(), targets.end(),
+                                        [path](const auto& entry)
+                                        {
+                                            return entry.first == "TransformComponent" && entry.second == path;
+                                        });
+        if (!exists)
+        {
+            targets.emplace_back("TransformComponent", path);
+        }
+    }
+    return targets;
+}
+void AnimationEditorPanel::updateRecording()
+{
+    if (!m_recordMode || !m_currentClip || !hasValidTargetObject())
+        return;
+    auto scene = SceneManager::GetInstance().GetCurrentScene();
+    if (!scene)
+        return;
+    auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
+    if (!targetObject.IsValid())
+        return;
+    auto& clipData = m_currentClip->getAnimationClip();
+    auto& sceneRegistry = scene->GetRegistry();
+    const auto entityHandle = targetObject.GetEntityHandle();
+    const auto monitored = collectRecordTargets();
+    struct PendingWrite
+    {
+        std::string component;
+        std::string propertyPath;
+        float value;
+    };
+    std::vector<PendingWrite> writes;
+    for (const auto& [componentName, propertyPath] : monitored)
+    {
+        float currentValue = 0.0f;
+        if (!AnimationTrackSampler::GetValue(sceneRegistry, entityHandle,
+                                             componentName, propertyPath, currentValue))
+        {
+            continue;
+        }
+        const std::string cacheKey = componentName + "/" + propertyPath;
+        auto it = m_recordValueCache.find(cacheKey);
+        if (it == m_recordValueCache.end())
+        {
+            // 首次见到的属性只记基线，不产生关键帧
+            m_recordValueCache[cacheKey] = currentValue;
+            continue;
+        }
+        if (std::abs(currentValue - it->second) <= 1e-5f)
+        {
+            continue;
+        }
+        writes.push_back({componentName, propertyPath, currentValue});
+        it->second = currentValue;
+    }
+    if (writes.empty())
+        return;
+    auto findTrack = [&clipData](const std::string& component, const std::string& path) -> PropertyTrack*
+    {
+        for (auto& track : clipData.PropertyTracks)
+        {
+            if (track.targetComponent == component && track.propertyPath == path)
+            {
+                return &track;
+            }
+        }
+        return nullptr;
+    };
+    // 仅在新建轨道/新建关键帧时压撤销栈：同帧连续改值（如拖 Inspector 滑条）聚合为一次撤销
+    bool needSnapshot = false;
+    for (const auto& write : writes)
+    {
+        const PropertyTrack* track = findTrack(write.component, write.propertyPath);
+        if (!track)
+        {
+            needSnapshot = true;
+            break;
+        }
+        const bool hasKeyAtPlayhead = std::any_of(track->keyframes.begin(), track->keyframes.end(),
+                                                  [this](const PropertyKey& key)
+                                                  {
+                                                      return key.frame == m_currentFrame;
+                                                  });
+        if (!hasKeyAtPlayhead)
+        {
+            needSnapshot = true;
+            break;
+        }
+    }
+    if (needSnapshot)
+    {
+        pushUndoSnapshot();
+    }
+    for (const auto& write : writes)
+    {
+        PropertyTrack* track = findTrack(write.component, write.propertyPath);
+        if (!track)
+        {
+            // 无轨道自动建轨：关键帧随后由统一写入逻辑落到播放头帧
+            PropertyTrack newTrack;
+            newTrack.targetComponent = write.component;
+            newTrack.propertyPath = write.propertyPath;
+            clipData.PropertyTracks.push_back(std::move(newTrack));
+            track = &clipData.PropertyTracks.back();
+            LogInfo("录制: 自动创建属性轨道 {}.{}", write.component, write.propertyPath);
+        }
+        bool updated = false;
+        for (auto& key : track->keyframes)
+        {
+            if (key.frame == m_currentFrame)
+            {
+                key.value = write.value;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated)
+        {
+            PropertyKey key;
+            key.frame = m_currentFrame;
+            key.value = write.value;
+            if (!track->keyframes.empty())
+            {
+                // 插值模式继承轨道内前一关键帧（bool 轨道的 Step 由此传递）
+                const PropertyKey* prevKey = nullptr;
+                for (const auto& existing : track->keyframes)
+                {
+                    if (existing.frame <= m_currentFrame && (!prevKey || existing.frame > prevKey->frame))
+                    {
+                        prevKey = &existing;
+                    }
+                }
+                key.interp = prevKey ? prevKey->interp : track->keyframes.front().interp;
+            }
+            track->keyframes.push_back(key);
+            AnimationTrackSampler::SortKeys(*track);
+        }
+    }
+    markDirty();
+}
+void AnimationEditorPanel::refreshRecordCache()
+{
+    m_recordValueCache.clear();
+    if (!m_currentClip || !hasValidTargetObject())
+        return;
+    auto scene = SceneManager::GetInstance().GetCurrentScene();
+    auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
+    if (!targetObject.IsValid())
+        return;
+    auto& sceneRegistry = scene->GetRegistry();
+    const auto entityHandle = targetObject.GetEntityHandle();
+    // 基线覆盖全部监听目标（含暂无轨道的 Transform 常用属性），预览写入后立即刷新可避免误判
+    for (const auto& [componentName, propertyPath] : collectRecordTargets())
+    {
+        float value = 0.0f;
+        if (AnimationTrackSampler::GetValue(sceneRegistry, entityHandle, componentName, propertyPath, value))
+        {
+            m_recordValueCache[componentName + "/" + propertyPath] = value;
+        }
+    }
+}
+void AnimationEditorPanel::applyPropertyTracksToObject(float frameTime)
+{
+    if (!m_currentClip || !hasValidTargetObject())
+        return;
+    const AnimationClip& clipData = m_currentClip->getAnimationClip();
+    if (clipData.PropertyTracks.empty())
+        return;
+    auto scene = SceneManager::GetInstance().GetCurrentScene();
+    if (!scene)
+        return;
+    auto targetObject = scene->FindGameObjectByGuid(m_targetObjectGuid);
+    if (!targetObject.IsValid())
+        return;
+    // 轨道写入同样属于预览污染，先备份以便停止/关闭时还原
+    backupPreviewTargetState();
+    AnimationTrackSampler::ApplyTracks(clipData, scene->GetRegistry(), targetObject.GetEntityHandle(), frameTime);
+    if (m_recordMode)
+    {
+        refreshRecordCache();
+    }
+}
+void AnimationEditorPanel::resetPropertyTrackEditState()
+{
+    m_recordMode = false;
+    m_selectedTrackIndex = -1;
+    m_selectedTrackKeys.clear();
+    m_isDraggingTrackKey = false;
+    m_trackDragHandleFrame = -1;
+    m_trackDragTargetFrame = -1;
+    m_isDraggingCurveKey = false;
+    m_curveDragKeyFrame = -1;
+    m_isDraggingTangent = false;
+    m_tangentDragKeyFrame = -1;
+    m_hasTrackDragPreState = false;
+    m_addTrackPopupOpen = false;
+    m_addTrackCandidates.clear();
+    m_recordValueCache.clear();
 }
 void AnimationEditorPanel::drawTimelineContextMenu()
 {
@@ -1079,6 +2370,11 @@ void AnimationEditorPanel::applyFrameToObject(int frameIndex)
             }
         }
     }
+    if (m_recordMode)
+    {
+        // 快照写入属于预览行为，刷新录制基线
+        refreshRecordCache();
+    }
 }
 void AnimationEditorPanel::backupPreviewTargetState()
 {
@@ -1098,6 +2394,11 @@ void AnimationEditorPanel::backupPreviewTargetState()
         {
             affectedComponents.insert(componentName);
         }
+    }
+    // 属性轨道写入的组件同样纳入备份，停止预览时一并还原
+    for (const auto& track : m_currentClip->getAnimationClip().PropertyTracks)
+    {
+        affectedComponents.insert(track.targetComponent);
     }
     if (affectedComponents.empty())
         return;
@@ -1154,6 +2455,11 @@ void AnimationEditorPanel::restorePreviewTargetState()
     }
     m_previewComponentBackup.clear();
     m_previewBackupObjectGuid = Guid();
+    if (m_recordMode)
+    {
+        // 还原写回了旧值，刷新录制基线避免被误判为用户修改
+        refreshRecordCache();
+    }
 }
 void AnimationEditorPanel::stopPreviewPlayback()
 {
@@ -1647,7 +2953,15 @@ void AnimationEditorPanel::handleShortcutInput()
     }
     if (ImGui::IsKeyPressed(ImGuiKey_Delete, false))
     {
-        removeSelectedKeyFrames();
+        // 轨道关键帧选中时 Delete 优先作用于轨道
+        if (!m_selectedTrackKeys.empty())
+        {
+            removeSelectedTrackKeys();
+        }
+        else
+        {
+            removeSelectedKeyFrames();
+        }
     }
 }
 void AnimationEditorPanel::drawEventEditor()
@@ -1852,6 +3166,13 @@ void AnimationEditorPanel::Draw()
     }
     // 脏标记显示在标题，###后缀保持窗口 ID 稳定（不破坏停靠布局）
     std::string windowTitle = std::string(GetPanelName()) + (m_isDirty ? " *" : "") + "###动画编辑器";
+    // 录制状态用红色窗口描边提示（Unity 录制红框语义）
+    const bool recordingBorder = m_recordMode && m_currentClip != nullptr;
+    if (recordingBorder)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.85f, 0.15f, 0.15f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    }
     if (ImGui::Begin(windowTitle.c_str(), &m_isVisible, ImGuiWindowFlags_MenuBar))
     {
         m_isFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
@@ -1928,6 +3249,11 @@ void AnimationEditorPanel::Draw()
         }
     }
     ImGui::End();
+    if (recordingBorder)
+    {
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+    }
     if (!m_isVisible)
     {
         // 用户点了窗口 X：有未保存修改时先弹确认，否则直接还原预览并停止播放
@@ -1952,6 +3278,7 @@ void AnimationEditorPanel::Draw()
     if (m_frameEditWindowOpen) { drawFrameEditor(); }
     if (m_componentSelectorOpen) { drawComponentSelector(); }
     if (m_eventEditorOpen) { drawEventEditor(); }
+    if (m_addTrackPopupOpen) { drawAddTrackPopup(); }
 }
 void AnimationEditorPanel::drawPropertiesPanel()
 {
@@ -1988,6 +3315,7 @@ void AnimationEditorPanel::drawPropertiesPanel()
             if (ImGui::Button("应用到物体"))
             {
                 applyFrameToObject(selectedFrame);
+                applyPropertyTracksToObject(static_cast<float>(selectedFrame));
             }
             const AnimFrame& frame = it->second;
             ImGui::Text("记录的组件: %zu 个", frame.animationData.size());

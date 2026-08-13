@@ -872,13 +872,13 @@ namespace Systems
         std::unordered_set<Guid> requiredTileGuids;
         std::unordered_set<Guid> requiredRuleTileGuids;
 
-        for (const auto& [coord, handle] : tilemap.normalTiles)
+        for (const auto& [coord, inst] : tilemap.normalTiles)
         {
-            if (handle.Valid()) requiredTileGuids.insert(handle.assetGuid);
+            if (inst.handle.Valid()) requiredTileGuids.insert(inst.handle.assetGuid);
         }
-        for (const auto& [coord, handle] : tilemap.ruleTiles)
+        for (const auto& [coord, inst] : tilemap.ruleTiles)
         {
-            if (handle.Valid()) requiredRuleTileGuids.insert(handle.assetGuid);
+            if (inst.handle.Valid()) requiredRuleTileGuids.insert(inst.handle.assetGuid);
         }
 
         for (const auto& guid : requiredRuleTileGuids)
@@ -945,14 +945,17 @@ namespace Systems
         tilemap.runtimeTileCache.clear();
         std::unordered_set<ECS::Vector2i, ECS::Vector2iHash> requiredPrefabCoords;
 
-        for (const auto& [coord, handle] : tilemap.normalTiles)
+        for (const auto& [coord, inst] : tilemap.normalTiles)
         {
-            if (loadedTiles.count(handle.assetGuid))
+            if (loadedTiles.count(inst.handle.assetGuid))
             {
-                const auto& tileAsset = loadedTiles.at(handle.assetGuid);
+                const auto& tileAsset = loadedTiles.at(inst.handle.assetGuid);
                 if (tileAsset)
                 {
-                    tilemap.runtimeTileCache[coord] = {handle, tileAsset->GetData()};
+                    // 放置实例的朝向透传到解析结果，渲染提取端据此旋转/翻转
+                    tilemap.runtimeTileCache[coord] = {
+                        inst.handle, tileAsset->GetData(), inst.rotation, inst.flipX, inst.flipY
+                    };
                     if (std::holds_alternative<PrefabTileData>(tileAsset->GetData()))
                     {
                         requiredPrefabCoords.insert(coord);
@@ -961,9 +964,9 @@ namespace Systems
             }
         }
 
-        for (const auto& [coord, handle] : tilemap.ruleTiles)
+        for (const auto& [coord, inst] : tilemap.ruleTiles)
         {
-            sk_sp<RuntimeRuleTile> ruleTileAsset = ruleTileLoader.LoadAsset(handle.assetGuid);
+            sk_sp<RuntimeRuleTile> ruleTileAsset = ruleTileLoader.LoadAsset(inst.handle.assetGuid);
             if (!ruleTileAsset) continue;
 
             const auto& ruleTileData = ruleTileAsset->GetData();
@@ -981,7 +984,7 @@ namespace Systems
                     ECS::Vector2i neighborCoord = {coord.x + neighborsOffset[i].x, coord.y + neighborsOffset[i].y};
                     bool neighborIsSameType = false;
                     auto it = tilemap.ruleTiles.find(neighborCoord);
-                    if (it != tilemap.ruleTiles.end() && it->second.assetGuid == handle.assetGuid)
+                    if (it != tilemap.ruleTiles.end() && it->second.handle.assetGuid == inst.handle.assetGuid)
                     {
                         neighborIsSameType = true;
                     }
@@ -1010,7 +1013,10 @@ namespace Systems
                 const auto& resultTileAsset = loadedTiles.at(selectedTileHandle.assetGuid);
                 if (resultTileAsset)
                 {
-                    tilemap.runtimeTileCache[coord] = {selectedTileHandle, resultTileAsset->GetData()};
+                    // 规则瓦片的解析输出同样继承放置实例的朝向
+                    tilemap.runtimeTileCache[coord] = {
+                        selectedTileHandle, resultTileAsset->GetData(), inst.rotation, inst.flipX, inst.flipY
+                    };
                     if (std::holds_alternative<PrefabTileData>(resultTileAsset->GetData()))
                     {
                         requiredPrefabCoords.insert(coord);

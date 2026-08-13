@@ -5,6 +5,7 @@
 #include <imgui.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include "../Resources/RuntimeAsset/RuntimeScene.h"
 #include "AssetManager.h"
 #include "AnimationControllerComponent.h"
@@ -133,6 +134,10 @@ void AnimationControllerEditorPanel::Draw()
     {
         drawVariableDeleteConfirmWindow();
     }
+    if (m_blendTreeWindowOpen)
+    {
+        drawBlendTreeEditorWindow();
+    }
 }
 void AnimationControllerEditorPanel::Shutdown()
 {
@@ -185,6 +190,8 @@ void AnimationControllerEditorPanel::CloseCurrentController()
     m_pendingDeleteVarIndex = -1;
     m_pendingDeleteVarName.clear();
     m_editingVarIndex = -1;
+    m_blendTreeWindowOpen = false;
+    m_blendTreeNodeId = 0;
     m_nextNodeId = 1;
     m_nextLinkId = 1;
     m_nextPinId = 1;
@@ -259,6 +266,10 @@ void AnimationControllerEditorPanel::initializeFromControllerData()
         node.name = state.stateName;
         node.type = NodeType::State;
         node.speed = state.speed;
+        node.stateType = state.stateType;
+        node.blendTree = state.blendTree;
+        // 子项按阈值升序，防御手改文件产生的乱序数据
+        sortBlendTreeChildren(node.blendTree);
         if (state.hasEditorPosition)
         {
             node.position = ImVec2(state.editorPosX, state.editorPosY);
@@ -271,7 +282,9 @@ void AnimationControllerEditorPanel::initializeFromControllerData()
             state.editorPosY = node.position.y;
             state.hasEditorPosition = true;
         }
-        node.color = ImVec4(0.4f, 0.4f, 0.5f, 1.0f);
+        node.color = state.stateType == AnimationStateType::BlendTree
+                         ? ImVec4(0.2f, 0.55f, 0.6f, 1.0f)
+                         : ImVec4(0.4f, 0.4f, 0.5f, 1.0f);
         node.inputPinId = getNextPinId();
         node.outputPinId = getNextPinId();
         m_stateToNodeIndex[stateGuid] = static_cast<int>(m_nodes.size());
@@ -312,6 +325,8 @@ void AnimationControllerEditorPanel::saveToControllerData()
         AnimationState state;
         state.stateName = node.name;
         state.speed = node.speed;
+        state.stateType = node.stateType;
+        state.blendTree = node.blendTree;
         // node.position 每帧与画布同步，保存时统一读取写入数据
         state.editorPosX = node.position.x;
         state.editorPosY = node.position.y;
@@ -415,6 +430,13 @@ void AnimationControllerEditorPanel::drawNodeContextMenu()
         ANode* contextNode = findNodeById(m_contextNodeId);
         if (contextNode && contextNode->type == NodeType::State)
         {
+            if (contextNode->stateType == AnimationStateType::BlendTree)
+            {
+                if (ImGui::MenuItem("编辑混合树"))
+                {
+                    openBlendTreeEditorWindow(*contextNode);
+                }
+            }
             if (ImGui::MenuItem("重命名"))
             {
                 openStatePropertiesWindow(*contextNode);
@@ -647,6 +669,31 @@ void AnimationControllerEditorPanel::createStateNode(const std::string& name, Im
     m_forceLayoutUpdate = true;
     markDirty();
     LogInfo("创建新状态节点: {}", name);
+}
+void AnimationControllerEditorPanel::createBlendTreeNode(const std::string& name, ImVec2 position)
+{
+    ANode newNode;
+    newNode.id = getNextNodeId();
+    // 混合树状态无绑定剪辑，状态GUID独立生成
+    newNode.stateGuid = Guid::NewGuid();
+    newNode.name = name;
+    newNode.position = position;
+    newNode.stateType = AnimationStateType::BlendTree;
+    newNode.inputPinId = getNextPinId();
+    newNode.outputPinId = getNextPinId();
+    newNode.color = ImVec4(0.2f, 0.55f, 0.6f, 1.0f);
+    AnimationState newState;
+    newState.stateName = name;
+    newState.stateType = AnimationStateType::BlendTree;
+    newState.editorPosX = position.x;
+    newState.editorPosY = position.y;
+    newState.hasEditorPosition = true;
+    m_controllerData.States[newNode.stateGuid] = newState;
+    m_stateToNodeIndex[newNode.stateGuid] = static_cast<int>(m_nodes.size());
+    m_nodes.push_back(newNode);
+    m_forceLayoutUpdate = true;
+    markDirty();
+    LogInfo("创建混合树状态节点: {}", name);
 }
 void AnimationControllerEditorPanel::deleteNode(ed::NodeId nodeId)
 {
@@ -886,27 +933,34 @@ void AnimationControllerEditorPanel::drawVariablesPanel()
     }
     ImGui::EndChild();
 }
+bool AnimationControllerEditorPanel::tryGetRuntimePlaybackStatus(
+    RuntimeAnimationController::PlaybackStatus& outStatus)
+{
+    // 播放模式下查询选中实体的运行时播放状态，供节点高亮与混合树权重实况共用
+    if (!m_context || m_context->editorState != EditorState::Playing ||
+        m_context->selectionType != SelectionType::GameObject ||
+        m_context->selectionList.empty() || !m_context->activeScene)
+    {
+        return false;
+    }
+    RuntimeGameObject selectedGO = m_context->activeScene->FindGameObjectByGuid(m_context->selectionList[0]);
+    if (!selectedGO.IsValid() || !selectedGO.HasComponent<ECS::AnimationControllerComponent>())
+    {
+        return false;
+    }
+    auto& animComp = selectedGO.GetComponent<ECS::AnimationControllerComponent>();
+    if (!animComp.runtimeController ||
+        animComp.animationController.assetGuid != m_currentControllerGuid)
+    {
+        return false;
+    }
+    outStatus = animComp.runtimeController->GetPlaybackStatus();
+    return true;
+}
 void AnimationControllerEditorPanel::drawNodeEditor()
 {
-    // 播放模式下查询选中实体的运行时播放状态，用于当前/目标状态节点描边高亮
-    bool runtimeStatusValid = false;
     RuntimeAnimationController::PlaybackStatus runtimeStatus;
-    if (m_context && m_context->editorState == EditorState::Playing &&
-        m_context->selectionType == SelectionType::GameObject &&
-        !m_context->selectionList.empty() && m_context->activeScene)
-    {
-        RuntimeGameObject selectedGO = m_context->activeScene->FindGameObjectByGuid(m_context->selectionList[0]);
-        if (selectedGO.IsValid() && selectedGO.HasComponent<ECS::AnimationControllerComponent>())
-        {
-            auto& animComp = selectedGO.GetComponent<ECS::AnimationControllerComponent>();
-            if (animComp.runtimeController &&
-                animComp.animationController.assetGuid == m_currentControllerGuid)
-            {
-                runtimeStatus = animComp.runtimeController->GetPlaybackStatus();
-                runtimeStatusValid = true;
-            }
-        }
-    }
+    bool runtimeStatusValid = tryGetRuntimePlaybackStatus(runtimeStatus);
     ed::SetCurrentEditor(m_nodeEditorContext);
     ed::Begin("AnimationStateMachine");
     if (m_forceLayoutUpdate)
@@ -960,7 +1014,14 @@ void AnimationControllerEditorPanel::drawNodeEditor()
         if (node.type == NodeType::State && ImGui::IsItemHovered() &&
             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
         {
-            openStatePropertiesWindow(node);
+            if (node.stateType == AnimationStateType::BlendTree)
+            {
+                openBlendTreeEditorWindow(node);
+            }
+            else
+            {
+                openStatePropertiesWindow(node);
+            }
         }
         if (node.type == NodeType::State)
         {
@@ -980,6 +1041,11 @@ void AnimationControllerEditorPanel::drawNodeEditor()
         {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f), "[Default]");
+        }
+        if (node.stateType == AnimationStateType::BlendTree)
+        {
+            ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.9f, 1.0f), "[混合树 x%d]",
+                               static_cast<int>(node.blendTree.children.size()));
         }
         if (ImGui::BeginDragDropTarget())
         {
@@ -1077,7 +1143,14 @@ void AnimationControllerEditorPanel::drawNodeEditor()
     if (ANode* doubleClickedNode = findNodeById(doubleClickedNodeId);
         doubleClickedNode && doubleClickedNode->type == NodeType::State)
     {
-        openStatePropertiesWindow(*doubleClickedNode);
+        if (doubleClickedNode->stateType == AnimationStateType::BlendTree)
+        {
+            openBlendTreeEditorWindow(*doubleClickedNode);
+        }
+        else
+        {
+            openStatePropertiesWindow(*doubleClickedNode);
+        }
     }
     ed::Suspend();
     ed::NodeId contextNodeId = 0;
@@ -1104,6 +1177,11 @@ void AnimationControllerEditorPanel::drawNodeEditor()
         {
             ImVec2 mousePos = ImGui::GetMousePosOnOpeningCurrentPopup();
             createStateNode("新状态", ed::ScreenToCanvas(mousePos));
+        }
+        if (ImGui::MenuItem("创建混合树状态"))
+        {
+            ImVec2 mousePos = ImGui::GetMousePosOnOpeningCurrentPopup();
+            createBlendTreeNode("新混合树", ed::ScreenToCanvas(mousePos));
         }
         ImGui::EndPopup();
     }
@@ -1161,6 +1239,20 @@ void AnimationControllerEditorPanel::handleAnimationClipDrop(const AssetHandle& 
 }
 void AnimationControllerEditorPanel::handleAnimationClipDropOnNode(const AssetHandle& assetHandle, ANode& targetNode)
 {
+    // 拖剪辑到混合树节点 = 添加子项，不改变节点自身绑定
+    if (targetNode.stateType == AnimationStateType::BlendTree)
+    {
+        BlendTreeData::Child child;
+        child.clipGuid = assetHandle.assetGuid;
+        child.threshold = targetNode.blendTree.children.empty()
+                              ? 0.0f
+                              : targetNode.blendTree.children.back().threshold + 1.0f;
+        targetNode.blendTree.children.push_back(child);
+        sortBlendTreeChildren(targetNode.blendTree);
+        markDirty();
+        LogInfo("向混合树 {} 添加子项: {}", targetNode.name, getClipDisplayName(assetHandle.assetGuid));
+        return;
+    }
     const Guid& newGuid = assetHandle.assetGuid;
     const Guid& oldGuid = targetNode.stateGuid;
     if (newGuid == oldGuid)
@@ -1392,4 +1484,222 @@ void AnimationControllerEditorPanel::removeConditionsReferencing(const std::stri
             return matches;
         });
     }
+}
+
+void AnimationControllerEditorPanel::sortBlendTreeChildren(BlendTreeData& tree)
+{
+    std::stable_sort(tree.children.begin(), tree.children.end(),
+                     [](const BlendTreeData::Child& a, const BlendTreeData::Child& b)
+                     {
+                         return a.threshold < b.threshold;
+                     });
+}
+
+std::string AnimationControllerEditorPanel::getClipDisplayName(const Guid& clipGuid) const
+{
+    if (!clipGuid.Valid())
+    {
+        return "(未设置)";
+    }
+    if (const AssetMetadata* meta = AssetManager::GetInstance().GetMetadata(clipGuid))
+    {
+        return Path::GetFileNameWithoutExtension(meta->assetPath.string());
+    }
+    // 资产已被删除或移动，保留GUID前缀便于排查
+    return "(丢失: " + clipGuid.ToString().substr(0, 8) + ")";
+}
+
+// 与运行时 evaluateBlendTree 同一套一维混合规则，此处展开为逐子项权重供预览条使用
+static std::vector<float> computeBlendTreeWeights(const BlendTreeData& tree, float value)
+{
+    std::vector<float> weights(tree.children.size(), 0.0f);
+    if (weights.empty())
+    {
+        return weights;
+    }
+    const auto& children = tree.children;
+    if (children.size() == 1 || value <= children.front().threshold)
+    {
+        weights.front() = 1.0f;
+        return weights;
+    }
+    if (value >= children.back().threshold)
+    {
+        weights.back() = 1.0f;
+        return weights;
+    }
+    for (size_t i = 0; i + 1 < children.size(); ++i)
+    {
+        if (value > children[i + 1].threshold)
+        {
+            continue;
+        }
+        float range = children[i + 1].threshold - children[i].threshold;
+        float t = range > 0.0f ? (value - children[i].threshold) / range : 0.0f;
+        weights[i] = 1.0f - t;
+        weights[i + 1] = t;
+        break;
+    }
+    return weights;
+}
+
+void AnimationControllerEditorPanel::openBlendTreeEditorWindow(const ANode& node)
+{
+    m_blendTreeNodeId = node.id;
+    // 预览滑条初值取绑定参数的当前编辑值，打开即落在有意义的位置
+    for (const auto& var : m_controllerData.Variables)
+    {
+        if (var.Type == VariableType::VariableType_Float && var.Name == node.blendTree.parameterName &&
+            std::holds_alternative<float>(var.Value))
+        {
+            m_blendTreePreviewValue = std::get<float>(var.Value);
+            break;
+        }
+    }
+    m_blendTreeWindowOpen = true;
+}
+
+void AnimationControllerEditorPanel::drawBlendTreeEditorWindow()
+{
+    ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
+    if (!ImGui::Begin("混合树编辑器", &m_blendTreeWindowOpen))
+    {
+        ImGui::End();
+        return;
+    }
+    ANode* node = findNodeById(m_blendTreeNodeId);
+    if (!node || node->stateType != AnimationStateType::BlendTree)
+    {
+        ImGui::Text("无效的混合树状态");
+        ImGui::End();
+        return;
+    }
+    BlendTreeData& tree = node->blendTree;
+    ImGui::Text("混合树: %s", node->name.c_str());
+    ImGui::Separator();
+    if (ImGui::BeginCombo("混合参数", tree.parameterName.empty() ? "(未选择)" : tree.parameterName.c_str()))
+    {
+        for (const auto& var : m_controllerData.Variables)
+        {
+            if (var.Type != VariableType::VariableType_Float)
+            {
+                continue;
+            }
+            if (ImGui::Selectable(var.Name.c_str(), tree.parameterName == var.Name))
+            {
+                tree.parameterName = var.Name;
+                markDirty();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (tree.parameterName.empty())
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "未绑定 float 参数，运行时按参数值 0 求值");
+    }
+    ImGui::Separator();
+    ImGui::Text("子项（剪辑 + 阈值）");
+    int deleteIndex = -1;
+    for (size_t i = 0; i < tree.children.size(); ++i)
+    {
+        ImGui::PushID(static_cast<int>(i));
+        BlendTreeData::Child& child = tree.children[i];
+        ImGui::SetNextItemWidth(180);
+        if (ImGui::BeginCombo("##Clip", getClipDisplayName(child.clipGuid).c_str()))
+        {
+            for (const auto& [key, meta] : AssetManager::GetInstance().GetAssetDatabase())
+            {
+                if (meta.type != AssetType::AnimationClip)
+                {
+                    continue;
+                }
+                std::string itemLabel = Path::GetFileNameWithoutExtension(meta.assetPath.string()) +
+                    "##" + meta.guid.ToString();
+                if (ImGui::Selectable(itemLabel.c_str(), child.clipGuid == meta.guid))
+                {
+                    child.clipGuid = meta.guid;
+                    markDirty();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        if (ImGui::DragFloat("##Threshold", &child.threshold, 0.05f, 0.0f, 0.0f, "%.2f"))
+        {
+            markDirty();
+        }
+        // 拖动结束再按阈值重排，避免拖动过程中行序跳变
+        if (ImGui::IsItemDeactivatedAfterEdit())
+        {
+            sortBlendTreeChildren(tree);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("删除"))
+        {
+            deleteIndex = static_cast<int>(i);
+        }
+        ImGui::PopID();
+    }
+    if (deleteIndex >= 0)
+    {
+        tree.children.erase(tree.children.begin() + deleteIndex);
+        markDirty();
+    }
+    if (ImGui::Button("添加子项"))
+    {
+        BlendTreeData::Child child;
+        child.threshold = tree.children.empty() ? 0.0f : tree.children.back().threshold + 1.0f;
+        tree.children.push_back(child);
+        markDirty();
+    }
+    ImGui::Separator();
+    ImGui::Text("权重预览");
+    if (tree.children.empty())
+    {
+        ImGui::TextDisabled("暂无子项");
+        ImGui::End();
+        return;
+    }
+    // 播放中且运行时活跃状态就是本混合树时，改用运行时实况权重
+    RuntimeAnimationController::PlaybackStatus status;
+    bool liveWeights = tryGetRuntimePlaybackStatus(status) && status.isBlendTreeState &&
+        ((!status.isTransitioning && status.currentStateGuid == node->stateGuid) ||
+         (status.isTransitioning && status.targetStateGuid == node->stateGuid));
+    std::vector<float> weights;
+    if (liveWeights)
+    {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.3f, 1.0f), "运行时实况: %s = %.3f",
+                           tree.parameterName.c_str(), status.blendParameterValue);
+        weights.assign(tree.children.size(), 0.0f);
+        if (status.activeChildIndex >= 0 && status.activeChildIndex < static_cast<int>(weights.size()))
+        {
+            weights[status.activeChildIndex] = status.blendWeight;
+        }
+        if (status.secondaryChildIndex >= 0 && status.secondaryChildIndex < static_cast<int>(weights.size()))
+        {
+            weights[status.secondaryChildIndex] = 1.0f - status.blendWeight;
+        }
+    }
+    else
+    {
+        float minThreshold = tree.children.front().threshold;
+        float maxThreshold = tree.children.back().threshold;
+        if (maxThreshold <= minThreshold)
+        {
+            maxThreshold = minThreshold + 1.0f;
+        }
+        m_blendTreePreviewValue = std::clamp(m_blendTreePreviewValue, minThreshold, maxThreshold);
+        ImGui::SliderFloat("参数预览值", &m_blendTreePreviewValue, minThreshold, maxThreshold, "%.3f");
+        weights = computeBlendTreeWeights(tree, m_blendTreePreviewValue);
+    }
+    for (size_t i = 0; i < tree.children.size(); ++i)
+    {
+        char overlay[160];
+        snprintf(overlay, sizeof(overlay), "%s @ %.2f  |  %.1f%%",
+                 getClipDisplayName(tree.children[i].clipGuid).c_str(),
+                 tree.children[i].threshold, weights[i] * 100.0f);
+        ImGui::ProgressBar(weights[i], ImVec2(-1, 0), overlay);
+    }
+    ImGui::End();
 }

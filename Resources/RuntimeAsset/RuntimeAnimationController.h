@@ -3,6 +3,7 @@
 #include <mutex>
 
 #include "AnimationControllerData.h"
+#include "AnimationTrackSampler.h"
 #include "IRuntimeAsset.h"
 #include "RuntimeAnimationClip.h"
 #include "Event/LumaEvent.h"
@@ -29,8 +30,11 @@ private:
      * @param clip 要播放的动画剪辑。
      * @param speed 动画播放速度。
      * @param transitionDuration 动画过渡持续时间。
+     * @param stateGuidOverride 有效时以该状态GUID作为当前状态（混合树状态GUID与剪辑GUID不同）。
+     * @return 是否真正开始播放。
      */
-    void playInternal(const sk_sp<RuntimeAnimationClip>& clip, float speed = 1.0f, float transitionDuration = 0.0f);
+    bool playInternal(const sk_sp<RuntimeAnimationClip>& clip, float speed = 1.0f, float transitionDuration = 0.0f,
+                      const Guid& stateGuidOverride = Guid());
     float m_currentTime = 0.0f; ///< 当前动画播放时间。
     float m_frameRate = 60.f; ///< 动画帧率。
     int m_currentFrameIndex = 0; ///< 当前动画帧索引。
@@ -43,6 +47,56 @@ private:
     sk_sp<RuntimeAnimationClip> m_fromClip; ///< 过渡的起始动画剪辑。
     sk_sp<RuntimeAnimationClip> m_toClip; ///< 过渡的目标动画剪辑。
     int m_fromFrameIndex = 0; ///< 过渡起始动画的帧索引。
+
+    sk_sp<RuntimeAnimationClip> m_currentClip; ///< 当前帧来源剪辑；混合树状态下为主导剪辑。
+    bool m_isBlendTreeState = false; ///< 当前状态是否为混合树。
+    int m_blendDominantChildIndex = -1; ///< 混合树主导子项索引（子项按阈值升序）。
+    int m_blendSecondaryChildIndex = -1; ///< 参与混合的相邻子项索引，无混合时为 -1。
+    float m_blendDominantWeight = 1.0f; ///< 主导子项权重（0.5~1.0）。
+    std::unordered_map<Guid, sk_sp<RuntimeAnimationClip>> m_blendClipCache; ///< 混合树子项剪辑缓存，按剪辑GUID索引。
+
+    /**
+     * @brief 一维混合树求值结果：相邻两个子项与主导权重。
+     */
+    struct BlendTreeSelection
+    {
+        int dominantIndex = -1; ///< 主导子项索引（权重较大者），求值失败时为 -1。
+        int secondaryIndex = -1; ///< 参与混合的相邻子项索引，参数落在阈值区间外时为 -1。
+        float dominantWeight = 1.0f; ///< 主导子项权重。
+        float parameterValue = 0.0f; ///< 求值时读到的参数值。
+    };
+
+    /**
+     * @brief 按当前参数值对混合树求值，取相邻阈值的两个子项与线性权重。
+     * @param tree 混合树数据（子项需按阈值升序）。
+     * @return 求值结果。
+     */
+    BlendTreeSelection evaluateBlendTree(const BlendTreeData& tree) const;
+    /**
+     * @brief 获取混合树子项剪辑（带缓存，未命中时按GUID加载）。
+     * @param clipGuid 子项剪辑的全局唯一标识符。
+     * @return 运行时剪辑，加载失败时为 nullptr。
+     */
+    sk_sp<RuntimeAnimationClip> getBlendChildClip(const Guid& clipGuid);
+    /**
+     * @brief 进入混合树状态：求主导剪辑并作为帧来源开始播放。
+     * @param stateGuid 混合树状态的全局唯一标识符。
+     * @param speed 动画播放速度。
+     * @param transitionDuration 动画过渡持续时间。
+     */
+    void playBlendTreeState(const Guid& stateGuid, float speed, float transitionDuration);
+    /**
+     * @brief 每帧重求混合树参数，主导剪辑变化时按归一化相位切换帧来源。
+     */
+    void refreshBlendTreeSelection();
+    /**
+     * @brief 混合树状态的帧推进与采样，独立于 UpdateFrameBasedAnimation。
+     *
+     * 第一期混合语义为加权选择：快照帧与属性轨道均取主导剪辑（权重大者），
+     * 帧率/循环也随主导剪辑；预留升级为两个剪辑各自采样结果按权重插值。
+     * @param deltaTime 帧之间的时间差。
+     */
+    void UpdateBlendTreeAnimation(float deltaTime);
 
     LumaEvent<float, int> m_onAnimationUpdateEvent; ///< 动画更新事件。
     ListenerHandle m_onAnimationUpdateListener; ///< 动画更新事件的监听器句柄。
@@ -82,6 +136,15 @@ private:
      */
     void ApplyAnimationFrame(const sk_sp<RuntimeAnimationClip>& clip, int frameIndex, float blendWeight = 1.0f);
     /**
+     * @brief 对剪辑的属性轨道按连续帧时间求值并写入目标实体。
+     * @param clip 要采样的动画剪辑。
+     * @param frameTime 以帧为单位的连续时间（可为小数），保证帧间插值平滑。
+     */
+    void ApplyPropertyTracks(const sk_sp<RuntimeAnimationClip>& clip, float frameTime);
+
+    AnimationTrackSampler::TrackBindingCache m_trackBindingCache; ///< 当前剪辑属性轨道的绑定缓存（注册表条目/类型解析结果）。
+    Guid m_trackBindingCacheClipGuid; ///< 绑定缓存对应的剪辑GUID，剪辑切换时重建缓存。
+    /**
      * @brief 混合两个动画剪辑的帧。
      * @param fromClip 源动画剪辑。
      * @param fromFrame 源动画的帧索引。
@@ -107,6 +170,11 @@ public:
         std::string targetStateName; ///< 过渡目标状态名称，未过渡时为空。
         Guid targetStateGuid; ///< 过渡目标状态的全局唯一标识符。
         float transitionProgress = 0.0f; ///< 过渡进度（0-1）。
+        bool isBlendTreeState = false; ///< 活跃状态（过渡中为目标状态）是否为混合树。
+        int activeChildIndex = -1; ///< 混合树主导子项索引（子项按阈值升序），非混合树时为 -1。
+        int secondaryChildIndex = -1; ///< 参与混合的相邻子项索引，无混合时为 -1。
+        float blendWeight = 1.0f; ///< 主导子项权重（0.5~1.0），相邻子项权重为 1-blendWeight。
+        float blendParameterValue = 0.0f; ///< 混合参数当前值。
     };
 
     /**

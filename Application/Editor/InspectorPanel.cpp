@@ -1368,6 +1368,19 @@ void InspectorPanel::drawBatchComponentContextMenu(const std::string& componentN
             }
         }
         if (!canPasteValues) ImGui::EndDisabled();
+        // 注册表没有默认值/reset 路径，重置等价于移除后重新添加（默认构造）
+        if (!compInfo->isRemovable) ImGui::BeginDisabled();
+        if (ImGui::MenuItem("批量重置组件"))
+        {
+            m_context->uiCallbacks->onValueChanged.Invoke();
+            for (const auto& obj : selectedObjects)
+            {
+                auto entityHandle = static_cast<entt::entity>(obj);
+                compInfo->remove(registry, entityHandle);
+                compInfo->add(registry, entityHandle);
+            }
+        }
+        if (!compInfo->isRemovable) ImGui::EndDisabled();
         ImGui::EndPopup();
     }
 }
@@ -1539,6 +1552,36 @@ bool InspectorPanel::drawComponentContextMenu(const std::string& componentName, 
                 compInfo->deserialize(registry, entityHandle, m_context->componentClipboard_Data);
             }
             if (!canPasteValues) ImGui::EndDisabled();
+            // 粘贴为新组件：剪贴板里的组件类型在当前对象上不存在时可用（Unity 的 Paste Component As New）
+            const ComponentRegistration* clipInfo = m_context->componentClipboard_Type.empty()
+                                                        ? nullptr
+                                                        : ComponentRegistry::GetInstance().Get(
+                                                            m_context->componentClipboard_Type);
+            bool canPasteAsNew = clipInfo != nullptr && !clipInfo->has(registry, entityHandle);
+            if (!canPasteAsNew) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("粘贴为新组件"))
+            {
+                m_context->uiCallbacks->onValueChanged.Invoke();
+                clipInfo->add(registry, entityHandle);
+                clipInfo->deserialize(registry, entityHandle, m_context->componentClipboard_Data);
+            }
+            if (!canPasteAsNew) ImGui::EndDisabled();
+            // 重置：注册表没有默认值工厂，借一个临时对象默认构造该组件并序列化取得默认值，
+            // 再整体覆盖目标组件（emplace_or_replace 原地替换，无移除中间态，因此不可移除的
+            // Transform 等组件同样支持重置：position(0,0)/rotation 0/scale(1,1) 即其默认构造值）
+            if (ImGui::MenuItem("重置组件"))
+            {
+                m_context->uiCallbacks->onValueChanged.Invoke();
+                RuntimeGameObject probe = m_context->activeScene->CreateGameObject("__ComponentDefaultProbe");
+                auto probeHandle = static_cast<entt::entity>(probe);
+                if (!compInfo->has(registry, probeHandle))
+                {
+                    compInfo->add(registry, probeHandle);
+                }
+                YAML::Node defaults = compInfo->serialize(registry, probeHandle);
+                m_context->activeScene->DestroyGameObject(probe);
+                compInfo->deserialize(registry, entityHandle, defaults);
+            }
             if (componentName == "ScriptsComponent")
             {
                 bool canPasteScript = !m_context->componentClipboard_Type.empty() &&

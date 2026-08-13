@@ -7,6 +7,7 @@
 #include "IComponent.h"
 #include <unordered_map>
 #include <cmath>
+#include <cstdint>
 
 #include "RuleTile.h"
 #include "Tile.h"
@@ -51,12 +52,37 @@ namespace ECS
     };
 
     /**
+     * @brief 单元格内放置的瓦片实例：资产句柄附带朝向（旋转与翻转）。
+     */
+    struct TileInstance
+    {
+        AssetHandle handle; ///< 瓦片或规则瓦片资产句柄。
+        uint8_t rotation = 0; ///< 旋转步数，0-3，每步顺时针 90°。
+        bool flipX = false; ///< 水平翻转。
+        bool flipY = false; ///< 垂直翻转。
+
+        bool Valid() const { return handle.Valid(); }
+
+        bool operator==(const TileInstance& other) const
+        {
+            return handle.assetGuid == other.handle.assetGuid &&
+                handle.assetType == other.handle.assetType &&
+                rotation == other.rotation &&
+                flipX == other.flipX &&
+                flipY == other.flipY;
+        }
+    };
+
+    /**
      * @brief 表示一个已解析的瓦片信息。
      */
     struct ResolvedTile
     {
         AssetHandle sourceTileAsset; ///< 源瓦片资源的句柄。
         TileAssetData data; ///< 瓦片资产数据。
+        uint8_t rotation = 0; ///< 放置实例的旋转步数（0-3，顺时针 90°），渲染提取端烘进每瓦片变换。
+        bool flipX = false; ///< 放置实例的水平翻转。
+        bool flipY = false; ///< 放置实例的垂直翻转。
     };
 
     /**
@@ -66,8 +92,8 @@ namespace ECS
     {
         Vector2f cellSize = {100.0f, 100.0f}; ///< 瓦片单元格的大小。
 
-        std::unordered_map<Vector2i, AssetHandle, Vector2iHash> normalTiles; ///< 存储普通瓦片的映射，键为瓦片位置，值为瓦片资产句柄。
-        std::unordered_map<Vector2i, AssetHandle, Vector2iHash> ruleTiles; ///< 存储规则瓦片的映射，键为瓦片位置，值为瓦片资产句柄。
+        std::unordered_map<Vector2i, TileInstance, Vector2iHash> normalTiles; ///< 存储普通瓦片的映射，键为瓦片位置，值为瓦片实例。
+        std::unordered_map<Vector2i, TileInstance, Vector2iHash> ruleTiles; ///< 存储规则瓦片的映射，键为瓦片位置，值为瓦片实例。
 
 
         std::unordered_map<Vector2i, ResolvedTile, Vector2iHash> runtimeTileCache; ///< 运行时瓦片缓存，键为瓦片位置，值为已解析的瓦片信息。
@@ -129,6 +155,53 @@ namespace ECS
 namespace YAML
 {
     /**
+     * @brief YAML转换器，用于ECS::TileInstance的序列化和反序列化。
+     * 解码向后兼容旧格式：旧场景文件的单元格值是裸 AssetHandle（等价于 rotation=0、无翻转）。
+     */
+    template <>
+    struct convert<ECS::TileInstance>
+    {
+        /**
+         * @brief 将ECS::TileInstance对象编码为YAML节点。
+         * @param rhs 要编码的ECS::TileInstance对象。
+         * @return 编码后的YAML节点。
+         */
+        static Node encode(const ECS::TileInstance& rhs)
+        {
+            Node node;
+            node["handle"] = rhs.handle;
+            node["rotation"] = static_cast<int>(rhs.rotation);
+            node["flipX"] = rhs.flipX;
+            node["flipY"] = rhs.flipY;
+            return node;
+        }
+
+        /**
+         * @brief 从YAML节点解码ECS::TileInstance对象。
+         * @param node 包含瓦片实例数据的YAML节点。
+         * @param rhs 要填充的ECS::TileInstance对象。
+         * @return 如果解码成功则返回true，否则返回false。
+         */
+        static bool decode(const Node& node, ECS::TileInstance& rhs)
+        {
+            if (!node.IsMap()) return false;
+            if (node["handle"])
+            {
+                rhs.handle = node["handle"].as<AssetHandle>();
+                rhs.rotation = static_cast<uint8_t>(node["rotation"].as<int>(0) & 3);
+                rhs.flipX = node["flipX"].as<bool>(false);
+                rhs.flipY = node["flipY"].as<bool>(false);
+                return true;
+            }
+            // 旧格式：节点本身就是 AssetHandle（含 "guid" 键），朝向取默认值
+            rhs.rotation = 0;
+            rhs.flipX = false;
+            rhs.flipY = false;
+            return convert<AssetHandle>::decode(node, rhs.handle);
+        }
+    };
+
+    /**
      * @brief YAML转换器，用于ECS::TilemapComponent的序列化和反序列化。
      * @tparam ECS::TilemapComponent 要转换的瓦片地图组件类型。
      */
@@ -159,12 +232,13 @@ namespace YAML
         {
             if (!node.IsMap()) return false;
             rhs.cellSize = node["cellSize"].as<ECS::Vector2f>(ECS::Vector2f{100.0f, 100.0f});
+            // 值类型 TileInstance 的解码内建旧格式（裸 AssetHandle）兼容
             if (node["normalTiles"])
                 rhs.normalTiles = node["normalTiles"].as<std::unordered_map<
-                    ECS::Vector2i, AssetHandle, ECS::Vector2iHash>>();
+                    ECS::Vector2i, ECS::TileInstance, ECS::Vector2iHash>>();
             if (node["ruleTiles"])
                 rhs.ruleTiles = node["ruleTiles"].as<std::unordered_map<
-                    ECS::Vector2i, AssetHandle, ECS::Vector2iHash>>();
+                    ECS::Vector2i, ECS::TileInstance, ECS::Vector2iHash>>();
             return true;
         }
     };

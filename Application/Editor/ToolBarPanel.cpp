@@ -2147,8 +2147,11 @@ void ToolbarPanel::handleShortcuts()
     // 动画编辑器聚焦时优先处理剪辑数据的撤销/重做（该面板绘制顺序在工具栏之后，用帧号标记让路）
     const bool animationEditorTakesUndo =
         (ImGui::GetFrameCount() - m_context->animationEditorUndoCaptureFrame) <= 1;
+    // 瓦片编辑模式下笔画撤销走场景视图面板的瓦片级增量栈，同样让路
+    const bool tileEditorTakesUndo =
+        (ImGui::GetFrameCount() - m_context->tileEditorUndoCaptureFrame) <= 1;
     // 拖拽/编辑控件进行中不响应撤销重做，避免撤销到编辑中途的状态
-    if (!ImGui::IsAnyItemActive() && !animationEditorTakesUndo)
+    if (!ImGui::IsAnyItemActive() && !animationEditorTakesUndo && !tileEditorTakesUndo)
     {
         if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
         {

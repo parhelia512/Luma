@@ -19,6 +19,7 @@
 #include "Particles/ParticleRenderer.h"
 #include "../../Components/ParticleComponent.h"
 #include "TouchGestureHandler.h"
+#include <deque>
 struct AssetHandle;
 class RuntimeGameObject;
 class SceneViewPanel : public IEditorPanel
@@ -75,7 +76,43 @@ private:
         Line,   ///< 直线
         Rect,   ///< 矩形
         Fill,   ///< 油漆桶
-        Picker  ///< 吸管
+        Picker, ///< 吸管
+        Select  ///< 选择：拖选场景瓦片区域，Ctrl+C/X 拷为图案笔刷
+    };
+    /**
+     * @brief 笔刷/图案的朝向操作（Z/X/H/V 快捷键）。
+     */
+    enum class TileOrientOp
+    {
+        RotateCCW, ///< 逆时针 90°
+        RotateCW,  ///< 顺时针 90°
+        FlipH,     ///< 水平翻转
+        FlipV      ///< 垂直翻转
+    };
+    /**
+     * @brief 单元格的完整内容快照（普通瓦片与规则瓦片两张表），句柄无效表示该表无此格。
+     */
+    struct TileCellState
+    {
+        ECS::TileInstance normal; 
+        ECS::TileInstance rule; 
+    };
+    /**
+     * @brief 一个格子在一次笔画前后的内容变化。
+     */
+    struct TileDiffEntry
+    {
+        ECS::Vector2i coord; 
+        TileCellState before; 
+        TileCellState after; 
+    };
+    /**
+     * @brief 一次笔画的瓦片级增量撤销记录。
+     */
+    struct TileUndoRecord
+    {
+        Guid tilemapGuid; 
+        std::vector<TileDiffEntry> entries; 
     };
     // Unity 风格变换工具（Q/W/E/R）
     enum class TransformTool
@@ -168,6 +205,33 @@ private:
     void computeTileFillRegion(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& anchor,
                                std::vector<ECS::Vector2i>& outCoords) const;
     void drawTileToolbar(ImDrawList* drawList, const ImVec2& viewportScreenPos, const ImVec2& viewportSize);
+    void handleTileEditHotkeys();
+    void applyTileBrushOrientationOp(TileOrientOp op);
+    void copyTileSelectionToPattern(bool cut);
+    void beginTileStroke(RuntimeGameObject& tilemapGo);
+    void recordTileCellBefore(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& coord);
+    void endTileStroke(const ECS::TilemapComponent& tilemap);
+    void undoTileStroke();
+    void redoTileStroke();
+    bool applyTileUndoRecord(const TileUndoRecord& record, bool useBefore);
+    static TileCellState captureTileCellState(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& coord);
+    static void applyTileCellState(ECS::TilemapComponent& tilemap, const ECS::Vector2i& coord,
+                                   const TileCellState& state);
+    /**
+     * @brief 场景视图虚影用的瓦片贴图缓存项，texture 为空表示该资产无法提取贴图（预制体瓦片等）。
+     */
+    struct TileGhostImage
+    {
+        sk_sp<RuntimeTexture> texture;
+        ImVec2 uv0 = ImVec2(0.0f, 0.0f);
+        ImVec2 uv1 = ImVec2(1.0f, 1.0f);
+    };
+    const TileGhostImage& getTileGhostImage(const AssetHandle& handle);
+    void drawTileGhostCell(ImDrawList* drawList, const ImVec2& screenMin, const ImVec2& screenMax,
+                           const AssetHandle& handle, uint8_t rotation, bool flipX, bool flipY, ImU32 tint);
+    ECS::Vector2i patternSnappedAnchor(const ECS::Vector2i& coord) const;
+    void pickTileRegionAsPattern(const ECS::TilemapComponent& tilemap, const ECS::Vector2i& from,
+                                 const ECS::Vector2i& to);
     entt::entity handleObjectPicking(const ECS::Vector2f& worldMousePos);
     void handleObjectDragging(const ECS::Vector2f& worldMousePos);
     void initiateDragging(const ECS::Vector2f& worldMousePos);
@@ -248,6 +312,22 @@ private:
     ECS::Vector2i m_fillPreviewAnchor; ///< 生成填充预览时的锚点格子。
     bool m_fillPreviewValid = false; ///< 填充预览缓存有效标记，锚点变化或瓦片数据修改后失效。
     const void* m_fillPreviewTilemap = nullptr; ///< 生成填充预览时的 Tilemap 组件地址，区分不同对象。
+    uint8_t m_brushRotation = 0; ///< 单瓦片笔刷当前旋转步数（0-3，顺时针 90°），Z/X 调整。
+    bool m_brushFlipX = false; ///< 单瓦片笔刷水平翻转（H）。
+    bool m_brushFlipY = false; ///< 单瓦片笔刷垂直翻转（V）。
+    bool m_tileSelectDragging = false; ///< 选择工具拖框进行中。
+    bool m_tileSelectionValid = false; ///< 存在已确认的瓦片选区。
+    ECS::Vector2i m_tileSelectStart; ///< 选区起点格。
+    ECS::Vector2i m_tileSelectEnd; ///< 选区终点格（拖拽中实时更新）。
+    bool m_tilePickerDragging = false; ///< 吸管拖框进行中（拖出范围则拾取为图案笔刷）。
+    ECS::Vector2i m_tilePickerStart; ///< 吸管拖框起点格。
+    ECS::Vector2i m_tilePickerEnd; ///< 吸管拖框终点格。
+    std::unordered_map<Guid, TileGhostImage> m_tileGhostCache; ///< 虚影贴图缓存，键为瓦片资产 Guid。
+    std::deque<TileUndoRecord> m_tileUndoStack; ///< 瓦片级增量撤销栈，上限 128 笔画。
+    std::vector<TileUndoRecord> m_tileRedoStack; ///< 瓦片级重做栈，新笔画时清空。
+    std::unordered_map<ECS::Vector2i, TileCellState, ECS::Vector2iHash> m_strokeBeforeStates; ///< 当前笔画中每个已触碰格子的初始内容。
+    bool m_strokeRecording = false; ///< 正在记录一次笔画的增量。
+    Guid m_strokeTilemapGuid; ///< 当前笔画所属 Tilemap 对象。
     std::unique_ptr<Particles::ParticleRenderer> m_particleRenderer; 
     std::vector<Guid> m_lastParticleSelection; 
     float m_particlePreviewTime = 0.0f;

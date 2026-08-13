@@ -102,7 +102,39 @@ private:
         ImVec2 position; 
         ImVec2 size; 
         uint32_t functionId = 0; 
+        uint32_t ownerFunctionId = 0; // 区域所在图页（0=主图），与 functionId（函数自身的区域）区分
         ImVec4 color; 
+    };
+    struct UndoRecord
+    {
+        Blueprint data; // 全量蓝图快照（含所有图页）
+        uint32_t activeGraphId = 0; // 快照时所在图页，恢复时切回
+    };
+    enum class NodeAlignMode
+    {
+        Left, 
+        Right, 
+        Top, 
+        Bottom 
+    };
+    enum class PendingNavKind
+    {
+        None, 
+        Rect, // 精确恢复到指定画布矩形（书签/切页视图记忆）
+        Content 
+    };
+    struct ReferenceItem
+    {
+        uint32_t nodeID = 0; 
+        uint32_t graphId = 0; 
+        std::string nodeTitle; 
+        std::string graphTitle; 
+    };
+    struct FindReferencesWindow
+    {
+        bool isOpen = false; 
+        std::string title; 
+        std::vector<ReferenceItem> items; 
     };
     enum class ERegionInteractionType
     {
@@ -183,11 +215,18 @@ private:
     bool doesEventNodeExist(const std::string& fullName);
     SelectFunctionWindow* findSelectFunctionWindow(uint32_t nodeId, const std::string& pinName);
     void handleShortcutInput();
+    void requestViewSwitch(uint32_t functionId);
+    void applyPendingViewSwitch();
+    void drawGraphBreadcrumb();
+    void migrateNodeOwnership();
+    const BlueprintFunction* findFunctionById(uint32_t functionId) const;
+    uint32_t getPinOwnerFunction(const BPin* pin) const;
+    int countNodesOwnedByFunction(uint32_t functionId) const;
     void captureStateToData();
-    Blueprint makeSnapshot();
+    UndoRecord makeSnapshot();
     void pushUndoSnapshot();
-    void pushUndoSnapshotDirect(Blueprint&& snapshot);
-    void restoreFromSnapshot(const Blueprint& snapshot);
+    void pushUndoSnapshotDirect(UndoRecord&& snapshot);
+    void restoreFromSnapshot(const UndoRecord& snapshot);
     void performUndo();
     void performRedo();
     void trackItemEditUndo();
@@ -201,6 +240,19 @@ private:
     void duplicateSelection();
     void drawCreateNodeFromPinMenu();
     void drawVariableDropMenu();
+    std::vector<BNode*> collectSelectedViewNodes();
+    void alignSelectedNodes(NodeAlignMode mode);
+    void distributeSelectedNodes(bool horizontal);
+    void arrangeNodes();
+    void setBookmark(int slot);
+    void jumpToBookmark(int slot);
+    ImVec4 captureCurrentViewRect() const;
+    void navigateToViewRect(const ImVec4& rect);
+    void openVariableReferences(const std::string& variableName);
+    void openFunctionReferences(const std::string& functionName);
+    void drawFindReferencesWindow();
+    void jumpToNode(uint32_t nodeDataId);
+    std::string graphDisplayName(uint32_t graphId) const;
     bool nodeDefinitionHasCompatiblePin(const BlueprintNodeDefinition* definition, const BPin* startPin) const;
     void connectPinToFirstCompatiblePin(BPin* startPin, BNode& newNode);
     uint32_t getNextNodeId() { return m_nextNodeId++; }
@@ -247,12 +299,12 @@ private:
     ListenerHandle m_scriptCompiledListener; 
     std::vector<SelectFunctionWindow> m_selectFunctionWindows;
     static constexpr size_t kUndoStackLimit = 64; 
-    std::deque<Blueprint> m_undoStack; // 撤销栈：结构性修改前的全量数据快照
-    std::deque<Blueprint> m_redoStack; 
+    std::deque<UndoRecord> m_undoStack; // 撤销栈：结构性修改前的全量数据快照（含所属图页）
+    std::deque<UndoRecord> m_redoStack; 
     int m_lastUndoPushFrame = -1; // 同一帧内的批量修改合并为一个撤销步骤
-    Blueprint m_pendingEditSnapshot; // 文本编辑开始时暂存的前置快照，提交时入栈
+    UndoRecord m_pendingEditSnapshot; // 文本编辑开始时暂存的前置快照，提交时入栈
     bool m_hasPendingEditSnapshot = false; 
-    Blueprint m_moveCandidateSnapshot; // 鼠标按下时暂存的快照，用于拖动结束后入栈
+    UndoRecord m_moveCandidateSnapshot; // 鼠标按下时暂存的快照，用于拖动结束后入栈
     bool m_hasMoveCandidate = false; 
     std::unordered_map<uint64_t, ImVec2> m_moveStartNodePositions; 
     std::unordered_map<uint32_t, std::pair<ImVec2, ImVec2>> m_moveStartRegionRects; 
@@ -263,5 +315,13 @@ private:
     std::string m_varDropName; 
     ImVec2 m_varDropCanvasPos = ImVec2(0, 0); 
     bool m_openVarDropMenu = false; 
+    static constexpr uint32_t kNoPendingView = 0xFFFFFFFFu; 
+    uint32_t m_currentViewFunction = 0; // 当前视图：0 = 主图，否则为正在编辑的函数 ID
+    uint32_t m_pendingViewFunction = kNoPendingView; // 切换请求延迟到帧首统一应用，保证同帧过滤一致
+    bool m_viewJustSwitched = false; // 切换视图后把镜头对准当前域内容
+    PendingNavKind m_pendingNavKind = PendingNavKind::None; // 待执行的画布导航（需在节点提交后应用）
+    ImVec4 m_pendingNavRect = ImVec4(0, 0, 0, 0); // Rect 导航的目标画布矩形（Min.xy, Max.xy）
+    uint32_t m_pendingFocusNodeId = 0; // 待选中并居中的节点（数据 ID），跨图页跳转后生效
+    FindReferencesWindow m_findReferences; 
 };
 #endif 

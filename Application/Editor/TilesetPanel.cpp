@@ -7,6 +7,7 @@
 #include "Loaders/RuleTileLoader.h"
 #include "Utils/Logger.h"
 #include <fstream>
+#include <limits>
 #include <Resources/Loaders/RuleTileLoader.h>
 #include <Resources/Loaders/TilesetLoader.h>
 #include "Profiler.h"
@@ -141,10 +142,15 @@ void TilesetPanel::drawTilesetContent()
 {
     float panelWidth = ImGui::GetContentRegionAvail().x;
     int columnCount = std::max(1, static_cast<int>(panelWidth / (m_thumbnailSize + 20.0f)));
+    // 本帧所有缩略图按钮的屏幕矩形，供拖选矩形做命中测试
+    std::vector<ThumbnailRect> thumbRects;
+    thumbRects.reserve(m_tileHandles.size());
+    int pendingRemoveIndex = -1;
     if (ImGui::BeginTable("TilesetGrid", columnCount))
     {
-        for (const auto& handle : m_tileHandles)
+        for (int index = 0; index < static_cast<int>(m_tileHandles.size()); ++index)
         {
+            const AssetHandle handle = m_tileHandles[index];
             ImGui::TableNextColumn();
             ImGui::PushID(handle.assetGuid.ToString().c_str());
             const auto* meta = AssetManager::GetInstance().GetMetadata(handle.assetGuid);
@@ -170,9 +176,12 @@ void TilesetPanel::drawTilesetContent()
                 // 无法提取纹理（预制体瓦片、缺失资产等）时退回文字按钮
                 clicked = ImGui::Button(name.c_str(), ImVec2(m_thumbnailSize, m_thumbnailSize));
             }
-            if (clicked)
+            thumbRects.push_back({handle, ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), index});
+            if (clicked && !m_thumbDragSelecting)
             {
+                // 单击回到单瓦片笔刷，退出图案模式
                 m_context->activeTileBrush = handle;
+                m_context->activeTileBrushPattern.clear();
             }
             if (isSelected)
             {
@@ -183,16 +192,8 @@ void TilesetPanel::drawTilesetContent()
             {
                 if (ImGui::MenuItem("删除"))
                 {
-                    auto it = std::find_if(m_tileHandles.begin(), m_tileHandles.end(), [&](const AssetHandle& h)
-                    { return h.assetGuid == handle.assetGuid; });
-                    if (it != m_tileHandles.end())
-                    {
-                        if (m_context->activeTileBrush.assetGuid == handle.assetGuid) { m_context->activeTileBrush = {}; }
-                        m_hydratedTiles.erase(handle.assetGuid);
-                        m_hydratedRuleTiles.erase(handle.assetGuid);
-                        m_thumbnailCache.erase(handle.assetGuid);
-                        m_tileHandles.erase(it);
-                    }
+                    // 延迟到循环外删除，避免遍历中修改容器
+                    pendingRemoveIndex = index;
                 }
                 ImGui::EndPopup();
             }
@@ -202,7 +203,7 @@ void TilesetPanel::drawTilesetContent()
             }
             if (ImGui::BeginDragDropSource())
             {
-                ImGui::SetDragDropPayload("DRAG_DROP_ASSET_HANDLE", &handle, sizeof(AssetHandle));
+                ImGui::SetDragDropPayload("DRAG_DROP_ASSET_HANDLE", &m_tileHandles[index], sizeof(AssetHandle));
                 ImGui::Text("%s", name.c_str());
                 ImGui::EndDragDropSource();
             }
@@ -211,6 +212,89 @@ void TilesetPanel::drawTilesetContent()
         }
         ImGui::EndTable();
     }
+    if (pendingRemoveIndex >= 0 && pendingRemoveIndex < static_cast<int>(m_tileHandles.size()))
+    {
+        const AssetHandle removed = m_tileHandles[pendingRemoveIndex];
+        if (m_context->activeTileBrush.assetGuid == removed.assetGuid) { m_context->activeTileBrush = {}; }
+        m_hydratedTiles.erase(removed.assetGuid);
+        m_hydratedRuleTiles.erase(removed.assetGuid);
+        m_thumbnailCache.erase(removed.assetGuid);
+        m_tileHandles.erase(m_tileHandles.begin() + pendingRemoveIndex);
+    }
+    // 缩略图网格拖选：划出矩形把命中的瓦片按网格相对行列组成多瓦片图案笔刷
+    const ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+    {
+        m_thumbDragStart = io.MousePos;
+        m_thumbDragPending = true;
+    }
+    if (m_thumbDragPending && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 6.0f))
+    {
+        m_thumbDragSelecting = true;
+    }
+    if (m_thumbDragSelecting)
+    {
+        const ImVec2 rectMin = {std::min(m_thumbDragStart.x, io.MousePos.x), std::min(m_thumbDragStart.y, io.MousePos.y)};
+        const ImVec2 rectMax = {std::max(m_thumbDragStart.x, io.MousePos.x), std::max(m_thumbDragStart.y, io.MousePos.y)};
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(rectMin, rectMax, IM_COL32(80, 160, 255, 40));
+        drawList->AddRect(rectMin, rectMax, IM_COL32(80, 160, 255, 220));
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        {
+            buildPatternFromThumbnailSelection(thumbRects, columnCount, rectMin, rectMax);
+            m_thumbDragSelecting = false;
+            m_thumbDragPending = false;
+        }
+    }
+    else if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+    {
+        m_thumbDragPending = false;
+    }
+}
+void TilesetPanel::buildPatternFromThumbnailSelection(const std::vector<ThumbnailRect>& thumbRects, int columnCount,
+                                                      const ImVec2& rectMin, const ImVec2& rectMax)
+{
+    // 调色板按添加顺序网格排列，相对坐标取网格行列差
+    struct Hit
+    {
+        AssetHandle handle;
+        int row;
+        int col;
+    };
+    std::vector<Hit> hits;
+    for (const auto& thumb : thumbRects)
+    {
+        const bool overlap = thumb.max.x >= rectMin.x && thumb.min.x <= rectMax.x &&
+            thumb.max.y >= rectMin.y && thumb.min.y <= rectMax.y;
+        if (overlap)
+        {
+            hits.push_back({thumb.handle, thumb.index / columnCount, thumb.index % columnCount});
+        }
+    }
+    if (hits.empty()) return;
+    if (hits.size() == 1)
+    {
+        // 只框到一个缩略图等价于单击选择
+        m_context->activeTileBrush = hits[0].handle;
+        m_context->activeTileBrushPattern.clear();
+        return;
+    }
+    int minRow = std::numeric_limits<int>::max();
+    int minCol = std::numeric_limits<int>::max();
+    for (const auto& hit : hits)
+    {
+        minRow = std::min(minRow, hit.row);
+        minCol = std::min(minCol, hit.col);
+    }
+    std::vector<TileBrushPatternCell> pattern;
+    pattern.reserve(hits.size());
+    for (const auto& hit : hits)
+    {
+        pattern.push_back({{hit.col - minCol, hit.row - minRow}, hit.handle, 0, false, false});
+    }
+    m_context->activeTileBrushPattern = std::move(pattern);
+    // 瓦片编辑模式由 activeTileBrush 有效性开启，用图案首格句柄保底
+    m_context->activeTileBrush = hits[0].handle;
 }
 void TilesetPanel::handleDropTarget()
 {
