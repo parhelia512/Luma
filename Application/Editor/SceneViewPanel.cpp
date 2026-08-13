@@ -506,6 +506,10 @@ void SceneViewPanel::drawSelectionOutlines(const ImVec2& viewportScreenPos, cons
             if (sprite.image)
             {
                 drawSpriteSelectionOutline(drawList, transform, sprite, outlineColor, fillColor, outlineThickness);
+                if (sprite.drawMode == ECS::SpriteDrawMode::Sliced)
+                {
+                    drawSpriteNineSliceGuides(drawList, transform, sprite, IM_COL32(0, 255, 0, 220));
+                }
                 hasVisualRepresentation = true;
             }
         }
@@ -787,7 +791,23 @@ void SceneViewPanel::drawTilemapColliderOutline(ImDrawList* drawList, const ECS:
                                                 ImU32 outlineColor,
                                                 float thickness)
 {
-    if (tilemapCollider.generatedChains.empty()) return;
+    if (tilemapCollider.generatedChains.empty() && tilemapCollider.generatedPolygons.empty()) return;
+    auto projectPoint = [&](const ECS::Vector2f& v) -> ImVec2
+    {
+        ECS::Vector2f local = {v.x + tilemapCollider.offset.x, v.y + tilemapCollider.offset.y};
+        local.x *= transform.scale.x;
+        local.y *= transform.scale.y;
+        if (std::abs(transform.rotation) > 0.001f)
+        {
+            const float sinR = sinf(transform.rotation);
+            const float cosR = cosf(transform.rotation);
+            float tempX = local.x;
+            local.x = local.x * cosR - local.y * sinR;
+            local.y = tempX * sinR + local.y * cosR;
+        }
+        ECS::Vector2f worldPos = transform.position + local;
+        return worldToScreenWith(m_editorCameraProperties, worldPos);
+    };
     for (const auto& chain : tilemapCollider.generatedChains)
     {
         if (chain.size() < 2) continue;
@@ -795,24 +815,27 @@ void SceneViewPanel::drawTilemapColliderOutline(ImDrawList* drawList, const ECS:
         screenVertices.reserve(chain.size());
         for (const auto& v : chain)
         {
-            ECS::Vector2f local = {v.x + tilemapCollider.offset.x, v.y + tilemapCollider.offset.y};
-            local.x *= transform.scale.x;
-            local.y *= transform.scale.y;
-            if (std::abs(transform.rotation) > 0.001f)
-            {
-                const float sinR = sinf(transform.rotation);
-                const float cosR = cosf(transform.rotation);
-                float tempX = local.x;
-                local.x = local.x * cosR - local.y * sinR;
-                local.y = tempX * sinR + local.y * cosR;
-            }
-            ECS::Vector2f worldPos = transform.position + local;
-            ImVec2 sp = worldToScreenWith(m_editorCameraProperties, worldPos);
-            screenVertices.push_back(sp);
+            screenVertices.push_back(projectPoint(v));
         }
         for (size_t i = 0; i + 1 < screenVertices.size(); ++i)
         {
             drawList->AddLine(screenVertices[i], screenVertices[i + 1], outlineColor, thickness);
+        }
+    }
+    // Custom 瓦片的逐格多边形按闭合环绘制
+    for (const auto& polygon : tilemapCollider.generatedPolygons)
+    {
+        if (polygon.size() < 3) continue;
+        std::vector<ImVec2> screenVertices;
+        screenVertices.reserve(polygon.size());
+        for (const auto& v : polygon)
+        {
+            screenVertices.push_back(projectPoint(v));
+        }
+        for (size_t i = 0; i < screenVertices.size(); ++i)
+        {
+            drawList->AddLine(screenVertices[i], screenVertices[(i + 1) % screenVertices.size()], outlineColor,
+                              thickness);
         }
     }
 }
@@ -859,6 +882,86 @@ void SceneViewPanel::drawSpriteSelectionOutline(ImDrawList* drawList, const ECS:
     {
         int nextI = (i + 1) % 4;
         drawList->AddLine(screenCorners[i], screenCorners[nextI], outlineColor, thickness);
+    }
+}
+void SceneViewPanel::drawSpriteNineSliceGuides(ImDrawList* drawList, const ECS::TransformComponent& transform,
+                                               const ECS::SpriteComponent& sprite, ImU32 lineColor)
+{
+    if (!sprite.image || !sprite.image->getImage()) return;
+    const float sourceWidth = sprite.sourceRect.Width() > 0
+                                  ? sprite.sourceRect.Width()
+                                  : static_cast<float>(sprite.image->getImage()->width());
+    const float sourceHeight = sprite.sourceRect.Height() > 0
+                                   ? sprite.sourceRect.Height()
+                                   : static_cast<float>(sprite.image->getImage()->height());
+    if (sourceWidth <= 0.0f || sourceHeight <= 0.0f) return;
+    // 与渲染提取共用同一钳制逻辑，保证辅助线与实际切割位置一致
+    const ECS::NineSliceBorders borders = ECS::ClampNineSliceBorders(sprite, sourceWidth, sourceHeight);
+    if (borders.left + borders.right + borders.top + borders.bottom <= 0.0001f) return;
+    const int pPU = sprite.image->getImportSettings().pixelPerUnit;
+    const float ppuScaleFactor = (pPU > 0) ? 100.0f / static_cast<float>(pPU) : 1.0f;
+    const float width = sourceWidth * ppuScaleFactor;
+    const float height = sourceHeight * ppuScaleFactor;
+    const ECS::Vector2f anchoredCenter = ComputeAnchoredCenter(transform, width, height);
+    const float signX = (transform.scale.x < 0.0f) ? -1.0f : 1.0f;
+    const float signY = (transform.scale.y < 0.0f) ? -1.0f : 1.0f;
+    const float targetWidth = width * std::abs(transform.scale.x);
+    const float targetHeight = height * std::abs(transform.scale.y);
+    float worldLeft = borders.left * ppuScaleFactor;
+    float worldRight = borders.right * ppuScaleFactor;
+    float worldTop = borders.top * ppuScaleFactor;
+    float worldBottom = borders.bottom * ppuScaleFactor;
+    // 与提取路径一致：目标尺寸小于两侧角所需时等比压缩
+    if (worldLeft + worldRight > targetWidth && worldLeft + worldRight > 0.0f)
+    {
+        const float shrink = targetWidth / (worldLeft + worldRight);
+        worldLeft *= shrink;
+        worldRight *= shrink;
+    }
+    if (worldTop + worldBottom > targetHeight && worldTop + worldBottom > 0.0f)
+    {
+        const float shrink = targetHeight / (worldTop + worldBottom);
+        worldTop *= shrink;
+        worldBottom *= shrink;
+    }
+    // 局部坐标（已含缩放，负缩放取镜像）→ 旋转 → 平移到锚定中心 → 投影到屏幕
+    const float sinR = sinf(transform.rotation);
+    const float cosR = cosf(transform.rotation);
+    auto toScreen = [&](float localX, float localY) -> ImVec2
+    {
+        float x = localX * signX;
+        float y = localY * signY;
+        if (std::abs(transform.rotation) > 0.001f)
+        {
+            const float tempX = x;
+            x = x * cosR - y * sinR;
+            y = tempX * sinR + y * cosR;
+        }
+        return worldToScreenWith(m_editorCameraProperties, anchoredCenter + ECS::Vector2f(x, y));
+    };
+    const float halfWidth = targetWidth * 0.5f;
+    const float halfHeight = targetHeight * 0.5f;
+    constexpr float kGuideThickness = 1.0f;
+    constexpr float kGuideDashSize = 5.0f;
+    if (worldLeft > 0.0001f)
+    {
+        drawDashedLine(drawList, toScreen(-halfWidth + worldLeft, -halfHeight),
+                       toScreen(-halfWidth + worldLeft, halfHeight), lineColor, kGuideThickness, kGuideDashSize);
+    }
+    if (worldRight > 0.0001f)
+    {
+        drawDashedLine(drawList, toScreen(halfWidth - worldRight, -halfHeight),
+                       toScreen(halfWidth - worldRight, halfHeight), lineColor, kGuideThickness, kGuideDashSize);
+    }
+    if (worldTop > 0.0001f)
+    {
+        drawDashedLine(drawList, toScreen(-halfWidth, -halfHeight + worldTop),
+                       toScreen(halfWidth, -halfHeight + worldTop), lineColor, kGuideThickness, kGuideDashSize);
+    }
+    if (worldBottom > 0.0001f)
+    {
+        drawDashedLine(drawList, toScreen(-halfWidth, halfHeight - worldBottom),
+                       toScreen(halfWidth, halfHeight - worldBottom), lineColor, kGuideThickness, kGuideDashSize);
     }
 }
 void SceneViewPanel::drawButtonSelectionOutline(ImDrawList* drawList, const ECS::TransformComponent& transform,

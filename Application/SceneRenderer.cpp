@@ -151,7 +151,9 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
             const auto& sprite = view.get<const ECS::SpriteComponent>(entity);
             if (!sprite.image || !sprite.image->getImage()) continue;
             const int pPU = sprite.image->getImportSettings().pixelPerUnit;
-            ECS::TransformComponent adjustedTransform = transform;
+            // 空 sourceRect 约定为整图，此时子矩形从 (0,0) 起算
+            const float sourceX = sprite.sourceRect.Width() > 0.0f ? sprite.sourceRect.X() : 0.0f;
+            const float sourceY = sprite.sourceRect.Height() > 0.0f ? sprite.sourceRect.Y() : 0.0f;
             const float sourceWidth = sprite.sourceRect.Width() > 0.0f
                                           ? sprite.sourceRect.Width()
                                           : static_cast<float>(sprite.image->getImage()->width());
@@ -162,32 +164,131 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
             const float worldWidth = sourceWidth * ppuScaleFactor;
             const float worldHeight = sourceHeight * ppuScaleFactor;
             const SkPoint anchoredPos = ComputeAnchoredCenter(transform, worldWidth, worldHeight);
-            adjustedTransform.position = ECS::Vector2f(anchoredPos.x(), anchoredPos.y());
-            renderables.emplace_back(Renderable{
-                .entityId = entity,
-                .zIndex = sprite.zIndex,
-                .sortKey = getSortKey(entity),
-                .transform = adjustedTransform,
-                .data = SpriteRenderData{
+            const uint64_t sortKey = getSortKey(entity);
+            // 子 quad 与整图共用同一份渲染数据，仅 sourceRect 不同
+            auto makeSpriteData = [&](const SkRect& subSourceRect) -> SpriteRenderData
+            {
+                return SpriteRenderData{
                     .image = sprite.image->getImage().get(),
                     .material = sprite.material.get(),
                     .wgpuTexture = sprite.image->getNutTexture(),
                     .wgpuMaterial = sprite.wgslMaterial.get(),
-                    .sourceRect = sprite.sourceRect,
+                    .sourceRect = subSourceRect,
                     .color = sprite.color,
                     .filterQuality = static_cast<int>(sprite.image->getImportSettings().filterQuality),
                     .wrapMode = static_cast<int>(sprite.image->getImportSettings().wrapMode),
                     .ppuScaleFactor = ppuScaleFactor,
                     .isUISprite = sprite.image->getNutTexture() ? false : true,
                     // 优先使用 LayerComponent，否则使用 Sprite 的 lightLayer
-                    .lightLayer = registry.any_of<ECS::LayerComponent>(entity) 
+                    .lightLayer = registry.any_of<ECS::LayerComponent>(entity)
                         ? registry.get<ECS::LayerComponent>(entity).GetLayerMask()
                         : sprite.lightLayer.value,
                     // 自发光数据 (Feature: 2d-lighting-enhancement)
                     .emissionColor = sprite.emissionColor,
                     .emissionIntensity = sprite.emissionIntensity
+                };
+            };
+            bool slicedEmitted = false;
+            if (sprite.drawMode == ECS::SpriteDrawMode::Sliced)
+            {
+                const ECS::NineSliceBorders borders = ECS::ClampNineSliceBorders(sprite, sourceWidth, sourceHeight);
+                if (borders.left + borders.right + borders.top + borders.bottom > 0.0001f)
+                {
+                    // 目标尺寸由 transform.scale 定义：四角保持源像素尺寸，四边单向拉伸、中心双向拉伸。
+                    // 负缩放（翻转）取镜像布局，每个子 quad 自身也带同号缩放以翻转内容。
+                    const float signX = (transform.scale.x < 0.0f) ? -1.0f : 1.0f;
+                    const float signY = (transform.scale.y < 0.0f) ? -1.0f : 1.0f;
+                    const float targetWidth = worldWidth * std::abs(transform.scale.x);
+                    const float targetHeight = worldHeight * std::abs(transform.scale.y);
+                    float worldLeft = borders.left * ppuScaleFactor;
+                    float worldRight = borders.right * ppuScaleFactor;
+                    float worldTop = borders.top * ppuScaleFactor;
+                    float worldBottom = borders.bottom * ppuScaleFactor;
+                    // 目标尺寸小于两侧角所需时等比压缩角尺寸，避免角互相穿插
+                    if (worldLeft + worldRight > targetWidth && worldLeft + worldRight > 0.0f)
+                    {
+                        const float shrink = targetWidth / (worldLeft + worldRight);
+                        worldLeft *= shrink;
+                        worldRight *= shrink;
+                    }
+                    if (worldTop + worldBottom > targetHeight && worldTop + worldBottom > 0.0f)
+                    {
+                        const float shrink = targetHeight / (worldTop + worldBottom);
+                        worldTop *= shrink;
+                        worldBottom *= shrink;
+                    }
+                    // 三列/三行的源纹理切割（像素）与目标空间布局（世界单位，含缩放）
+                    const float srcColX[3] = {sourceX, sourceX + borders.left, sourceX + sourceWidth - borders.right};
+                    const float srcColW[3] = {borders.left, sourceWidth - borders.left - borders.right, borders.right};
+                    const float srcRowY[3] = {sourceY, sourceY + borders.top, sourceY + sourceHeight - borders.bottom};
+                    const float srcRowH[3] = {borders.top, sourceHeight - borders.top - borders.bottom, borders.bottom};
+                    const float colWidth[3] = {worldLeft, targetWidth - worldLeft - worldRight, worldRight};
+                    const float colCenterX[3] = {
+                        -targetWidth * 0.5f + worldLeft * 0.5f,
+                        (worldLeft - worldRight) * 0.5f,
+                        targetWidth * 0.5f - worldRight * 0.5f
+                    };
+                    const float rowHeight[3] = {worldTop, targetHeight - worldTop - worldBottom, worldBottom};
+                    const float rowCenterY[3] = {
+                        -targetHeight * 0.5f + worldTop * 0.5f,
+                        (worldTop - worldBottom) * 0.5f,
+                        targetHeight * 0.5f - worldBottom * 0.5f
+                    };
+                    const float sinR = sinf(transform.rotation);
+                    const float cosR = cosf(transform.rotation);
+                    constexpr float kMinPieceSize = 0.0001f;
+                    for (int row = 0; row < 3; ++row)
+                    {
+                        for (int col = 0; col < 3; ++col)
+                        {
+                            // 源区域或目标区域尺寸为 0 的子 quad 直接跳过
+                            if (srcColW[col] <= kMinPieceSize || srcRowH[row] <= kMinPieceSize ||
+                                colWidth[col] <= kMinPieceSize || rowHeight[row] <= kMinPieceSize)
+                            {
+                                continue;
+                            }
+                            // 局部偏移已含缩放（由目标尺寸构造，负缩放取镜像），再旋转，最后平移到锚定中心
+                            float offsetX = colCenterX[col] * signX;
+                            float offsetY = rowCenterY[row] * signY;
+                            if (std::abs(transform.rotation) > 0.0001f)
+                            {
+                                const float tempX = offsetX;
+                                offsetX = offsetX * cosR - offsetY * sinR;
+                                offsetY = tempX * sinR + offsetY * cosR;
+                            }
+                            ECS::TransformComponent pieceTransform = transform;
+                            pieceTransform.position = ECS::Vector2f(anchoredPos.x() + offsetX,
+                                                                    anchoredPos.y() + offsetY);
+                            // 渲染端子 quad 世界尺寸 = 子源尺寸 × ppu × scale，反推缩放：角为 ±1，边/中心为拉伸倍率
+                            pieceTransform.scale = ECS::Vector2f(
+                                signX * colWidth[col] / (srcColW[col] * ppuScaleFactor),
+                                signY * rowHeight[row] / (srcRowH[row] * ppuScaleFactor));
+                            renderables.emplace_back(Renderable{
+                                .entityId = entity,
+                                .zIndex = sprite.zIndex,
+                                .sortKey = sortKey,
+                                .transform = pieceTransform,
+                                .data = makeSpriteData(SkRect::MakeXYWH(srcColX[col], srcRowY[row],
+                                                                        srcColW[col], srcRowH[row]))
+                            });
+                        }
+                    }
+                    slicedEmitted = true;
                 }
-            });
+            }
+            // Simple 模式，或 Sliced 但边距无效（全零）时回退整图单 quad
+            if (!slicedEmitted)
+            {
+                ECS::TransformComponent adjustedTransform = transform;
+                adjustedTransform.position = ECS::Vector2f(anchoredPos.x(), anchoredPos.y());
+                renderables.emplace_back(Renderable{
+                    .entityId = entity,
+                    .zIndex = sprite.zIndex,
+                    .sortKey = sortKey,
+                    .transform = adjustedTransform,
+                    .data = makeSpriteData(sprite.sourceRect)
+                });
+            }
         }
     }
     PROFILE_SCOPE("SceneRenderer::ExtractToRenderableManager - Tilemap Processing");

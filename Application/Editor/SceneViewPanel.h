@@ -159,6 +159,8 @@ private:
     void drawSpriteSelectionOutline(ImDrawList* drawList, const ECS::TransformComponent& transform,
                                     const ECS::SpriteComponent& sprite, ImU32 outlineColor, ImU32 fillColor,
                                     float thickness);
+    void drawSpriteNineSliceGuides(ImDrawList* drawList, const ECS::TransformComponent& transform,
+                                   const ECS::SpriteComponent& sprite, ImU32 lineColor);
     void drawButtonSelectionOutline(ImDrawList* drawList, const ECS::TransformComponent& transform,
                                     const ECS::ButtonComponent& buttonComp, ImU32 outlineColor, ImU32 fillColor,
                                     float thickness);

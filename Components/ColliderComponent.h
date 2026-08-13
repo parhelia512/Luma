@@ -113,9 +113,10 @@ namespace ECS
     struct TilemapColliderComponent : public ColliderComponent
     {
         std::vector<std::vector<Vector2f>> generatedChains; ///< 生成的瓦片地图碰撞链的顶点列表。
+        std::vector<std::vector<Vector2f>> generatedPolygons; ///< Custom 瓦片逐格生成的多边形顶点列表（tilemap 局部像素坐标，已含放置朝向变换）。
 
         std::vector<b2ChainId> runtimeChains; ///< 运行时Box2D链形状的ID列表（兼容旧实现）。
-        std::vector<b2ShapeId> runtimeShapes; ///< 运行时Box2D多边形形状的ID列表（薄条多边形）。
+        std::vector<b2ShapeId> runtimeShapes; ///< 运行时Box2D多边形形状的ID列表（薄条多边形与Custom多边形共用）。
     };
 }
 

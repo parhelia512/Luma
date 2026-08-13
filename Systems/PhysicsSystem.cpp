@@ -1041,6 +1041,33 @@ namespace Systems
                     tilemapCollider.runtimeShapes.push_back(sid);
                 }
             }
+
+            // Custom 瓦片的逐格多边形：顶点已在生成端变换到 tilemap 局部像素坐标，
+            // 这里仅做与链相同的 偏移/缩放/Y翻转/米制 转换；b2ComputeHull 对非凸输入取凸包兜底
+            for (const auto& polygonVerts : tilemapCollider.generatedPolygons)
+            {
+                if (polygonVerts.size() < 3) continue;
+
+                std::vector<b2Vec2> b2Vertices;
+                b2Vertices.reserve(polygonVerts.size());
+                for (const auto& v : polygonVerts)
+                {
+                    b2Vertices.push_back({
+                        (v.x + tilemapCollider.offset.x) * scale.x * METER_PER_PIXEL,
+                        -(v.y + tilemapCollider.offset.y) * scale.y * METER_PER_PIXEL
+                    });
+                }
+
+                b2Hull hull = b2ComputeHull(b2Vertices.data(), static_cast<int32_t>(b2Vertices.size()));
+                if (hull.count < 3) continue; // 共线/重合顶点导致的退化多边形直接跳过
+
+                b2Polygon polygon = b2MakePolygon(&hull, 0.0f);
+                b2ShapeId sid = b2CreatePolygonShape(bodyId, &shapeDef, &polygon);
+                if (sid.index1 != B2_NULL_INDEX)
+                {
+                    tilemapCollider.runtimeShapes.push_back(sid);
+                }
+            }
         }
     }
 

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "Components/Sprite.h"
+#include "AssetImporterRegistry.h"
 #include <variant>
+#include <vector>
 #include <yaml-cpp/yaml.h>
 
 /**
@@ -11,6 +13,9 @@ enum class TileType {
     Sprite, ///< 精灵瓦片类型。
     Prefab  ///< 预制体瓦片类型。
 };
+
+/// @brief 自定义瓦片碰撞多边形的顶点数上限（Box2D 凸多边形顶点上限）。
+inline constexpr size_t kTileColliderMaxVertices = 8;
 
 /**
  * @brief 存储精灵瓦片的数据。
@@ -22,6 +27,9 @@ struct SpriteTileData
     ECS::Color color = ECS::Colors::White; ///< 瓦片的颜色。
     ECS::FilterQuality filterQuality = ECS::FilterQuality::Bilinear; ///< 纹理过滤质量。
     ECS::WrapMode wrapMode = ECS::WrapMode::Clamp; ///< 纹理环绕模式。
+
+    int colliderType = 1; ///< 物理形状：0=None 无碰撞，1=Full 整格盒，2=Custom 自定义多边形。默认 Full 保持旧资产"所有精灵瓦片参与碰撞"的行为。
+    std::vector<ECS::Vector2f> colliderVertices; ///< Custom 时的多边形顶点，瓦片局部归一化坐标（(0,0)=左上，(1,1)=右下，y 向下），最多 kTileColliderMaxVertices 个。
 };
 
 /**
@@ -57,6 +65,11 @@ namespace YAML
             node["color"] = rhs.color;
             node["filterQuality"] = static_cast<int>(rhs.filterQuality);
             node["wrapMode"] = static_cast<int>(rhs.wrapMode);
+            node["colliderType"] = rhs.colliderType;
+            if (!rhs.colliderVertices.empty())
+            {
+                node["colliderVertices"] = rhs.colliderVertices;
+            }
             return node;
         }
 
@@ -77,6 +90,16 @@ namespace YAML
                 rhs.filterQuality = static_cast<ECS::FilterQuality>(node["filterQuality"].as<int>());
             if (node["wrapMode"])
                 rhs.wrapMode = static_cast<ECS::WrapMode>(node["wrapMode"].as<int>());
+            // 向后兼容：旧资产无 colliderType 字段时默认 Full，维持"精灵瓦片全部参与碰撞"的旧语义
+            rhs.colliderType = node["colliderType"].as<int>(1);
+            if (rhs.colliderType < 0 || rhs.colliderType > 2)
+                rhs.colliderType = 1;
+            if (node["colliderVertices"])
+                rhs.colliderVertices = node["colliderVertices"].as<std::vector<ECS::Vector2f>>();
+            else
+                rhs.colliderVertices.clear();
+            if (rhs.colliderVertices.size() > kTileColliderMaxVertices)
+                rhs.colliderVertices.resize(kTileColliderMaxVertices);
             return true;
         }
     };
@@ -165,4 +188,14 @@ namespace YAML
             return true;
         }
     };
+}
+
+/**
+ * @brief 注册 Tile 资产的序列化接口。
+ * 不注册反射属性：瓦片属性（物理形状等）由资产检视器以专用 UI 绘制。
+ */
+REGISTRY
+{
+    // (void) 避免 most vexing parse：无链式调用时该行会被解析为变量声明
+    (void)AssetRegistry_<TileAssetData>(AssetType::Tile);
 }

@@ -10,11 +10,16 @@
 #include <any>
 #include <cctype>
 #include <algorithm>
+#include <limits>
+#include <variant>
 #include <unordered_set>
 #include "Resources/RuntimeAsset/RuntimeScene.h"
 #include "Editor.h"
 #include "TextureSlicerPanel.h"
 #include "ShaderEditorPanel.h"
+#include "ImGuiRenderer.h"
+#include "Data/Tile.h"
+#include "Loaders/TextureLoader.h"
 
 namespace
 {
@@ -103,6 +108,40 @@ namespace
         std::sort(output.begin(), output.end());
         return output;
     }
+
+    /**
+     * @brief 判断多边形是否为凸（按顶点顺序检查相邻边叉积符号是否一致）。
+     */
+    bool IsConvexPolygon(const std::vector<ECS::Vector2f>& vertices)
+    {
+        const size_t count = vertices.size();
+        if (count < 4) return true;
+        bool hasPositive = false;
+        bool hasNegative = false;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const ECS::Vector2f& a = vertices[i];
+            const ECS::Vector2f& b = vertices[(i + 1) % count];
+            const ECS::Vector2f& c = vertices[(i + 2) % count];
+            const float cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+            if (cross > 1e-6f) hasPositive = true;
+            else if (cross < -1e-6f) hasNegative = true;
+            if (hasPositive && hasNegative) return false;
+        }
+        return true;
+    }
+
+    float PointSegmentDistSq(const ECS::Vector2f& p, const ECS::Vector2f& a, const ECS::Vector2f& b)
+    {
+        const float abx = b.x - a.x;
+        const float aby = b.y - a.y;
+        const float lenSq = abx * abx + aby * aby;
+        float t = lenSq > 1e-12f ? ((p.x - a.x) * abx + (p.y - a.y) * aby) / lenSq : 0.0f;
+        t = std::clamp(t, 0.0f, 1.0f);
+        const float dx = p.x - (a.x + t * abx);
+        const float dy = p.y - (a.y + t * aby);
+        return dx * dx + dy * dy;
+    }
 }
 void AssetInspectorPanel::Initialize(EditorContext* context)
 {
@@ -148,6 +187,9 @@ void AssetInspectorPanel::Shutdown()
     m_groupMixed = false;
     m_addressDirty = false;
     m_groupDirty = false;
+    m_tileVertexDragIndex = -1;
+    m_tilePreviewTexture = nullptr;
+    m_tilePreviewTextureGuid = Guid();
 }
 void AssetInspectorPanel::resetStateFromSelection()
 {
@@ -163,6 +205,7 @@ void AssetInspectorPanel::resetStateFromSelection()
     m_groupMixed = false;
     m_addressDirty = false;
     m_groupDirty = false;
+    m_tileVertexDragIndex = -1;
     m_editingAssetType = AssetType::Unknown;
     if (m_currentEditingPaths.empty()) return;
     const AssetMetadata* firstMetadata = nullptr;
@@ -374,6 +417,11 @@ void AssetInspectorPanel::drawInspectorUI()
             }
         }
     }
+    if (m_editingAssetType == AssetType::Tile && m_currentEditingPaths.size() == 1 && dataPtr)
+    {
+        PROFILE_SCOPE("AssetInspectorPanel::TileColliderEditor");
+        drawTileColliderEditor(dataPtr);
+    }
     if (m_editingAssetType == AssetType::Texture && m_currentEditingPaths.size() == 1)
     {
         PROFILE_SCOPE("AssetInspectorPanel::TextureSlicerButton");
@@ -406,6 +454,202 @@ void AssetInspectorPanel::drawInspectorUI()
                 resetStateFromSelection();
             }
         }
+    }
+}
+void AssetInspectorPanel::drawTileColliderEditor(void* dataPtr)
+{
+    auto* tileData = static_cast<TileAssetData*>(dataPtr);
+    auto* spriteData = std::get_if<SpriteTileData>(tileData);
+    if (!spriteData)
+    {
+        return; // 预制体瓦片没有瓦片级物理形状
+    }
+
+    ImGui::Separator();
+    ImGui::Text("物理形状");
+
+    bool changed = false;
+    const char* colliderTypeNames[] = {"无碰撞", "整格碰撞", "自定义多边形"};
+    int colliderType = (spriteData->colliderType < 0 || spriteData->colliderType > 2) ? 1 : spriteData->colliderType;
+    if (ImGui::Combo("碰撞类型", &colliderType, colliderTypeNames, IM_ARRAYSIZE(colliderTypeNames)))
+    {
+        spriteData->colliderType = colliderType;
+        // 切到自定义且尚无顶点时以整格四角起步
+        if (colliderType == 2 && spriteData->colliderVertices.empty())
+        {
+            spriteData->colliderVertices = {
+                {0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}
+            };
+        }
+        changed = true;
+    }
+
+    if (spriteData->colliderType == 2)
+    {
+        auto& vertices = spriteData->colliderVertices;
+
+        // 预览纹理按 GUID 缓存，选中其它瓦片或换贴图时失效
+        const Guid textureGuid = spriteData->textureHandle.assetGuid;
+        if (m_tilePreviewTextureGuid != textureGuid)
+        {
+            m_tilePreviewTexture = nullptr;
+            m_tilePreviewTextureGuid = textureGuid;
+            if (textureGuid.Valid() && m_context->graphicsBackend)
+            {
+                TextureLoader textureLoader(*m_context->graphicsBackend);
+                m_tilePreviewTexture = textureLoader.LoadAsset(textureGuid);
+            }
+        }
+
+        const float canvasSize = 128.0f;
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        const ImVec2 canvasPos = ImGui::GetCursorScreenPos();
+        const ImVec2 canvasMax = ImVec2(canvasPos.x + canvasSize, canvasPos.y + canvasSize);
+        ImGui::InvisibleButton("##TileColliderCanvas", ImVec2(canvasSize, canvasSize));
+        const bool canvasHovered = ImGui::IsItemHovered();
+
+        drawList->AddRectFilled(canvasPos, canvasMax, IM_COL32(30, 30, 30, 255));
+        if (m_tilePreviewTexture && m_tilePreviewTexture->getNutTexture() && m_context->imguiRenderer)
+        {
+            ImVec2 uv0(0.0f, 0.0f);
+            ImVec2 uv1(1.0f, 1.0f);
+            const ECS::RectF& rect = spriteData->sourceRect;
+            if (m_tilePreviewTexture->getImage() && rect.Width() > 0.0f && rect.Height() > 0.0f)
+            {
+                const float texW = static_cast<float>(m_tilePreviewTexture->getImage()->width());
+                const float texH = static_cast<float>(m_tilePreviewTexture->getImage()->height());
+                if (texW > 0.0f && texH > 0.0f)
+                {
+                    uv0 = ImVec2(rect.x / texW, rect.y / texH);
+                    uv1 = ImVec2((rect.x + rect.Width()) / texW, (rect.y + rect.Height()) / texH);
+                }
+            }
+            ImTextureID texId = m_context->imguiRenderer->GetOrCreateTextureIdFor(
+                m_tilePreviewTexture->getNutTexture()->GetTexture());
+            drawList->AddImage(texId, canvasPos, canvasMax, uv0, uv1);
+        }
+        drawList->AddRect(canvasPos, canvasMax, IM_COL32(120, 120, 120, 255));
+
+        auto toScreen = [&](const ECS::Vector2f& v)
+        {
+            return ImVec2(canvasPos.x + v.x * canvasSize, canvasPos.y + v.y * canvasSize);
+        };
+        auto toNormalized = [&](const ImVec2& p)
+        {
+            return ECS::Vector2f(std::clamp((p.x - canvasPos.x) / canvasSize, 0.0f, 1.0f),
+                                 std::clamp((p.y - canvasPos.y) / canvasSize, 0.0f, 1.0f));
+        };
+        const ImVec2 mousePos = ImGui::GetIO().MousePos;
+
+        // 命中检测：8 像素内最近顶点
+        int hoveredVertex = -1;
+        float bestDistSq = 8.0f * 8.0f;
+        for (int i = 0; i < static_cast<int>(vertices.size()); ++i)
+        {
+            const ImVec2 sp = toScreen(vertices[i]);
+            const float dx = sp.x - mousePos.x;
+            const float dy = sp.y - mousePos.y;
+            const float distSq = dx * dx + dy * dy;
+            if (distSq < bestDistSq)
+            {
+                bestDistSq = distSq;
+                hoveredVertex = i;
+            }
+        }
+
+        // 撤销等外部操作可能收缩顶点数组，防拖拽下标越界
+        if (m_tileVertexDragIndex >= static_cast<int>(vertices.size()))
+        {
+            m_tileVertexDragIndex = -1;
+        }
+
+        if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            if (hoveredVertex >= 0)
+            {
+                m_tileVertexDragIndex = hoveredVertex;
+            }
+            else if (vertices.size() < kTileColliderMaxVertices)
+            {
+                const ECS::Vector2f newVertex = toNormalized(mousePos);
+                size_t insertIndex = vertices.size();
+                if (vertices.size() >= 3)
+                {
+                    // 插到距点击位置最近的边之后，保持轮廓顺序
+                    float bestEdgeDistSq = std::numeric_limits<float>::max();
+                    for (size_t i = 0; i < vertices.size(); ++i)
+                    {
+                        const float distSq = PointSegmentDistSq(newVertex, vertices[i],
+                                                                vertices[(i + 1) % vertices.size()]);
+                        if (distSq < bestEdgeDistSq)
+                        {
+                            bestEdgeDistSq = distSq;
+                            insertIndex = i + 1;
+                        }
+                    }
+                }
+                vertices.insert(vertices.begin() + insertIndex, newVertex);
+                m_tileVertexDragIndex = static_cast<int>(insertIndex);
+                changed = true;
+            }
+        }
+        if (m_tileVertexDragIndex >= 0)
+        {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            {
+                const ECS::Vector2f dragged = toNormalized(mousePos);
+                if (dragged.x != vertices[m_tileVertexDragIndex].x || dragged.y != vertices[m_tileVertexDragIndex].y)
+                {
+                    vertices[m_tileVertexDragIndex] = dragged;
+                    changed = true;
+                }
+            }
+            else
+            {
+                m_tileVertexDragIndex = -1;
+            }
+        }
+        if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && hoveredVertex >= 0)
+        {
+            vertices.erase(vertices.begin() + hoveredVertex);
+            m_tileVertexDragIndex = -1;
+            hoveredVertex = -1;
+            changed = true;
+        }
+
+        const ImU32 lineColor = IM_COL32(0, 255, 0, 220);
+        if (vertices.size() >= 2)
+        {
+            const size_t count = vertices.size();
+            const size_t edgeCount = count >= 3 ? count : count - 1;
+            for (size_t i = 0; i < edgeCount; ++i)
+            {
+                drawList->AddLine(toScreen(vertices[i]), toScreen(vertices[(i + 1) % count]), lineColor, 1.5f);
+            }
+        }
+        for (int i = 0; i < static_cast<int>(vertices.size()); ++i)
+        {
+            const bool active = (i == m_tileVertexDragIndex) || (i == hoveredVertex && m_tileVertexDragIndex < 0);
+            drawList->AddCircleFilled(toScreen(vertices[i]), active ? 5.0f : 3.5f,
+                                      active ? IM_COL32(255, 200, 60, 255) : IM_COL32(0, 255, 0, 255));
+        }
+
+        ImGui::Text("顶点 %zu/%zu（左键添加/拖动，右键删除）", vertices.size(), kTileColliderMaxVertices);
+        if (vertices.size() < 3)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "至少 3 个顶点才会生成碰撞");
+        }
+        else if (!IsConvexPolygon(vertices))
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "非凸多边形：物理生成时将取其凸包");
+        }
+    }
+
+    if (changed)
+    {
+        // 该资产的 YAML 根只有 Type/Data 两个键，整体标脏后走通用的 应用→保存→重导入 流程
+        m_dirtyProperties.insert("Type");
+        m_dirtyProperties.insert("Data");
     }
 }
 void AssetInspectorPanel::applyChanges()

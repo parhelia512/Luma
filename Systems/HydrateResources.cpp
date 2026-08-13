@@ -22,6 +22,7 @@
 #include "Loaders/PrefabLoader.h"
 #include "Loaders/RuleTileLoader.h"
 #include "Loaders/TileLoader.h"
+#include "Managers/RuntimeTileManager.h"
 
 namespace Systems
 {
@@ -209,6 +210,42 @@ namespace Systems
                             inputText.placeholder.fontHandle.assetGuid == event.guid)
                         {
                             OnInputTextUpdated(registry, entity);
+                        }
+                    }
+                }
+                else if (event.assetType == AssetType::Tile)
+                {
+                    // 先失效运行时瓦片缓存，否则重新水合时 TileLoader 仍命中旧数据
+                    RuntimeTileManager::GetInstance().TryRemoveAsset(event.guid);
+
+                    auto tilemapView = registry.view<ECS::TilemapComponent>();
+                    for (auto entity : tilemapView)
+                    {
+                        auto& tilemap = tilemapView.get<ECS::TilemapComponent>(entity);
+                        bool references = false;
+                        for (const auto& [coord, inst] : tilemap.normalTiles)
+                        {
+                            if (inst.handle.assetGuid == event.guid)
+                            {
+                                references = true;
+                                break;
+                            }
+                        }
+                        if (!references)
+                        {
+                            // 规则瓦片的解析输出也可能引用该瓦片，查已解析缓存
+                            for (const auto& [coord, resolved] : tilemap.runtimeTileCache)
+                            {
+                                if (resolved.sourceTileAsset.assetGuid == event.guid)
+                                {
+                                    references = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (references)
+                        {
+                            OnTilemapUpdated(registry, entity);
                         }
                     }
                 }
@@ -1067,6 +1104,7 @@ namespace Systems
         {
             auto& tilemapCollider = registry.get<ECS::TilemapColliderComponent>(entity);
             tilemapCollider.generatedChains.clear();
+            tilemapCollider.generatedPolygons.clear();
 
             auto isSolid = [&](const ECS::Vector2i& coord) -> bool
             {
@@ -1081,7 +1119,8 @@ namespace Systems
                     using T = std::decay_t<decltype(tileData)>;
                     if constexpr (std::is_same_v<T, SpriteTileData>)
                     {
-                        return true;
+                        // 仅 Full(1) 参与链式合并；None(0) 无碰撞，Custom(2) 走逐格独立多边形
+                        return tileData.colliderType == 1;
                     }
                     return false;
                 }, it->second.data);
@@ -1190,6 +1229,59 @@ namespace Systems
                         }
                     }
                 }
+            }
+
+            // Custom 格逐格生成独立多边形（不参与上方的链式合并）。
+            // 顶点映射：归一化 (u,v)（(0,0)=瓦片左上，y 向下）先平移到瓦片中心为原点，
+            // 与渲染端约定一致地先翻转（负缩放）再按顺时针 90° 步进旋转，
+            // 最后平移到格中心 coord*cellSize（格子像素范围 [coord-0.5, coord+0.5]*cellSize）。
+            for (const auto& [coord, resolved] : tilemap.runtimeTileCache)
+            {
+                const auto* spriteData = std::get_if<SpriteTileData>(&resolved.data);
+                if (!spriteData || spriteData->colliderType != 2)
+                {
+                    continue;
+                }
+                const size_t vertexCount = std::min(spriteData->colliderVertices.size(), kTileColliderMaxVertices);
+                if (vertexCount < 3)
+                {
+                    continue;
+                }
+
+                std::vector<ECS::Vector2f> polygon;
+                polygon.reserve(vertexCount);
+                for (size_t i = 0; i < vertexCount; ++i)
+                {
+                    float x = spriteData->colliderVertices[i].x - 0.5f;
+                    float y = spriteData->colliderVertices[i].y - 0.5f;
+                    if (resolved.flipX) x = -x;
+                    if (resolved.flipY) y = -y;
+                    switch (resolved.rotation & 3)
+                    {
+                    case 1: // 90° 顺时针：(x,y)->(-y,x)
+                        {
+                            const float t = x;
+                            x = -y;
+                            y = t;
+                            break;
+                        }
+                    case 2: // 180°：(x,y)->(-x,-y)
+                        x = -x;
+                        y = -y;
+                        break;
+                    case 3: // 270° 顺时针：(x,y)->(y,-x)
+                        {
+                            const float t = x;
+                            x = y;
+                            y = -t;
+                            break;
+                        }
+                    default:
+                        break;
+                    }
+                    polygon.emplace_back((coord.x + x) * cellWidth, (coord.y + y) * cellHeight);
+                }
+                tilemapCollider.generatedPolygons.push_back(std::move(polygon));
             }
 
             tilemapCollider.isDirty = true;
