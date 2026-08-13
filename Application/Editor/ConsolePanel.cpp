@@ -116,11 +116,11 @@ void ConsolePanel::drawToolbar()
     {
         if (!errorFilterActive)
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.216f, 0.224f, 0.235f, 1.0f));
         }
         else
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.62f, 0.24f, 0.24f, 1.0f));
         }
         errorPressed = ImGui::Button(std::format("{}  {}", getLogLevelIcon(LogLevel::Error), errorCount).c_str());
         ImGui::PopStyleColor();
@@ -142,11 +142,11 @@ void ConsolePanel::drawToolbar()
     {
         if (!warningFilterActive)
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.216f, 0.224f, 0.235f, 1.0f));
         }
         else
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f, 0.7f, 0.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.66f, 0.52f, 0.14f, 1.0f));
         }
         warningPressed = ImGui::Button(std::format("{}  {}", getLogLevelIcon(LogLevel::Warning), warningCount).c_str());
         ImGui::PopStyleColor();
@@ -168,11 +168,11 @@ void ConsolePanel::drawToolbar()
     {
         if (!infoFilterActive)
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.216f, 0.224f, 0.235f, 1.0f));
         }
         else
         {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 1.0f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.227f, 0.396f, 0.561f, 1.0f));
         }
         infoPressed = ImGui::Button(std::format("{}  {}", getLogLevelIcon(LogLevel::Info), infoCount).c_str());
         ImGui::PopStyleColor();

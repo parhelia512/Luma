@@ -318,8 +318,8 @@ void ShaderEditorPanel::RenderAutoCompletePopup()
             bool isSelected = (i == m_autoCompleteSelectedIndex);
             if (isSelected)
             {
-                ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.3f, 0.5f, 0.8f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.4f, 0.6f, 0.9f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
+                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
             }
             const char* typeIcon = "";
             ImVec4 typeColor;

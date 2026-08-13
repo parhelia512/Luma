@@ -131,6 +131,10 @@ void InspectorPanel::Update(float deltaTime)
 void InspectorPanel::Draw()
 {
     PROFILE_FUNCTION();
+    // 组件折叠头使用中性灰（Unity 风格），蓝色 Header 仅保留给列表选中高亮。
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.20f, 0.21f, 0.22f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.24f, 0.25f, 0.27f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.28f, 0.29f, 0.31f, 1.00f));
     ImGui::Begin(GetPanelName(), &m_isVisible);
     m_isFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     drawLockButton();
@@ -171,6 +175,7 @@ void InspectorPanel::Draw()
         break;
     }
     ImGui::End();
+    ImGui::PopStyleColor(3);
 }
 void InspectorPanel::Shutdown()
 {

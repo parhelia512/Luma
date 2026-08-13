@@ -172,7 +172,7 @@ void ImGuiRenderer::ProcessEvent(const SDL_Event& event)
 void ImGuiRenderer::ApplyEditorStyle()
 {
     ImGuiStyle& style = ImGui::GetStyle();
-    
+
 #if defined(SDL_PLATFORM_ANDROID) || defined(__ANDROID__)
     float touchScale = 1.5f;
     style.WindowPadding = ImVec2(12.0f * touchScale, 12.0f * touchScale);
@@ -184,77 +184,108 @@ void ImGuiRenderer::ApplyEditorStyle()
     style.GrabMinSize = 16.0f * touchScale;
     style.TouchExtraPadding = ImVec2(8.0f, 8.0f); // 触摸额外边距
 #else
-    style.WindowPadding = ImVec2(8.0f, 8.0f);
-    style.FramePadding = ImVec2(6.0f, 4.0f);
-    style.CellPadding = ImVec2(4.0f, 2.0f);
-    style.ItemSpacing = ImVec2(6.0f, 4.0f);
-    style.ItemInnerSpacing = ImVec2(4.0f, 4.0f);
-    style.ScrollbarSize = 12.0f;
-    style.GrabMinSize = 10.0f;
+    style.WindowPadding = ImVec2(10.0f, 8.0f);
+    style.FramePadding = ImVec2(8.0f, 4.5f);
+    style.CellPadding = ImVec2(6.0f, 3.0f);
+    style.ItemSpacing = ImVec2(8.0f, 5.0f);
+    style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
+    style.ScrollbarSize = 13.0f;
+    style.GrabMinSize = 12.0f;
 #endif
+    style.IndentSpacing = 14.0f;
+    style.WindowTitleAlign = ImVec2(0.02f, 0.50f);
+    style.SeparatorTextBorderSize = 2.0f;
+    style.SeparatorTextPadding = ImVec2(16.0f, 2.0f);
+
+    // 扁平化：仅保留窗口/弹窗描边，去掉控件描边。
     style.WindowBorderSize = 1.0f;
-    style.ChildBorderSize = 1.0f;
+    style.ChildBorderSize = 0.0f;
     style.PopupBorderSize = 1.0f;
-    style.FrameBorderSize = 1.0f;
-    style.TabBorderSize = 1.0f;
-    style.WindowRounding = 4.0f;
+    style.FrameBorderSize = 0.0f;
+    style.TabBorderSize = 0.0f;
+    style.TabBarBorderSize = 1.0f;
+    style.TabBarOverlineSize = 2.0f;
+    style.DockingSeparatorSize = 2.0f;
+
+    style.WindowRounding = 6.0f;
     style.ChildRounding = 4.0f;
     style.FrameRounding = 3.0f;
-    style.PopupRounding = 4.0f;
-    style.ScrollbarRounding = 9.0f;
+    style.PopupRounding = 5.0f;
+    style.ScrollbarRounding = 12.0f;
     style.GrabRounding = 3.0f;
     style.TabRounding = 4.0f;
+
+    // 现代深色主题：中性深灰底 + 低饱和强调（参考 Unity 6 / Godot 4 深色风格）。
+    // 选中态用 Godot 式低调蓝灰（CollapsingHeader/TreeNode 共用此色，必须足够内敛），
+    // 小元素（勾选/滑块/标签强调线）用略亮的低饱和蓝，避免 ImGui 默认高饱和亮蓝。
+    const ImVec4 selection(0.212f, 0.259f, 0.318f, 1.00f);       // 列表/树选中底色（蓝灰）
+    const ImVec4 selectionHovered(0.247f, 0.302f, 0.369f, 1.00f);// 选中悬停
+    const ImVec4 selectionActive(0.286f, 0.349f, 0.424f, 1.00f); // 选中按下
+    const ImVec4 accent(0.357f, 0.557f, 0.769f, 1.00f);          // 小元素强调（勾选/滑块/强调线）
+    const ImVec4 bgDeepest(0.086f, 0.090f, 0.094f, 1.00f);       // 标题栏 / 最底层
+    const ImVec4 bgWindow(0.118f, 0.122f, 0.129f, 1.00f);        // 面板底
+    const ImVec4 bgElevated(0.157f, 0.163f, 0.173f, 1.00f);      // 控件底 / 菜单栏
+    const ImVec4 bgHovered(0.216f, 0.224f, 0.235f, 1.00f);       // 控件悬停
+    const ImVec4 bgActive(0.263f, 0.275f, 0.290f, 1.00f);        // 控件按下
+
     ImVec4* colors = style.Colors;
-    colors[ImGuiCol_Text] = ImVec4(0.95f, 0.96f, 0.98f, 1.00f);
-    colors[ImGuiCol_TextDisabled] = ImVec4(0.36f, 0.42f, 0.47f, 1.00f);
-    colors[ImGuiCol_WindowBg] = ImVec4(0.11f, 0.12f, 0.13f, 1.00f);
-    colors[ImGuiCol_ChildBg] = ImVec4(0.15f, 0.16f, 0.17f, 1.00f);
-    colors[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.08f, 0.08f, 0.94f);
-    colors[ImGuiCol_Border] = ImVec4(0.20f, 0.22f, 0.24f, 1.00f);
+    colors[ImGuiCol_Text] = ImVec4(0.92f, 0.93f, 0.94f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.52f, 0.55f, 1.00f);
+    colors[ImGuiCol_WindowBg] = bgWindow;
+    colors[ImGuiCol_ChildBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.100f, 0.104f, 0.110f, 0.99f);
+    colors[ImGuiCol_Border] = ImVec4(0.045f, 0.047f, 0.049f, 0.90f);
     colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.20f, 0.21f, 0.22f, 0.54f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.40f, 0.40f, 0.40f, 0.40f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.18f, 0.18f, 0.18f, 0.67f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.09f, 0.09f, 0.09f, 1.00f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.20f, 0.22f, 0.24f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.00f, 0.00f, 0.00f, 0.51f);
-    colors[ImGuiCol_MenuBarBg] = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
-    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.02f, 0.02f, 0.02f, 0.53f);
-    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.41f, 0.41f, 0.41f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.51f, 0.51f, 0.51f, 1.00f);
-    colors[ImGuiCol_CheckMark] = ImVec4(0.56f, 0.80f, 0.26f, 1.00f);
-    colors[ImGuiCol_SliderGrab] = ImVec4(0.51f, 0.76f, 0.28f, 1.00f);
-    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.66f, 0.90f, 0.42f, 1.00f);
-    colors[ImGuiCol_Button] = ImVec4(0.25f, 0.52f, 0.96f, 0.40f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.28f, 0.56f, 0.98f, 1.00f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.06f, 0.53f, 0.98f, 1.00f);
-    colors[ImGuiCol_Header] = ImVec4(0.26f, 0.59f, 0.98f, 0.31f);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.26f, 0.59f, 0.98f, 0.80f);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
-    colors[ImGuiCol_Separator] = colors[ImGuiCol_Border];
-    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.10f, 0.40f, 0.75f, 0.78f);
-    colors[ImGuiCol_SeparatorActive] = ImVec4(0.10f, 0.40f, 0.75f, 1.00f);
-    colors[ImGuiCol_ResizeGrip] = ImVec4(0.26f, 0.59f, 0.98f, 0.25f);
-    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.26f, 0.59f, 0.98f, 0.67f);
-    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.26f, 0.59f, 0.98f, 0.95f);
-    colors[ImGuiCol_Tab] = ImVec4(0.18f, 0.35f, 0.58f, 0.86f);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.26f, 0.59f, 0.98f, 0.80f);
-    colors[ImGuiCol_TabActive] = ImVec4(0.20f, 0.41f, 0.68f, 1.00f);
-    colors[ImGuiCol_TabUnfocused] = ImVec4(0.09f, 0.21f, 0.38f, 0.97f);
-    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.14f, 0.26f, 0.42f, 1.00f);
-    colors[ImGuiCol_DockingPreview] = ImVec4(0.26f, 0.59f, 0.98f, 0.70f);
-    colors[ImGuiCol_DockingEmptyBg] = ImVec4(0.20f, 0.20f, 0.20f, 1.00f);
-    colors[ImGuiCol_PlotLines] = ImVec4(0.61f, 0.61f, 0.61f, 1.00f);
-    colors[ImGuiCol_PlotLinesHovered] = ImVec4(1.00f, 0.43f, 0.35f, 1.00f);
-    colors[ImGuiCol_PlotHistogram] = ImVec4(0.90f, 0.70f, 0.00f, 1.00f);
-    colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
-    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.26f, 0.59f, 0.98f, 0.35f);
-    colors[ImGuiCol_DragDropTarget] = ImVec4(1.00f, 1.00f, 0.00f, 0.90f);
-    colors[ImGuiCol_NavHighlight] = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    colors[ImGuiCol_FrameBg] = bgElevated;
+    colors[ImGuiCol_FrameBgHovered] = bgHovered;
+    colors[ImGuiCol_FrameBgActive] = bgActive;
+    colors[ImGuiCol_TitleBg] = bgDeepest;
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.104f, 0.108f, 0.114f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed] = bgDeepest;
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.104f, 0.108f, 0.114f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.29f, 0.30f, 0.32f, 0.80f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.37f, 0.39f, 0.41f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.45f, 0.47f, 0.50f, 1.00f);
+    colors[ImGuiCol_CheckMark] = accent;
+    colors[ImGuiCol_SliderGrab] = ImVec4(accent.x, accent.y, accent.z, 0.85f);
+    colors[ImGuiCol_SliderGrabActive] = accent;
+    colors[ImGuiCol_Button] = ImVec4(0.216f, 0.224f, 0.235f, 0.85f);
+    colors[ImGuiCol_ButtonHovered] = bgActive;
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.31f, 0.32f, 0.34f, 1.00f);
+    colors[ImGuiCol_Header] = selection;
+    colors[ImGuiCol_HeaderHovered] = selectionHovered;
+    colors[ImGuiCol_HeaderActive] = selectionActive;
+    colors[ImGuiCol_Separator] = ImVec4(0.22f, 0.23f, 0.24f, 0.80f);
+    colors[ImGuiCol_SeparatorHovered] = ImVec4(accent.x, accent.y, accent.z, 0.55f);
+    colors[ImGuiCol_SeparatorActive] = accent;
+    colors[ImGuiCol_ResizeGrip] = ImVec4(accent.x, accent.y, accent.z, 0.18f);
+    colors[ImGuiCol_ResizeGripHovered] = ImVec4(accent.x, accent.y, accent.z, 0.55f);
+    colors[ImGuiCol_ResizeGripActive] = accent;
+    colors[ImGuiCol_Tab] = ImVec4(0.104f, 0.108f, 0.114f, 1.00f);
+    colors[ImGuiCol_TabHovered] = bgHovered;
+    colors[ImGuiCol_TabSelected] = bgElevated;
+    colors[ImGuiCol_TabSelectedOverline] = accent;
+    colors[ImGuiCol_TabDimmed] = bgDeepest;
+    colors[ImGuiCol_TabDimmedSelected] = bgWindow;
+    colors[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_DockingPreview] = ImVec4(accent.x, accent.y, accent.z, 0.40f);
+    colors[ImGuiCol_DockingEmptyBg] = bgDeepest;
+    colors[ImGuiCol_PlotLines] = ImVec4(0.55f, 0.57f, 0.60f, 1.00f);
+    colors[ImGuiCol_PlotLinesHovered] = accent;
+    colors[ImGuiCol_PlotHistogram] = ImVec4(accent.x, accent.y, accent.z, 0.90f);
+    colors[ImGuiCol_PlotHistogramHovered] = accent;
+    colors[ImGuiCol_TableHeaderBg] = bgElevated;
+    colors[ImGuiCol_TableBorderStrong] = ImVec4(0.045f, 0.047f, 0.049f, 1.00f);
+    colors[ImGuiCol_TableBorderLight] = ImVec4(0.19f, 0.20f, 0.21f, 1.00f);
+    colors[ImGuiCol_TableRowBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_TableRowBgAlt] = ImVec4(1.00f, 1.00f, 1.00f, 0.03f);
+    colors[ImGuiCol_TextSelectedBg] = ImVec4(selection.x, selection.y, selection.z, 0.80f);
+    colors[ImGuiCol_DragDropTarget] = ImVec4(accent.x, accent.y, accent.z, 0.90f);
+    colors[ImGuiCol_NavHighlight] = ImVec4(accent.x, accent.y, accent.z, 0.80f);
     colors[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
-    colors[ImGuiCol_NavWindowingDimBg] = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
-    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.80f, 0.80f, 0.80f, 0.35f);
+    colors[ImGuiCol_NavWindowingDimBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.45f);
+    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.00f, 0.00f, 0.00f, 0.55f);
 }
 std::string ImGuiRenderer::LoadFonts(const std::string& fontPath, float dpiScale)
 {

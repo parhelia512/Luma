@@ -570,7 +570,7 @@ void AssetBrowserPanel::drawAssetContentView()
                 bool isSelected = std::ranges::find(m_context->selectedAssets, item.path) != m_context->
                     selectedAssets.end();
                 ImGui::BeginGroup();
-                ImVec4 color = isSelected ? ImGui::GetStyle().Colors[ImGuiCol_ButtonHovered] : ImVec4(0, 0, 0, 0);
+                ImVec4 color = isSelected ? ImGui::GetStyle().Colors[ImGuiCol_Header] : ImVec4(0, 0, 0, 0);
                 ImGui::PushStyleColor(ImGuiCol_Button, color);
                 auto iconTexturePtr = item.isDirectory ? m_icons.directory : getIconForAssetType(item.type);
                 wgpu::Texture iconTexture = iconTexturePtr ? iconTexturePtr->GetTexture() : wgpu::Texture();

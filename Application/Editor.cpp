@@ -32,6 +32,7 @@
 #include "Utils/Profiler.h"
 #include "Components/ComponentRegistry.h"
 #include "Event/LumaEvent.h"
+#include "Editor/ComponentCatalog.h"
 #include "Editor/ToolBarPanel.h"
 #include "Editor/SceneViewPanel.h"
 #include "Editor/GameViewPanel.h"
@@ -974,11 +975,16 @@ PlatformWindow* Editor::GetPlatWindow()
 void Editor::drawAddComponentPopupContent()
 {
     static char searchBuffer[256] = {0};
-    ImGui::InputTextWithHint("##SearchComponents", "搜索组件", searchBuffer, sizeof(searchBuffer));
-    ImGui::Separator();
+    if (ImGui::IsWindowAppearing())
+    {
+        searchBuffer[0] = '\0';
+        ImGui::SetKeyboardFocusHere();
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##SearchComponents", "搜索组件...", searchBuffer, sizeof(searchBuffer));
     if (m_editorContext.selectionType != SelectionType::GameObject || m_editorContext.selectionList.empty())
     {
-        ImGui::Text("请先选择至少一个游戏对象。");
+        ImGui::TextDisabled("请先选择至少一个游戏对象。");
         return;
     }
     std::vector<RuntimeGameObject> selectedObjects;
@@ -992,33 +998,59 @@ void Editor::drawAddComponentPopupContent()
     }
     if (selectedObjects.empty())
     {
-        ImGui::Text("选中的对象无效。");
+        ImGui::TextDisabled("选中的对象无效。");
         return;
     }
-    auto& registry = m_editorContext.activeScene->GetRegistry();
-    const auto& componentRegistry = ComponentRegistry::GetInstance();
     if (selectedObjects.size() == 1)
     {
-        ImGui::Text("为对象 '%s' 添加组件", selectedObjects[0].GetName().c_str());
+        ImGui::TextDisabled("添加到: %s", selectedObjects[0].GetName().c_str());
     }
     else
     {
-        ImGui::Text("为 %d 个对象批量添加组件", static_cast<int>(selectedObjects.size()));
+        ImGui::TextDisabled("批量添加到 %d 个对象", static_cast<int>(selectedObjects.size()));
     }
     ImGui::Separator();
+
+    auto& registry = m_editorContext.activeScene->GetRegistry();
+    const auto& componentRegistry = ComponentRegistry::GetInstance();
+
     std::string filter = searchBuffer;
     std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+    auto toLower = [](std::string text)
+    {
+        std::transform(text.begin(), text.end(), text.begin(), ::tolower);
+        return text;
+    };
+
+    // 收集可添加组件并按目录分类。
+    struct ItemInfo
+    {
+        ComponentCatalog::Entry entry;
+        const ComponentRegistration* compInfo;
+    };
+    std::map<std::string, std::vector<ItemInfo>> byCategory;
     for (const auto& componentName : componentRegistry.GetAllRegisteredNames())
     {
         const ComponentRegistration* compInfo = componentRegistry.Get(componentName);
         if (!compInfo || !compInfo->isExposedInEditor) continue;
-        std::string lowerCaseName = componentName;
-        std::transform(lowerCaseName.begin(), lowerCaseName.end(), lowerCaseName.begin(), ::tolower);
-        if (!filter.empty() && lowerCaseName.find(filter) == std::string::npos) continue;
+        ComponentCatalog::Entry entry = ComponentCatalog::Get(componentName);
+        if (!filter.empty())
+        {
+            const bool matches =
+                toLower(entry.displayName).find(filter) != std::string::npos ||
+                toLower(entry.componentName).find(filter) != std::string::npos ||
+                toLower(entry.category).find(filter) != std::string::npos;
+            if (!matches) continue;
+        }
+        byCategory[entry.category].push_back({std::move(entry), compInfo});
+    }
+
+    auto drawItem = [&](const ItemInfo& item)
+    {
         bool allHaveComponent = true;
         for (const auto& obj : selectedObjects)
         {
-            if (!compInfo->has(registry, static_cast<entt::entity>(obj)))
+            if (!item.compInfo->has(registry, static_cast<entt::entity>(obj)))
             {
                 allHaveComponent = false;
                 break;
@@ -1028,14 +1060,14 @@ void Editor::drawAddComponentPopupContent()
         {
             ImGui::BeginDisabled();
         }
-        if (ImGui::MenuItem(componentName.c_str()))
+        if (ImGui::MenuItem(item.entry.displayName.c_str()))
         {
             m_editorContext.uiCallbacks->onValueChanged.Invoke();
             for (const auto& obj : selectedObjects)
             {
-                if (!compInfo->has(registry, static_cast<entt::entity>(obj)))
+                if (!item.compInfo->has(registry, static_cast<entt::entity>(obj)))
                 {
-                    compInfo->add(registry, static_cast<entt::entity>(obj));
+                    item.compInfo->add(registry, static_cast<entt::entity>(obj));
                 }
             }
             PopupManager::GetInstance().Close("AddComponentPopup");
@@ -1044,7 +1076,77 @@ void Editor::drawAddComponentPopupContent()
         {
             ImGui::EndDisabled();
         }
+    };
+
+    // 分类的显示顺序：先按目录推荐顺序，再补上未列出的分类。
+    std::vector<const std::string*> orderedCategories;
+    for (const auto& category : ComponentCatalog::CategoryOrder())
+    {
+        if (byCategory.count(category)) orderedCategories.push_back(&category);
     }
+    for (const auto& [category, items] : byCategory)
+    {
+        bool listed = false;
+        for (const auto* c : orderedCategories)
+        {
+            if (*c == category)
+            {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed) orderedCategories.push_back(&category);
+    }
+
+    ImGui::BeginChild("##ComponentList", ImVec2(320.0f, 380.0f), ImGuiChildFlags_None);
+    if (byCategory.empty())
+    {
+        ImGui::TextDisabled("没有匹配的组件。");
+    }
+    else if (!filter.empty())
+    {
+        // 搜索模式：平铺展示，标注所属分类。
+        for (const auto* category : orderedCategories)
+        {
+            for (const auto& item : byCategory[*category])
+            {
+                drawItem(item);
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", category->c_str());
+            }
+        }
+    }
+    else
+    {
+        // 浏览模式：Unity 风格分类树。分类行用中性灰（结构元素），选中蓝只留给列表高亮。
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.176f, 0.184f, 0.192f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.216f, 0.224f, 0.235f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.263f, 0.275f, 0.290f, 1.00f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                            ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0f));
+        for (const auto* category : orderedCategories)
+        {
+            const auto& items = byCategory[*category];
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 4.0f));
+            const bool open = ImGui::TreeNodeEx(category->c_str(),
+                                                ImGuiTreeNodeFlags_Framed |
+                                                ImGuiTreeNodeFlags_SpanAvailWidth |
+                                                ImGuiTreeNodeFlags_NoTreePushOnOpen);
+            ImGui::PopStyleVar();
+            if (open)
+            {
+                ImGui::Indent(12.0f);
+                for (const auto& item : items)
+                {
+                    drawItem(item);
+                }
+                ImGui::Unindent(12.0f);
+            }
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
+    }
+    ImGui::EndChild();
 }
 
 void Editor::drawFileConflictPopupContent()
