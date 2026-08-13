@@ -523,7 +523,13 @@ void Editor::Update(float fixedDeltaTime)
             std::string title = settings.IsProjectLoaded() ? settings.GetAppName() : "Luma Engine";
             std::string newTitle = title + " - " + m_editorContext.currentSceneName;
             newTitle += isDirty ? " 未保存" : "";
-            m_window->SetTitle(newTitle);
+            // 必须投递到主线程执行：SetWindowText 是同步 SendMessage，需要窗口所属线程（主线程）
+            // 泵消息才能返回。本函数在模拟线程持有场景锁执行，若直接调用而主线程恰好在等锁，
+            // 会形成 SendMessage/互斥锁互等死锁（主线程等锁、模拟线程等主线程泵消息）。
+            m_context.commandsForRender.Push([this, newTitle]()
+            {
+                m_window->SetTitle(newTitle);
+            });
         }
         m_editorContext.activeScene->UpdateSimulation(fixedDeltaTime, *m_editorContext.engineContext,
                                                       m_editorContext.editorState == EditorState::Paused);

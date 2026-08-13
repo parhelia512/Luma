@@ -395,6 +395,7 @@ private:
     entt::registry m_registry; ///< 场景的实体组件系统(ECS)注册表。
     std::vector<RuntimeGameObject> m_rootGameObjects; ///< 场景中的所有根游戏对象。
     SystemsManager m_systemsManager; ///< 系统管理器，负责管理所有系统。
+    bool m_isActivated = false; ///< 场景是否已激活（Activate/Deactivate 幂等守卫）。
     std::unordered_map<Guid, entt::entity> m_guidToEntityMap; ///< GUID到实体句柄的映射。
     std::string m_name = "Untitled Scene"; ///< 场景的名称。
     Camera::CamProperties m_cameraProperties; ///< 场景的主摄像机属性。

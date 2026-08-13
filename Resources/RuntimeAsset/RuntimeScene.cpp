@@ -28,11 +28,23 @@ RuntimeScene::~RuntimeScene()
 
 void RuntimeScene::Activate(EngineContext& engineCtx)
 {
+    // 幂等守卫：场景加载路径可能显式 Activate 一次、SceneManager 的激活命令又 Activate 一次，
+    // 重复初始化会让所有系统 OnCreate 跑两遍（重复创建 GPU 资源、重复订阅事件）
+    if (m_isActivated)
+    {
+        return;
+    }
+    m_isActivated = true;
     m_systemsManager.InitializeSystems(this, engineCtx);
 }
 
 void RuntimeScene::Deactivate()
 {
+    if (!m_isActivated)
+    {
+        return;
+    }
+    m_isActivated = false;
     m_systemsManager.DestroySystems(this);
 }
 

@@ -313,6 +313,13 @@ namespace Systems
 
     void QualityManager::SetLightingSystem(LightingSystem* lightingSystem)
     {
+        // 指针未变化时直接返回：调用方（系统 OnUpdate 的幂等重挂）每帧都会调用本函数，
+        // 若每次都重新应用设置并打日志，会以每秒数百行的速度刷屏——当 stdout 接管道
+        // （如 IDE 运行窗口）且缓冲写满时，持有场景锁的线程会阻塞在日志写入上造成整体死锁
+        if (m_lightingSystem == lightingSystem)
+        {
+            return;
+        }
         m_lightingSystem = lightingSystem;
         if (m_lightingSystem)
         {
@@ -322,6 +329,10 @@ namespace Systems
 
     void QualityManager::SetShadowRenderer(ShadowRenderer* shadowRenderer)
     {
+        if (m_shadowRenderer == shadowRenderer)
+        {
+            return;
+        }
         m_shadowRenderer = shadowRenderer;
         if (m_shadowRenderer)
         {
@@ -331,6 +342,10 @@ namespace Systems
 
     void QualityManager::SetPostProcessSystem(PostProcessSystem* postProcessSystem)
     {
+        if (m_postProcessSystem == postProcessSystem)
+        {
+            return;
+        }
         m_postProcessSystem = postProcessSystem;
         if (m_postProcessSystem)
         {

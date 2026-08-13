@@ -90,6 +90,14 @@ void ApplicationBase::simulationLoop()
             m_context.eventsForSim.clear();
         }
         nextFrameTime += std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(fixedDeltaTime);
+        // 防主线程饥饿：tick 耗时超过周期时 nextFrameTime 已落后，sleep_until 会立即返回，
+        // 模拟线程将无间隙连续抢占场景锁，导致主线程（UI/渲染）拿不到锁而失去响应。
+        // 此时重置节拍并强制让出一个最小窗口。
+        const auto now = std::chrono::high_resolution_clock::now();
+        if (nextFrameTime <= now)
+        {
+            nextFrameTime = now + std::chrono::milliseconds(1);
+        }
         std::this_thread::sleep_until(nextFrameTime);
     }
 }

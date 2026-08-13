@@ -66,8 +66,19 @@ namespace Nut
         }
         else
         {
-            LogError("No pixel data source specified for texture creation.");
-            return nullptr;
+            // 无像素源：按描述符尺寸创建空纹理（渲染目标/阴影贴图/计算写入等
+            // 场景无需初始数据）。此前这里直接报错返回空，导致 ShadowRenderer
+            // 的阴影贴图从未创建成功过。
+            const auto& emptyDesc = m_descriptorBuilder.GetDescriptor();
+            if (emptyDesc.size.width == 0 || emptyDesc.size.height == 0)
+            {
+                LogError("No pixel data source specified and descriptor has no valid size for texture creation.");
+                return nullptr;
+            }
+            finalPixels = nullptr;
+            finalWidth = emptyDesc.size.width;
+            finalHeight = emptyDesc.size.height;
+            finalChannels = 0;
         }
 
 
