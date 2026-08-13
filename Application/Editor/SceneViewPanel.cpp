@@ -362,9 +362,12 @@ void SceneViewPanel::Draw()
             uiCam.SetProperties(m_editorCameraProperties);
 
             m_context->graphicsBackend->SetActiveRenderTarget(m_sceneViewTarget);
-            for (const auto& packet : m_context->renderQueue)
+            if (m_context->renderQueue)
             {
-                m_context->engineContext->renderSystem->Submit(packet);
+                for (const auto& packet : *m_context->renderQueue)
+                {
+                    m_context->engineContext->renderSystem->Submit(packet);
+                }
             }
             m_context->engineContext->renderSystem->Flush();
             m_context->graphicsBackend->Submit();

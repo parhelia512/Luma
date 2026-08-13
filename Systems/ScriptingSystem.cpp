@@ -1,6 +1,7 @@
 #include "ScriptingSystem.h"
 #include "ProjectSettings.h"
 #include "ScriptMetadataRegistry.h"
+#include "../Components/ActivityComponent.h"
 #include "../Resources/RuntimeAsset/RuntimeScene.h"
 #include "../Resources/Loaders/CSharpScriptLoader.h"
 #include "../Components/ScriptComponent.h"
@@ -143,7 +144,8 @@ namespace Systems
 
         for (auto entity : view)
         {
-            if (!scene->FindGameObjectByEntity(entity).IsActive())
+            if (const auto* activity = registry.try_get<ECS::ActivityComponent>(entity);
+                activity && !activity->isActive)
                 continue;
 
             const auto& scriptsComp = view.get<const ECS::ScriptsComponent>(entity);

@@ -163,8 +163,15 @@ void PlatformWindow::handleEvent(const SDL_Event& event)
     switch (event.type)
     {
     case SDL_EVENT_QUIT:
-        shouldCloseFlag = true;
-        OnCloseRequest.Invoke();
+        // 有监听者（如编辑器未保存确认）时交由监听者决定是否 ForceClose；无监听者则直接退出
+        if (OnCloseRequest.IsEmpty())
+        {
+            shouldCloseFlag = true;
+        }
+        else
+        {
+            OnCloseRequest.Invoke();
+        }
         break;
     case SDL_EVENT_WINDOW_RESIZED:
         OnResize.Invoke(event.window.data1, event.window.data2);

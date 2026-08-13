@@ -189,7 +189,6 @@ namespace
         }
         void Execute() override
         {
-            auto& simd = SIMD::GetInstance();
             const float one_minus_alpha = 1.0f - alpha;
             auto prevIt = prevFrameStart;
             auto currIt = currFrameStart;
@@ -215,23 +214,19 @@ namespace
                 ECS::TransformComponent interpolatedTransform = currIt->transform;
                 if (prevIt != prevFrameEnd && prevIt->entityId == currIt->entityId)
                 {
-                    const float prevPos[2] = {prevIt->transform.position.x, prevIt->transform.position.y};
-                    const float currPos[2] = {currIt->transform.position.x, currIt->transform.position.y};
-                    float resultPos[2];
-                    const float prevScale[2] = {prevIt->transform.scale.x, prevIt->transform.scale.y};
-                    const float currScale[2] = {currIt->transform.scale.x, currIt->transform.scale.y};
-                    float resultScale[2];
-                    float term1[2], term2[2];
-                    simd.VectorScalarMultiply(prevPos, one_minus_alpha, term1, 2);
-                    simd.VectorScalarMultiply(currPos, alpha, term2, 2);
-                    simd.VectorAdd(term1, term2, resultPos, 2);
-                    simd.VectorScalarMultiply(prevScale, one_minus_alpha, term1, 2);
-                    simd.VectorScalarMultiply(currScale, alpha, term2, 2);
-                    simd.VectorAdd(term1, term2, resultScale, 2);
-                    interpolatedTransform.position = {resultPos[0], resultPos[1]};
-                    interpolatedTransform.scale = {resultScale[0], resultScale[1]};
-                    interpolatedTransform.rotation =
-                        Lerp(prevIt->transform.rotation, currIt->transform.rotation, alpha);
+                    // 每实体仅 2 个 float 的插值，直接标量计算；
+                    // 旧实现经 SIMD 单例虚接口连打 6 次虚调用，比标量慢一个数量级
+                    const auto& prevT = prevIt->transform;
+                    const auto& currT = currIt->transform;
+                    interpolatedTransform.position = {
+                        prevT.position.x * one_minus_alpha + currT.position.x * alpha,
+                        prevT.position.y * one_minus_alpha + currT.position.y * alpha
+                    };
+                    interpolatedTransform.scale = {
+                        prevT.scale.x * one_minus_alpha + currT.scale.x * alpha,
+                        prevT.scale.y * one_minus_alpha + currT.scale.y * alpha
+                    };
+                    interpolatedTransform.rotation = Lerp(prevT.rotation, currT.rotation, alpha);
                     ++prevIt;
                 }
                 processRenderable(currIt, interpolatedTransform);
@@ -1996,10 +1991,16 @@ namespace
 void RenderableManager::SubmitFrame(std::vector<Renderable>&& frameData)
 {
     auto newCurrVector = std::make_shared<std::vector<Renderable>>(std::move(frameData));
-    std::ranges::sort(*newCurrVector, [](const Renderable& a, const Renderable& b)
+    // 提取端（SceneRenderer::ExtractToRenderableManager）已按 entityId 稳定排序；
+    // Renderable 是数百字节的大对象，避免冗余的第二次 O(n log n) 搬运排序
+    const auto byEntityId = [](const Renderable& a, const Renderable& b)
     {
         return static_cast<uint32_t>(a.entityId) < static_cast<uint32_t>(b.entityId);
-    });
+    };
+    if (!std::ranges::is_sorted(*newCurrVector, byEntityId))
+    {
+        std::ranges::stable_sort(*newCurrVector, byEntityId);
+    }
     std::shared_ptr<RenderableFrame> newCurrFrame = newCurrVector;
     {
         std::lock_guard<std::mutex> lock(frameDataMutex);
@@ -2011,13 +2012,35 @@ void RenderableManager::SubmitFrame(std::vector<Renderable>&& frameData)
         currFrameVersion.fetch_add(1, std::memory_order_relaxed);
     }
 }
+float RenderableManager::computeEffectiveAlpha() const
+{
+    float ext = m_externalAlpha.load(std::memory_order_relaxed);
+    if (ext >= 0.0f && ext <= 1.0f)
+    {
+        return ext;
+    }
+    auto renderTime = std::chrono::steady_clock::now();
+    auto prevTime = prevStateTime.load(std::memory_order_relaxed);
+    auto currTime = currStateTime.load(std::memory_order_relaxed);
+    auto stateDuration = std::chrono::duration<float>(currTime - prevTime);
+    auto renderDuration = std::chrono::duration<float>(renderTime - currTime);
+    float alpha = 0.0f;
+    if (stateDuration.count() > 0.0f)
+    {
+        alpha = renderDuration.count() / stateDuration.count();
+    }
+    return std::clamp(alpha, 0.0f, 1.0f);
+}
 const std::vector<RenderPacket>& RenderableManager::GetInterpolationData()
 {
     std::shared_ptr<RenderableFrame> localPrevFrame;
     std::shared_ptr<RenderableFrame> localCurrFrame;
+    // 先计算本帧的有效 alpha：旧实现的缓存只看模拟帧版本，渲染帧之间 alpha 的变化
+    // 不会触发重建，导致两个模拟帧之间始终返回同一份包（运动按模拟帧率步进，插值失效）。
+    const float alpha = computeEffectiveAlpha();
     {
         std::lock_guard<std::mutex> lock(frameDataMutex);
-        if (!needsRebuild())
+        if (!needsRebuild(alpha))
         {
             return packetBuffers[activeBufferIndex.load(std::memory_order_relaxed)];
         }
@@ -2032,38 +2055,16 @@ const std::vector<RenderPacket>& RenderableManager::GetInterpolationData()
         auto& outPackets = packetBuffers[buildIndex];
         outPackets.clear();
         activeBufferIndex.store(buildIndex, std::memory_order_release);
-        updateCacheState();
+        updateCacheState(alpha);
         return outPackets;
     }
     bool shouldInterpolate = hasPrevFrame && hasCurrFrame;
     const auto& baseFrameView = *localCurrFrame;
-    float alpha = 0.0f;
-    if (shouldInterpolate)
-    {
-        float ext = m_externalAlpha.load(std::memory_order_relaxed);
-        if (ext >= 0.0f && ext <= 1.0f)
-        {
-            alpha = ext;
-        }
-        else
-        {
-            auto renderTime = std::chrono::steady_clock::now();
-            auto prevTime = prevStateTime.load(std::memory_order_relaxed);
-            auto currTime = currStateTime.load(std::memory_order_relaxed);
-            auto stateDuration = std::chrono::duration<float>(currTime - prevTime);
-            auto renderDuration = std::chrono::duration<float>(renderTime - currTime);
-            if (stateDuration.count() > 0.0f)
-            {
-                alpha = renderDuration.count() / stateDuration.count();
-            }
-            alpha = std::clamp(alpha, 0.0f, 1.0f);
-        }
-    }
     const int buildIndex = (activeBufferIndex.load(std::memory_order_relaxed) ^ 1);
     auto& outPackets = packetBuffers[buildIndex];
     outPackets.clear();
-    transformArenas[buildIndex]->Reverse();
-    textArenas[buildIndex]->Reverse();
+    transformArenas[buildIndex]->Reset();
+    textArenas[buildIndex]->Reset();
     spriteGroupIndices.clear();
     textGroupIndices.clear();
     spriteBatchGroups.clear();
@@ -2071,7 +2072,7 @@ const std::vector<RenderPacket>& RenderableManager::GetInterpolationData()
     if (baseFrameView.empty())
     {
         activeBufferIndex.store(buildIndex, std::memory_order_release);
-        updateCacheState();
+        updateCacheState(alpha);
         return outPackets;
     }
     auto& jobSystem = JobSystem::GetInstance();
@@ -2345,7 +2346,7 @@ const std::vector<RenderPacket>& RenderableManager::GetInterpolationData()
         return ka < kb;
     });
     activeBufferIndex.store(buildIndex, std::memory_order_release);
-    updateCacheState();
+    updateCacheState(alpha);
     return outPackets;
 }
 RenderableManager::RenderableManager()
@@ -2359,21 +2360,29 @@ RenderableManager::RenderableManager()
     lastBuiltPrevTime.store(now, std::memory_order_relaxed);
     lastBuiltCurrTime.store(now, std::memory_order_relaxed);
 }
-bool RenderableManager::needsRebuild() const
+bool RenderableManager::needsRebuild(float candidateAlpha) const
 {
     auto currentPrevTime = prevStateTime.load(std::memory_order_relaxed);
     auto currentCurrTime = currStateTime.load(std::memory_order_relaxed);
     auto currentPrevVersion = prevFrameVersion.load(std::memory_order_relaxed);
     auto currentCurrVersion = currFrameVersion.load(std::memory_order_relaxed);
-    return lastBuiltPrevTime.load(std::memory_order_relaxed) != currentPrevTime ||
+    if (lastBuiltPrevTime.load(std::memory_order_relaxed) != currentPrevTime ||
         lastBuiltCurrTime.load(std::memory_order_relaxed) != currentCurrTime ||
         lastBuiltPrevFrameVersion.load(std::memory_order_relaxed) != currentPrevVersion ||
-        lastBuiltCurrFrameVersion.load(std::memory_order_relaxed) != currentCurrVersion;
+        lastBuiltCurrFrameVersion.load(std::memory_order_relaxed) != currentCurrVersion)
+    {
+        return true;
+    }
+    // 插值 alpha 变化超过阈值时也需要重建：渲染率高于模拟率时，两个模拟帧之间
+    // 每个渲染帧都应产生新的插值结果，否则运动按模拟帧率步进
+    constexpr float kAlphaEpsilon = 0.001f;
+    return std::abs(candidateAlpha - m_lastBuiltAlpha.load(std::memory_order_relaxed)) > kAlphaEpsilon;
 }
-void RenderableManager::updateCacheState()
+void RenderableManager::updateCacheState(float alphaUsed)
 {
     lastBuiltPrevTime.store(prevStateTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
     lastBuiltCurrTime.store(currStateTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
     lastBuiltPrevFrameVersion.store(prevFrameVersion.load(std::memory_order_relaxed), std::memory_order_relaxed);
     lastBuiltCurrFrameVersion.store(currFrameVersion.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    m_lastBuiltAlpha.store(alphaUsed, std::memory_order_relaxed);
 }

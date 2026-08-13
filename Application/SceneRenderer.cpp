@@ -1,5 +1,6 @@
 #include "SceneRenderer.h"
 #include "../Renderer/RenderComponent.h"
+#include "../Components/ActivityComponent.h"
 #include "../Components/Transform.h"
 #include "../Components/Sprite.h"
 #include "../Components/LayerComponent.h"
@@ -20,6 +21,18 @@
 #include "include/core/SkColorFilter.h"
 namespace
 {
+    /**
+     * @brief 直接查询实体激活状态。
+     *
+     * 旧实现每实体每帧构造 RuntimeGameObject 包装并 GetComponent（对缺少
+     * ActivityComponent 的实体是 entt 未定义行为）；这里直接 try_get，缺省视为激活。
+     */
+    inline bool IsEntityActive(entt::registry& registry, entt::entity entity)
+    {
+        const auto* activity = registry.try_get<ECS::ActivityComponent>(entity);
+        return !activity || activity->isActive;
+    }
+
     inline SkPoint ComputeAnchoredCenter(const ECS::TransformComponent& transform, float width, float height)
     {
         float offsetX = (0.5f - transform.anchor.x) * width;
@@ -38,13 +51,20 @@ namespace
     }
     inline SkSize EstimateTextSize(const std::string& text, float fontSize)
     {
-        const float charWidth = fontSize * 0.55f;
+        // 按 UTF-8 码点估宽：ASCII 半宽（0.55），多字节字符（CJK 等）按全宽（1.0）。
+        // 旧实现按字节累加，中文一字 3 字节会把宽度高估约 65%，锚点随之错位。
+        const float asciiWidth = fontSize * 0.55f;
+        const float wideWidth = fontSize * 1.0f;
         const float lineHeight = fontSize * 1.15f;
         float maxWidth = 0.0f;
         float currentLineWidth = 0.0f;
         size_t lineCount = 1;
-        for (char c : text)
+        for (unsigned char c : text)
         {
+            if ((c & 0xC0) == 0x80)
+            {
+                continue; // UTF-8 续字节，不计宽
+            }
             if (c == '\n')
             {
                 maxWidth = std::max(maxWidth, currentLineWidth);
@@ -53,7 +73,7 @@ namespace
             }
             else
             {
-                currentLineWidth += charWidth;
+                currentLineWidth += (c < 0x80) ? asciiWidth : wideWidth;
             }
         }
         maxWidth = std::max(maxWidth, currentLineWidth);
@@ -125,7 +145,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto view = registry.view<const ECS::TransformComponent, const ECS::SpriteComponent>();
         for (auto entity : view)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive())
+            if (!IsEntityActive(registry, entity))
                 continue;
             const auto& transform = view.get<const ECS::TransformComponent>(entity);
             const auto& sprite = view.get<const ECS::SpriteComponent>(entity);
@@ -174,70 +194,129 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
     {
         auto view = registry.view<const ECS::TransformComponent, const ECS::TilemapComponent, const
                                   ECS::TilemapRendererComponent>();
+        const auto viewport = RenderableManager::GetInstance().GetViewport();
+        std::vector<entt::entity> seenTilemaps;
         for (auto entity : view)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive())
+            if (!IsEntityActive(registry, entity))
                 continue;
+            seenTilemaps.push_back(entity);
             const auto& tilemapTransform = view.get<const ECS::TransformComponent>(entity);
             const auto& tilemap = view.get<const ECS::TilemapComponent>(entity);
             const auto& renderer = view.get<const ECS::TilemapRendererComponent>(entity);
-            std::vector<ECS::Vector2i> coords;
-            coords.reserve(tilemap.runtimeTileCache.size());
-            for (const auto& kv : tilemap.runtimeTileCache)
+
+            // 静态瓦片缓存：旧实现每帧对每个 tilemap 拷贝全部坐标、O(n log n) 排序、
+            // 逐瓦片查水合表并构造 Renderable。现在仅在瓦片数据/布局参数变化时重建，
+            // 每帧只做平移 + 视口剔除。
+            auto& cache = m_tilemapCaches[entity];
+            const bool cacheDirty =
+                cache.version != tilemap.runtimeCacheVersion ||
+                cache.hydratedCount != renderer.hydratedSpriteTiles.size() ||
+                cache.material != static_cast<const void*>(renderer.material.get()) ||
+                cache.zIndex != renderer.zIndex ||
+                cache.cellSize.x != tilemap.cellSize.x || cache.cellSize.y != tilemap.cellSize.y ||
+                cache.mapScale.x != tilemapTransform.scale.x || cache.mapScale.y != tilemapTransform.scale.y ||
+                cache.mapRotation != tilemapTransform.rotation ||
+                cache.mapAnchor.x != tilemapTransform.anchor.x || cache.mapAnchor.y != tilemapTransform.anchor.y;
+            if (cacheDirty)
             {
-                coords.push_back(kv.first);
-            }
-            std::ranges::sort(coords, [](const ECS::Vector2i& a, const ECS::Vector2i& b)
-            {
-                if (a.x != b.x) return a.x < b.x;
-                return a.y < b.y;
-            });
-            for (const auto& coord : coords)
-            {
-                const auto& resolvedTile = tilemap.runtimeTileCache.at(coord);
-                if (std::holds_alternative<SpriteTileData>(resolvedTile.data))
+                cache.version = tilemap.runtimeCacheVersion;
+                cache.hydratedCount = renderer.hydratedSpriteTiles.size();
+                cache.material = renderer.material.get();
+                cache.zIndex = renderer.zIndex;
+                cache.cellSize = tilemap.cellSize;
+                cache.mapScale = tilemapTransform.scale;
+                cache.mapRotation = tilemapTransform.rotation;
+                cache.mapAnchor = tilemapTransform.anchor;
+                cache.localTiles.clear();
+
+                std::vector<ECS::Vector2i> coords;
+                coords.reserve(tilemap.runtimeTileCache.size());
+                for (const auto& kv : tilemap.runtimeTileCache)
                 {
+                    coords.push_back(kv.first);
+                }
+                std::ranges::sort(coords, [](const ECS::Vector2i& a, const ECS::Vector2i& b)
+                {
+                    if (a.x != b.x) return a.x < b.x;
+                    return a.y < b.y;
+                });
+                cache.localTiles.reserve(coords.size());
+                for (const auto& coord : coords)
+                {
+                    const auto& resolvedTile = tilemap.runtimeTileCache.at(coord);
+                    if (!std::holds_alternative<SpriteTileData>(resolvedTile.data)) continue;
                     const Guid& tileAssetGuid = resolvedTile.sourceTileAsset.assetGuid;
-                    if (tileAssetGuid.Valid() && renderer.hydratedSpriteTiles.contains(tileAssetGuid))
+                    if (!tileAssetGuid.Valid() || !renderer.hydratedSpriteTiles.contains(tileAssetGuid)) continue;
+                    const auto& hydratedTile = renderer.hydratedSpriteTiles.at(tileAssetGuid);
+                    if (!hydratedTile.image) continue;
+                    const int pPU = hydratedTile.image->getImportSettings().pixelPerUnit;
+                    const float ppuScaleFactor = (pPU > 0) ? 100.0f / static_cast<float>(pPU) : 1.0f;
+                    const float sourceWidth = hydratedTile.sourceRect.width() > 0.0f
+                                                  ? hydratedTile.sourceRect.width()
+                                                  : static_cast<float>(hydratedTile.image->getImage()->width());
+                    const float sourceHeight = hydratedTile.sourceRect.height() > 0.0f
+                                                   ? hydratedTile.sourceRect.height()
+                                                   : static_cast<float>(hydratedTile.image->getImage()->height());
+                    const float worldWidth = sourceWidth * ppuScaleFactor;
+                    const float worldHeight = sourceHeight * ppuScaleFactor;
+                    // 以“位置归零”的 tilemap 变换计算锚点偏移，得到相对地图原点的局部位置
+                    ECS::TransformComponent localTransform = tilemapTransform;
+                    localTransform.position = ECS::Vector2f(coord.x * tilemap.cellSize.x,
+                                                            coord.y * tilemap.cellSize.y);
+                    const SkPoint anchoredPos = ComputeAnchoredCenter(localTransform, worldWidth, worldHeight);
+                    localTransform.position = ECS::Vector2f(anchoredPos.x(), anchoredPos.y());
+                    cache.localTiles.emplace_back(Renderable{
+                        .entityId = entity,
+                        .zIndex = renderer.zIndex,
+                        .sortKey = 0,
+                        .transform = localTransform,
+                        .data = SpriteRenderData{
+                            .image = hydratedTile.image->getImage().get(),
+                            .material = renderer.material.get(),
+                            .wgpuTexture = hydratedTile.image->getNutTexture(),
+                            .wgpuMaterial = nullptr,
+                            .sourceRect = hydratedTile.sourceRect,
+                            .color = hydratedTile.color,
+                            .filterQuality = static_cast<int>(hydratedTile.filterQuality),
+                            .wrapMode = static_cast<int>(hydratedTile.wrapMode),
+                            .ppuScaleFactor = ppuScaleFactor,
+                            .isUISprite = false,
+                            .lightLayer = 0xFFFFFFFF // Tilemaps use default light layer
+                        }
+                    });
+                }
+            }
+
+            // 每帧：平移到世界位置 + 视口剔除后提交
+            const uint64_t tilemapSortKey = getSortKey(entity);
+            const float cullMargin = 150.0f +
+                std::max(std::abs(tilemap.cellSize.x), std::abs(tilemap.cellSize.y)) * 2.0f;
+            for (const auto& localTile : cache.localTiles)
+            {
+                const float worldX = tilemapTransform.position.x + localTile.transform.position.x;
+                const float worldY = tilemapTransform.position.y + localTile.transform.position.y;
+                if (viewport.valid)
+                {
+                    if (worldX < viewport.minX - cullMargin || worldX > viewport.maxX + cullMargin ||
+                        worldY < viewport.minY - cullMargin || worldY > viewport.maxY + cullMargin)
                     {
-                        const auto& hydratedTile = renderer.hydratedSpriteTiles.at(tileAssetGuid);
-                        if (!hydratedTile.image) continue;
-                        ECS::TransformComponent tileTransform = tilemapTransform;
-                        tileTransform.position.x += coord.x * tilemap.cellSize.x;
-                        tileTransform.position.y += coord.y * tilemap.cellSize.y;
-                        const int pPU = hydratedTile.image->getImportSettings().pixelPerUnit;
-                        const float ppuScaleFactor = (pPU > 0) ? 100.0f / static_cast<float>(pPU) : 1.0f;
-                        const float sourceWidth = hydratedTile.sourceRect.width() > 0.0f
-                                                      ? hydratedTile.sourceRect.width()
-                                                      : static_cast<float>(hydratedTile.image->getImage()->width());
-                        const float sourceHeight = hydratedTile.sourceRect.height() > 0.0f
-                                                       ? hydratedTile.sourceRect.height()
-                                                       : static_cast<float>(hydratedTile.image->getImage()->height());
-                        const float worldWidth = sourceWidth * ppuScaleFactor;
-                        const float worldHeight = sourceHeight * ppuScaleFactor;
-                        const SkPoint anchoredPos = ComputeAnchoredCenter(tileTransform, worldWidth, worldHeight);
-                        tileTransform.position = ECS::Vector2f(anchoredPos.x(), anchoredPos.y());
-                        renderables.emplace_back(Renderable{
-                            .entityId = entity,
-                            .zIndex = renderer.zIndex,
-                            .sortKey = getSortKey(entity),
-                            .transform = tileTransform,
-                            .data = SpriteRenderData{
-                                .image = hydratedTile.image->getImage().get(),
-                                .material = renderer.material.get(),
-                                .wgpuTexture = hydratedTile.image->getNutTexture(),
-                                .wgpuMaterial = nullptr,
-                                .sourceRect = hydratedTile.sourceRect,
-                                .color = hydratedTile.color,
-                                .filterQuality = static_cast<int>(hydratedTile.filterQuality),
-                                .wrapMode = static_cast<int>(hydratedTile.wrapMode),
-                                .ppuScaleFactor = ppuScaleFactor,
-                                .isUISprite = false,
-                                .lightLayer = 0xFFFFFFFF // Tilemaps use default light layer
-                            }
-                        });
+                        continue;
                     }
                 }
+                Renderable& out = renderables.emplace_back(localTile);
+                out.sortKey = tilemapSortKey;
+                out.transform.position = ECS::Vector2f(worldX, worldY);
+            }
+        }
+        // 清理已删除 tilemap 的缓存
+        if (m_tilemapCaches.size() > seenTilemaps.size())
+        {
+            for (auto it = m_tilemapCaches.begin(); it != m_tilemapCaches.end();)
+            {
+                const bool seen = std::find(seenTilemaps.begin(), seenTilemaps.end(), it->first) !=
+                    seenTilemaps.end();
+                it = seen ? std::next(it) : m_tilemapCaches.erase(it);
             }
         }
     }
@@ -245,7 +324,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
     {
         auto processTextView = [&](auto& view, auto getTextComponent, auto entity)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive())
+            if (!IsEntityActive(registry, entity))
                 return;
             const auto& transform = view.template get<const ECS::TransformComponent>(entity);
             const auto& textData = getTextComponent(view, entity);
@@ -282,7 +361,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto buttonView = registry.view<const ECS::TransformComponent, const ECS::ButtonComponent>();
         for (auto entity : buttonView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive())
+            if (!IsEntityActive(registry, entity))
                 continue;
             const auto& transform = buttonView.get<const ECS::TransformComponent>(entity);
             const auto& button = buttonView.get<const ECS::ButtonComponent>(entity);
@@ -310,7 +389,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto inputTextView = registry.view<const ECS::TransformComponent, const ECS::InputTextComponent>();
         for (auto entity : inputTextView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = inputTextView.get<const ECS::TransformComponent>(entity);
             const auto& inputText = inputTextView.get<const ECS::InputTextComponent>(entity);
             if (!inputText.text.typeface || !inputText.placeholder.typeface || !inputText.isVisible)
@@ -347,7 +426,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto toggleView = registry.view<const ECS::TransformComponent, const ECS::ToggleButtonComponent>();
         for (auto entity : toggleView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = toggleView.get<const ECS::TransformComponent>(entity);
             const auto& toggle = toggleView.get<const ECS::ToggleButtonComponent>(entity);
             if (!toggle.isVisible) continue;
@@ -378,7 +457,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto radioView = registry.view<const ECS::TransformComponent, const ECS::RadioButtonComponent>();
         for (auto entity : radioView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = radioView.get<const ECS::TransformComponent>(entity);
             const auto& radio = radioView.get<const ECS::RadioButtonComponent>(entity);
             if (!radio.isVisible) continue;
@@ -413,7 +492,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto checkBoxView = registry.view<const ECS::TransformComponent, const ECS::CheckBoxComponent>();
         for (auto entity : checkBoxView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = checkBoxView.get<const ECS::TransformComponent>(entity);
             const auto& checkBox = checkBoxView.get<const ECS::CheckBoxComponent>(entity);
             if (!checkBox.isVisible) continue;
@@ -451,7 +530,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto sliderView = registry.view<const ECS::TransformComponent, const ECS::SliderComponent>();
         for (auto entity : sliderView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = sliderView.get<const ECS::TransformComponent>(entity);
             const auto& slider = sliderView.get<const ECS::SliderComponent>(entity);
             if (!slider.isVisible) continue;
@@ -488,7 +567,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto comboView = registry.view<const ECS::TransformComponent, const ECS::ComboBoxComponent>();
         for (auto entity : comboView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = comboView.get<const ECS::TransformComponent>(entity);
             const auto& combo = comboView.get<const ECS::ComboBoxComponent>(entity);
             if (!combo.isVisible) continue;
@@ -526,7 +605,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto expanderView = registry.view<const ECS::TransformComponent, const ECS::ExpanderComponent>();
         for (auto entity : expanderView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = expanderView.get<const ECS::TransformComponent>(entity);
             const auto& expander = expanderView.get<const ECS::ExpanderComponent>(entity);
             if (!expander.isVisible) continue;
@@ -555,7 +634,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto progressView = registry.view<const ECS::TransformComponent, const ECS::ProgressBarComponent>();
         for (auto entity : progressView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = progressView.get<const ECS::TransformComponent>(entity);
             const auto& progress = progressView.get<const ECS::ProgressBarComponent>(entity);
             if (!progress.isVisible) continue;
@@ -589,7 +668,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
         auto tabView = registry.view<const ECS::TransformComponent, const ECS::TabControlComponent>();
         for (auto entity : tabView)
         {
-            if (currentScene && !currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+            if (!IsEntityActive(registry, entity)) continue;
             const auto& transform = tabView.get<const ECS::TransformComponent>(entity);
             const auto& tabControl = tabView.get<const ECS::TabControlComponent>(entity);
             if (!tabControl.isVisible) continue;
@@ -628,7 +707,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
             auto listBoxView = registry.view<const ECS::TransformComponent, const ECS::ListBoxComponent>();
             for (auto entity : listBoxView)
             {
-                if (!currentScene->FindGameObjectByEntity(entity).IsActive()) continue;
+                if (!IsEntityActive(registry, entity)) continue;
                 const auto& transform = listBoxView.get<const ECS::TransformComponent>(entity);
                 const auto& listBox = listBoxView.get<const ECS::ListBoxComponent>(entity);
                 if (!listBox.isVisible) continue;
@@ -647,7 +726,7 @@ void SceneRenderer::ExtractToRenderableManager(entt::registry& registry)
                             for (auto childEntity : childrenComp.children)
                             {
                                 if (!registry.valid(childEntity)) continue;
-                                if (!currentScene->FindGameObjectByEntity(childEntity).IsActive()) continue;
+                                if (!IsEntityActive(registry, childEntity)) continue;
                                 ++itemCount;
                             }
                         }

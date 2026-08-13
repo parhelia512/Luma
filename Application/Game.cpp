@@ -160,7 +160,8 @@ void Game::Render()
     if (auto activeScene = SceneManager::GetInstance().GetCurrentScene())
     {
         RenderableManager::GetInstance().SetExternalAlpha(m_context.interpolationAlpha.load(std::memory_order_relaxed));
-        std::vector<RenderPacket> renderQueue = RenderableManager::GetInstance().GetInterpolationData();
+        // 直接引用 RenderableManager 双缓冲结果，同帧内只读消费，避免整帧深拷贝（sk_sp 引用计数/委托/字符串）
+        const std::vector<RenderPacket>& renderQueue = RenderableManager::GetInstance().GetInterpolationData();
         for (const auto& packet : renderQueue)
         {
             m_renderSystem->Submit(packet);

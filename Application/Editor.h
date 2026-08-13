@@ -44,6 +44,7 @@ private:
     void loadStartupScene(); 
     void drawAddComponentPopupContent(); 
     void drawFileConflictPopupContent(); 
+    void drawExitConfirmPopupContent();
     void updateUps(); 
     void updateFps();
 private:
@@ -53,6 +54,9 @@ private:
     std::unique_ptr<ImGuiRenderer> m_imguiRenderer; 
     std::unique_ptr<SceneRenderer> m_sceneRenderer; 
     std::filesystem::path m_pendingProjectPath; 
+    bool m_undoEditActive = false; ///< 连续编辑（拖拽/输入）进行中，撤销快照推迟到编辑结束提交。
+    float m_autosaveTimer = 0.0f; ///< 自动保存计时器（秒）。
+    ListenerHandle m_closeRequestListener; ///< 窗口关闭请求监听（未保存确认）。
     inline static Editor* s_instance; 
 };
 #endif

@@ -42,6 +42,14 @@ public:
     PlatformWindow& operator=(const PlatformWindow&) = delete;
     void PollEvents();
     bool ShouldClose() const;
+
+    /**
+     * @brief 立即请求关闭窗口（跳过 OnCloseRequest 拦截）。
+     *
+     * 当 OnCloseRequest 有监听者时，系统关闭事件只触发回调、不直接置位关闭标志，
+     * 由监听者（如编辑器的未保存确认弹窗）决定是否调用本方法真正退出。
+     */
+    void ForceClose() { shouldCloseFlag = true; }
     void SetTitle(const std::string& title);
     SDL_Window* GetSdlWindow() const;
     NativeWindowHandle GetNativeWindowHandle() const;

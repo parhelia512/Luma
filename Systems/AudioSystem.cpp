@@ -1,6 +1,8 @@
 #include "AudioSystem.h"
 #include "../Application/AudioManager.h"
+#include "../Renderer/Camera.h"
 #include "../Resources/Loaders/AudioLoader.h"
+#include "../Components/ActivityComponent.h"
 #include "../Components/AudioComponent.h"
 #include "../Components/Transform.h"
 #include "../Utils/Logger.h"
@@ -56,6 +58,13 @@ namespace Systems
 
     void AudioSystem::OnUpdate(RuntimeScene* scene, float deltaTime, EngineContext& context)
     {
+        // 在模拟线程上读取相机位姿并缓存给音频线程，音频回调不再跨线程访问相机
+        {
+            const auto camProps = CameraManager::GetInstance().GetActiveCamera().GetProperties();
+            AudioManager::GetInstance().UpdateListener(camProps.position.x(), camProps.position.y(),
+                                                       camProps.rotation);
+        }
+
         auto& reg = scene->GetRegistry();
         auto view = reg.view<ECS::AudioComponent>();
 
@@ -65,7 +74,8 @@ namespace Systems
 
         for (auto e : view)
         {
-            if (!scene->FindGameObjectByEntity(e).IsActive())
+            if (const auto* activity = reg.try_get<ECS::ActivityComponent>(e);
+                activity && !activity->isActive)
                 continue;
             auto& ac = view.get<ECS::AudioComponent>(e);
             if (!ac.Enable)

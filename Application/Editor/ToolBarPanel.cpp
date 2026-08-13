@@ -154,6 +154,57 @@ namespace
         }
         return wide;
     }
+    std::string WideToUtf8(const std::wstring& value)
+    {
+        if (value.empty())
+        {
+            return {};
+        }
+        int needed = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (needed <= 0)
+        {
+            return {};
+        }
+        std::string utf8(static_cast<size_t>(needed), '\0');
+        int converted = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, utf8.data(), needed, nullptr, nullptr);
+        if (converted <= 0)
+        {
+            return {};
+        }
+        if (!utf8.empty() && utf8.back() == '\0')
+        {
+            utf8.pop_back();
+        }
+        return utf8;
+    }
+    /**
+     * @brief 获取路径的 8.3 短路径（UTF-8 进出）。
+     *
+     * 旧实现用 GetShortPathNameA，在含非 ACP 字符（如中文）的路径上会失败或产生乱码；
+     * 这里全程走宽字符 API，失败时原样返回输入。
+     */
+    std::string ToShortPathUtf8(const std::string& utf8Path)
+    {
+        std::wstring wide = Utf8ToWide(utf8Path);
+        if (wide.empty())
+        {
+            return utf8Path;
+        }
+        DWORD needed = GetShortPathNameW(wide.c_str(), nullptr, 0);
+        if (needed == 0)
+        {
+            return utf8Path;
+        }
+        std::wstring shortPath(needed, L'\0');
+        DWORD written = GetShortPathNameW(wide.c_str(), shortPath.data(), needed);
+        if (written == 0 || written >= needed)
+        {
+            return utf8Path;
+        }
+        shortPath.resize(written);
+        std::string result = WideToUtf8(shortPath);
+        return result.empty() ? utf8Path : result;
+    }
 #endif
     std::string ResolveKeytoolExecutable()
     {
@@ -301,6 +352,8 @@ void ToolbarPanel::Initialize(EditorContext* context)
                                          ImGuiWindowFlags_AlwaysAutoResize);
     PopupManager::GetInstance().Register("SaveScene", [this]() { this->drawSaveBeforePackagingPopup(); }, true,
                                          ImGuiWindowFlags_AlwaysAutoResize);
+    PopupManager::GetInstance().Register("NewSceneConfirm", [this]() { this->drawNewSceneConfirmPopup(); }, true,
+                                         ImGuiWindowFlags_AlwaysAutoResize);
 }
 void ToolbarPanel::Update(float deltaTime)
 {
@@ -329,7 +382,7 @@ void ToolbarPanel::drawPackagingPopup()
             if (m_packagingProgress < 1.0f)
             {
                 ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x + 10.0f);
-                ImGui::TextUnformatted(m_packagingStatus.c_str());
+                ImGui::TextUnformatted(m_packagingStatus.Get().c_str());
                 ImGui::SameLine();
                 const float spinnerRadius = 12.0f;
                 const float spinnerThickness = 4.0f;
@@ -358,7 +411,7 @@ void ToolbarPanel::drawPackagingPopup()
             {
                 ImVec4 color = m_packagingSuccess ? ImVec4(0.2f, 0.9f, 0.2f, 1) : ImVec4(0.9f, 0.2f, 0.2f, 1);
                 const char* icon = m_packagingSuccess ? "✔" : "✖";
-                std::string text = std::string(icon) + " " + m_packagingStatus;
+                std::string text = std::string(icon) + " " + m_packagingStatus.Get();
                 float textWidth = ImGui::CalcTextSize(text.c_str()).x;
                 ImGui::SetCursorPosX((ImGui::GetWindowWidth() - textWidth) / 2.0f);
                 ImGui::TextColored(color, "%s", text.c_str());
@@ -401,14 +454,21 @@ void ToolbarPanel::drawPackagingPopup()
 }
 void ToolbarPanel::rebuildScripts()
 {
-    if (m_isCompilingScripts)
+    // 可能从 FileWatcher 线程（自动编译事件）或 UI 线程（菜单）进入，用原子交换做互斥。
+    if (m_isCompilingScripts.exchange(true))
     {
-        LogWarn("脚本已在编译中。");
+        // 编译进行中又有新改动：记为待编译，本轮结束后自动补一轮，避免最后一次保存被静默丢弃。
+        m_recompileQueued.store(true);
+        LogInfo("脚本已在编译中，本次变更已排队，将在当前编译完成后自动重新编译。");
         return;
     }
-    m_isCompilingScripts = true;
+    launchScriptCompilation();
+}
+void ToolbarPanel::launchScriptCompilation()
+{
     m_compilationFinished = false;
     m_compilationSuccess = false;
+    m_compileResultShownAt = -1.0f;
     m_compilationStatus = "正在准备编译环境...";
     m_compilationFuture = std::async(std::launch::async, [this]()
     {
@@ -417,7 +477,7 @@ void ToolbarPanel::rebuildScripts()
         if (m_compilationSuccess) { EventBus::GetInstance().Publish(CSharpScriptRebuiltEvent()); }
     });
 }
-bool ToolbarPanel::runScriptCompilationLogic(std::string& statusMessage, const std::filesystem::path& outPath)
+bool ToolbarPanel::runScriptCompilationLogic(ThreadSafeText& statusMessage, const std::filesystem::path& outPath)
 {
     const std::filesystem::path projectRoot = ProjectSettings::GetInstance().GetProjectRoot();
     const std::filesystem::path editorRoot = ".";
@@ -451,16 +511,8 @@ bool ToolbarPanel::runScriptCompilationLogic(std::string& statusMessage, const s
         std::string projectRootStr = projectRoot.string();
         std::string libraryDirStr = libraryDir.string();
 #ifdef _WIN32
-        char shortProjectPath[MAX_PATH];
-        char shortLibraryPath[MAX_PATH];
-        if (GetShortPathNameA(projectRootStr.c_str(), shortProjectPath, MAX_PATH) > 0)
-        {
-            projectRootStr = shortProjectPath;
-        }
-        if (GetShortPathNameA(libraryDirStr.c_str(), shortLibraryPath, MAX_PATH) > 0)
-        {
-            libraryDirStr = shortLibraryPath;
-        }
+        projectRootStr = ToShortPathUtf8(projectRootStr);
+        libraryDirStr = ToShortPathUtf8(libraryDirStr);
 #endif
         std::string slnPathStr = (projectRoot / "LumaScripting.sln").string();
         const std::string publishCmd = "dotnet publish -c Release -r " + dotnetRid + " \"" +
@@ -491,21 +543,9 @@ bool ToolbarPanel::runScriptCompilationLogic(std::string& statusMessage, const s
         std::string gameScriptsDllStr = absGameScriptsDll.string();
         std::string metadataYamlStr = absMetadataYaml.string();
 #ifdef _WIN32
-        char shortToolPath[MAX_PATH];
-        char shortDllPath[MAX_PATH];
-        char shortYamlPath[MAX_PATH];
-        if (GetShortPathNameA(toolsExeStr.c_str(), shortToolPath, MAX_PATH) > 0)
-        {
-            toolsExeStr = shortToolPath;
-        }
-        if (GetShortPathNameA(gameScriptsDllStr.c_str(), shortDllPath, MAX_PATH) > 0)
-        {
-            gameScriptsDllStr = shortDllPath;
-        }
-        if (GetShortPathNameA(metadataYamlStr.c_str(), shortYamlPath, MAX_PATH) > 0)
-        {
-            metadataYamlStr = shortYamlPath;
-        }
+        toolsExeStr = ToShortPathUtf8(toolsExeStr);
+        gameScriptsDllStr = ToShortPathUtf8(gameScriptsDllStr);
+        metadataYamlStr = ToShortPathUtf8(metadataYamlStr);
 #endif
         const std::string extractCmd = toolsExeStr + " " + gameScriptsDllStr + " " + metadataYamlStr;
         if (!ExecuteCommand(extractCmd, "MetadataTool"))
@@ -614,29 +654,55 @@ void ToolbarPanel::drawPreferencesPopup()
 }
 void ToolbarPanel::drawScriptCompilationPopup()
 {
-    if (!m_isCompilingScripts) return;
-    ImGui::OpenPopup("编译脚本");
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowSize(ImVec2(380, 120), ImGuiCond_Appearing);
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if (ImGui::BeginPopupModal("编译脚本", NULL,
-                               ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize))
+    // 非阻塞角标：编译在后台进行，编辑器保持可交互（旧实现是全屏模态，IDE 里每次保存都会锁住编辑器数秒）。
+    const bool compiling = m_isCompilingScripts.load();
+    if (!compiling && m_compileResultShownAt < 0.0f) return;
+
+    // 编译刚结束：若有排队的变更立刻补编一轮；否则短暂展示结果角标
+    if (compiling && m_compilationFinished.load())
     {
-        if (!m_compilationFinished)
+        if (m_recompileQueued.exchange(false))
         {
-            ImGui::Dummy(ImVec2(0.0f, 20.0f));
-            ImGui::SetCursorPosX(ImGui::GetStyle().WindowPadding.x + 10.0f);
-            ImGui::TextUnformatted(m_compilationStatus.c_str());
-            ImGui::SameLine();
-            const float spinnerRadius = 14.0f;
-            const float spinnerThickness = 4.0f;
-            float spinnerPosX = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - spinnerRadius * 2.0f -
-                10.0f;
-            ImGui::SetCursorPosX(spinnerPosX);
+            LogInfo("检测到编译期间的脚本变更，自动开始新一轮编译。");
+            launchScriptCompilation();
+        }
+        else
+        {
+            m_compileResultShownAt = static_cast<float>(ImGui::GetTime());
+            m_isCompilingScripts.store(false);
+        }
+    }
+
+    const bool stillCompiling = m_isCompilingScripts.load();
+    const bool resultVisible = m_compileResultShownAt >= 0.0f;
+    constexpr float kResultDisplaySeconds = 4.0f;
+    // 成功结果短暂展示后自动消失；失败结果保留，直到用户点击关闭
+    if (!stillCompiling && resultVisible && m_compilationSuccess.load() &&
+        static_cast<float>(ImGui::GetTime()) - m_compileResultShownAt > kResultDisplaySeconds)
+    {
+        m_compileResultShownAt = -1.0f;
+        return;
+    }
+
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    constexpr float kPadding = 16.0f;
+    ImVec2 pos(viewport->WorkPos.x + viewport->WorkSize.x - kPadding,
+               viewport->WorkPos.y + viewport->WorkSize.y - kPadding);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    constexpr ImGuiWindowFlags kOverlayFlags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_AlwaysAutoResize |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##ScriptCompileOverlay", nullptr, kOverlayFlags))
+    {
+        if (stillCompiling)
+        {
+            const float spinnerRadius = 8.0f;
             ImDrawList* draw_list = ImGui::GetWindowDrawList();
-            ImVec2 pos = ImGui::GetCursorScreenPos();
-            pos.x += spinnerRadius;
-            pos.y += spinnerRadius;
+            ImVec2 spinnerPos = ImGui::GetCursorScreenPos();
+            spinnerPos.x += spinnerRadius;
+            spinnerPos.y += spinnerRadius + 2.0f;
             float start_angle = (float)ImGui::GetTime() * 8.0f;
             const int num_segments = 12;
             for (int i = 0; i < num_segments; ++i)
@@ -644,36 +710,32 @@ void ToolbarPanel::drawScriptCompilationPopup()
                 float a = start_angle + (float)i * (2.0f * IM_PI) / (float)num_segments;
                 ImU32 col = ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, (float)i / (float)num_segments));
                 draw_list->AddLine(
-                    ImVec2(pos.x + cosf(a) * spinnerRadius, pos.y + sinf(a) * spinnerRadius),
-                    ImVec2(pos.x + cosf(a - IM_PI / (num_segments / 2)) * spinnerRadius,
-                           pos.y + sinf(a - IM_PI / (num_segments / 2)) * spinnerRadius),
-                    col, spinnerThickness);
+                    ImVec2(spinnerPos.x + cosf(a) * spinnerRadius, spinnerPos.y + sinf(a) * spinnerRadius),
+                    ImVec2(spinnerPos.x + cosf(a - IM_PI / (num_segments / 2)) * spinnerRadius,
+                           spinnerPos.y + sinf(a - IM_PI / (num_segments / 2)) * spinnerRadius),
+                    col, 2.5f);
             }
-            ImGui::Dummy(ImVec2(spinnerRadius * 2, spinnerRadius * 2));
+            ImGui::Dummy(ImVec2(spinnerRadius * 2 + 6.0f, spinnerRadius * 2));
+            ImGui::SameLine();
+            ImGui::TextUnformatted(("正在编译脚本: " + m_compilationStatus.Get()).c_str());
         }
         else
         {
-            ImGui::Dummy(ImVec2(0.0f, 10.0f));
-            ImVec4 color = m_compilationSuccess ? ImVec4(0.2f, 0.9f, 0.2f, 1) : ImVec4(0.9f, 0.2f, 0.2f, 1);
-            const char* icon = m_compilationSuccess ? "✔" : "✖";
-            std::string text = std::string(icon) + " " + m_compilationStatus;
-            float textWidth = ImGui::CalcTextSize(text.c_str()).x;
-            ImGui::SetCursorPosX((ImGui::GetWindowWidth() - textWidth) / 2.0f);
-            ImGui::TextColored(color, "%s", text.c_str());
-            ImGui::Dummy(ImVec2(0.0f, 15.0f));
-            ImGui::Separator();
-            ImGui::Dummy(ImVec2(0.0f, 5.0f));
-            const float buttonWidth = 120.0f;
-            ImGui::SetCursorPosX((ImGui::GetWindowWidth() - buttonWidth) / 2.0f);
-            if (ImGui::Button("确定", ImVec2(buttonWidth, 0)))
+            const bool ok = m_compilationSuccess.load();
+            ImVec4 color = ok ? ImVec4(0.2f, 0.9f, 0.2f, 1) : ImVec4(0.9f, 0.2f, 0.2f, 1);
+            const char* icon = ok ? "✔" : "✖";
+            ImGui::TextColored(color, "%s %s", icon, m_compilationStatus.Get().c_str());
+            if (!ok)
             {
-                m_isCompilingScripts = false;
-                ImGui::CloseCurrentPopup();
+                ImGui::SameLine();
+                if (ImGui::SmallButton("关闭"))
+                {
+                    m_compileResultShownAt = -1.0f;
+                }
             }
-            ImGui::SetItemDefaultFocus();
         }
-        ImGui::EndPopup();
     }
+    ImGui::End();
 }
 void ToolbarPanel::Shutdown()
 {
@@ -1528,6 +1590,40 @@ void ToolbarPanel::newScene()
         LogError("无法创建新场景：EditorContext 未初始化。");
         return;
     }
+    // 当前场景有未保存修改时先确认，避免 Ctrl+N 直接丢弃修改
+    if (m_context->activeScene && m_context->editorState == EditorState::Editing &&
+        SceneManager::GetInstance().IsCurrentSceneDirty())
+    {
+        PopupManager::GetInstance().Open("NewSceneConfirm");
+        return;
+    }
+    createNewSceneNow();
+}
+void ToolbarPanel::drawNewSceneConfirmPopup()
+{
+    ImGui::Text("当前场景有未保存的修改。\n创建新场景前要保存吗？");
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    if (ImGui::Button("保存并新建", ImVec2(110, 0)))
+    {
+        saveScene();
+        PopupManager::GetInstance().Close("NewSceneConfirm");
+        createNewSceneNow();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("不保存", ImVec2(90, 0)))
+    {
+        PopupManager::GetInstance().Close("NewSceneConfirm");
+        createNewSceneNow();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消", ImVec2(90, 0)))
+    {
+        PopupManager::GetInstance().Close("NewSceneConfirm");
+    }
+}
+void ToolbarPanel::createNewSceneNow()
+{
     auto queueNewScene = [ctx = m_context]()
     {
         if (ctx->activeScene)
@@ -1537,8 +1633,7 @@ void ToolbarPanel::newScene()
         }
         sk_sp<RuntimeScene> newScene = sk_make_sp<RuntimeScene>();
         newScene->SetName("NewScene");
-        newScene->AddEssentialSystem<Systems::HydrateResources>();
-        newScene->AddEssentialSystem<Systems::TransformSystem>();
+        SceneManager::ConfigureEditorPreviewSystems(newScene);
         newScene->Activate(*ctx->engineContext);
         SceneManager::GetInstance().SetCurrentScene(newScene);
         ctx->activeScene = newScene;
@@ -1551,7 +1646,7 @@ void ToolbarPanel::saveScene()
 {
     if (m_context->editingMode == EditingMode::Prefab)
     {
-        if (m_context->editingMode != EditingMode::Prefab || !m_context->activeScene) return;
+        if (!m_context->activeScene) return;
         auto& rootObjects = m_context->activeScene->GetRootGameObjects();
         if (rootObjects.empty() || !rootObjects[0].IsValid())
         {
@@ -1580,8 +1675,13 @@ void ToolbarPanel::saveScene()
     }
     else
     {
-        if (!m_context->activeScene->GetGuid().Valid()) { LogWarn("'另存为'功能尚未实现。"); }
-        else { SceneManager::GetInstance().SaveScene(m_context->activeScene); }
+        if (m_context->editorState != EditorState::Editing)
+        {
+            LogWarn("播放模式下不能保存场景，请先停止播放。");
+            return;
+        }
+        // SaveScene 已支持首次保存：无有效 GUID 时按场景名落盘到 Assets 并导入回填 GUID
+        SceneManager::GetInstance().SaveScene(m_context->activeScene);
     }
 }
 void ToolbarPanel::play()
@@ -1604,29 +1704,13 @@ void ToolbarPanel::play()
         *ctx->engineContext->appMode = ApplicationMode::PIE;
         ctx->editingScene = ctx->activeScene;
         sk_sp<RuntimeScene> playScene = ctx->editingScene->CreatePlayModeCopy();
-        playScene->AddEssentialSystem<Systems::HydrateResources>();
-        playScene->AddEssentialSystem<Systems::TransformSystem>();
-        playScene->AddSystem<Systems::PhysicsSystem>();
-        playScene->AddSystem<Systems::AudioSystem>();
-        playScene->AddSystem<Systems::InteractionSystem>();
-        playScene->AddSystem<Systems::ButtonSystem>();
-        playScene->AddSystemToMainThread<Systems::InputTextSystem>();
-        playScene->AddSystem<Systems::CommonUIControlSystem>();
-        playScene->AddSystem<Systems::ScriptingSystem>();
-        playScene->AddSystem<Systems::AnimationSystem>();
-        playScene->AddSystem<Systems::ParticleSystem>();
-        playScene->AddSystemToMainThread<Systems::AmbientZoneSystem>();
-        playScene->AddSystemToMainThread<Systems::AreaLightSystem>();
-        playScene->AddSystemToMainThread<Systems::LightingSystem>();
-        playScene->AddSystemToMainThread<Systems::ShadowRenderer>();
-        playScene->AddSystemToMainThread<Systems::IndirectLightingSystem>();
+        // 与运行时共用同一份系统注册列表，避免两处手写清单漂移（此前 PIE 缺 UILayoutSystem）
+        SceneManager::ConfigureGameplaySystems(playScene);
         SceneManager::GetInstance().SetCurrentScene(playScene);
         playScene->Activate(*ctx->engineContext);
-        std::cout << "原始场景地址: " << ctx->editingScene.get() << std::endl;
         ctx->activeScene = playScene;
         m_isTransitioningPlayState = false;
         LogInfo("已通过命令队列安全进入播放模式。");
-        std::cout << "场景地址: " << playScene.get() << std::endl;
     };
     m_context->engineContext->commandsForSim.Push(switchToPlayMode);
 }
@@ -1719,35 +1803,45 @@ void ToolbarPanel::packageGame()
 }
 void ToolbarPanel::handleShortcuts()
 {
-    if (!m_context->editor->GetPanelByName("场景")->IsFocused())
+    // 全局快捷键（不再要求场景面板聚焦）。使用 ImGui 键位链：
+    //  - 边沿触发（旧实现用按住状态，按住 Ctrl+Z 每帧撤销一次、Ctrl+S 每帧写盘）
+    //  - 精确修饰键匹配（旧实现 Ctrl+Shift+Z 会同时命中撤销与重做，相互抵消）
+    //  - 左右 Ctrl 均可用
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput)
     {
-        return;
+        return; // 正在文本输入，把快捷键留给输入框
     }
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::N.IsPressed())
+
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N))
     {
         newScene();
     }
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::S.IsPressed())
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S))
     {
         saveScene();
     }
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::P.IsPressed())
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_P))
     {
         if (m_context->editorState == EditorState::Editing) { play(); }
-        else if (m_context->editorState != EditorState::Editing) { stop(); }
+        else { stop(); }
     }
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::D.IsPressed())
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D))
     {
-        if (m_context->editorState == EditorState::Playing) { pause(); }
-        else if (m_context->editorState == EditorState::Paused) { m_context->editorState = EditorState::Playing; }
+        if (m_context->editorState != EditorState::Editing) { pause(); }
     }
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::Z.IsPressed())
+    // 拖拽/编辑控件进行中不响应撤销重做，避免撤销到编辑中途的状态
+    if (!ImGui::IsAnyItemActive())
     {
-        undo();
-    }
-    if (Keyboard::LeftCtrl.IsPressed() && Keyboard::LeftShift.IsPressed() && Keyboard::Z.IsPressed())
-    {
-        redo();
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z))
+        {
+            undo();
+        }
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z) ||
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y))
+        {
+            redo();
+        }
     }
 }
 void ToolbarPanel::startPackagingProcess()
@@ -1781,10 +1875,10 @@ void ToolbarPanel::startPackagingProcess()
             }
             m_packagingProgress = 0.0f;
             m_packagingStatus = "正在编译 C# 脚本 (目标: " + targetPlatformStr + ")...";
-            std::string compileStatus;
+            ThreadSafeText compileStatus;
             if (!runScriptCompilationLogicForPackaging(compileStatus, targetPlatform))
             {
-                throw std::runtime_error("脚本编译失败，打包已中止。详情: " + compileStatus);
+                throw std::runtime_error("脚本编译失败，打包已中止。详情: " + compileStatus.Get());
             }
             std::filesystem::path platformOutputDir = (targetPlatform == TargetPlatform::Android)
                                                           ? buildRoot / "Android"
@@ -2142,7 +2236,7 @@ void ToolbarPanel::startPackagingProcess()
         {
             m_packagingStatus = std::string("打包失败: ") + e.what();
             m_packagingSuccess = false;
-            LogError("{}", m_packagingStatus);
+            LogError("{}", m_packagingStatus.Get());
         }
         m_packagingProgress = 1.0f;
     });
@@ -2692,7 +2786,7 @@ std::filesystem::path ToolbarPanel::signAndroidApk(const std::filesystem::path& 
     LogInfo("已使用 apksigner 对 APK 进行签名: {}", signedApk.string());
     return signedApk;
 }
-bool ToolbarPanel::runScriptCompilationLogicForPackaging(std::string& statusMessage, TargetPlatform targetPlatform)
+bool ToolbarPanel::runScriptCompilationLogicForPackaging(ThreadSafeText& statusMessage, TargetPlatform targetPlatform)
 {
     const std::filesystem::path projectRoot = ProjectSettings::GetInstance().GetProjectRoot();
     const std::filesystem::path editorRoot = ".";
@@ -2708,10 +2802,10 @@ bool ToolbarPanel::runScriptCompilationLogicForPackaging(std::string& statusMess
         }
     }
     statusMessage = "正在构建宿主平台脚本 (用于生成元数据)...";
-    std::string hostStatus;
-    if (!runScriptCompilationLogic(hostStatus,libraryDir))
+    ThreadSafeText hostStatus;
+    if (!runScriptCompilationLogic(hostStatus, libraryDir))
     {
-        statusMessage = "宿主平台脚本编译失败: " + hostStatus;
+        statusMessage = "宿主平台脚本编译失败: " + hostStatus.Get();
         return false;
     }
     std::string metadataSnapshot;
@@ -2743,6 +2837,17 @@ bool ToolbarPanel::runScriptCompilationLogicForPackaging(std::string& statusMess
         dotnetRid = "win-x64";
         break;
     }
+    // 目标平台与宿主平台 RID 相同时，宿主构建产物可直接复用，跳过第二次完整 publish（打包时间近乎减半）
+    {
+        const TargetPlatform hostPlatform = ProjectSettings::GetCurrentHostPlatform();
+        const std::string hostRid = (hostPlatform == TargetPlatform::Windows) ? "win-x64" : "linux-x64";
+        if (dotnetRid == hostRid)
+        {
+            ScriptMetadataRegistry::GetInstance().Initialize(metadataYaml.string());
+            statusMessage = "脚本编译成功（宿主与目标平台一致，复用宿主构建产物）！目标平台: " + platformSubDir;
+            return true;
+        }
+    }
     const std::filesystem::path toolsDir = editorRoot / "Tools" / platformSubDir;
     try
     {
@@ -2766,16 +2871,8 @@ bool ToolbarPanel::runScriptCompilationLogicForPackaging(std::string& statusMess
         std::string projectRootStr = projectRoot.string();
         std::string libraryDirStr = libraryDir.string();
 #ifdef _WIN32
-        char shortProjectPath[MAX_PATH];
-        char shortLibraryPath[MAX_PATH];
-        if (GetShortPathNameA(projectRootStr.c_str(), shortProjectPath, MAX_PATH) > 0)
-        {
-            projectRootStr = shortProjectPath;
-        }
-        if (GetShortPathNameA(libraryDirStr.c_str(), shortLibraryPath, MAX_PATH) > 0)
-        {
-            libraryDirStr = shortLibraryPath;
-        }
+        projectRootStr = ToShortPathUtf8(projectRootStr);
+        libraryDirStr = ToShortPathUtf8(libraryDirStr);
 #endif
         std::string slnPathStr = (projectRoot / "LumaScripting.sln").string();
         const std::string publishCmd = "dotnet publish -c Release -r " + dotnetRid + " \"" +

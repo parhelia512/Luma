@@ -861,6 +861,8 @@ namespace Systems
         if (!currentScene) return;
 
         auto& tilemap = registry.get<ECS::TilemapComponent>(entity);
+        // 版本号递增：通知渲染提取端的瓦片缓存失效（本函数会整体重建 runtimeTileCache）
+        tilemap.runtimeCacheVersion++;
         auto tilemapGo = currentScene->FindGameObjectByEntity(entity);
         const auto& tilemapTransform = registry.get<ECS::TransformComponent>(entity);
 

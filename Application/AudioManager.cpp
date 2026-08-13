@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <vector>
 #include <cmath>
-#include "../Renderer/Camera.h"
 bool AudioManager::Initialize(int sampleRate, int channels)
 {
     if (m_audioStream)
@@ -27,6 +26,8 @@ bool AudioManager::Initialize(int sampleRate, int channels)
     }
     m_sampleRate = spec.freq;
     m_channels = spec.channels;
+    // 预分配混音缓冲（按 1 秒封顶的常见回调块大小预留），避免首次回调内分配
+    m_mixBuffer.resize(static_cast<size_t>(m_sampleRate / 10) * m_channels);
     SDL_ResumeAudioStreamDevice(m_audioStream);
     LogInfo("AudioManager: Initialized. {} Hz, channels {}", m_sampleRate, m_channels);
     return true;
@@ -126,17 +127,22 @@ void AudioManager::SDLAudioCallback(void* userdata, SDL_AudioStream* stream, int
     {
         return;
     }
-    std::vector<float> mix_buffer(static_cast<size_t>(frames_needed) * self->m_channels);
-    self->Mix(mix_buffer.data(), frames_needed);
-    SDL_PutAudioStreamData(stream, mix_buffer.data(), total_amount);
+    // 复用成员缓冲：仅在需求增长时扩容一次，稳态下回调内零堆分配
+    const size_t samplesNeeded = static_cast<size_t>(frames_needed) * self->m_channels;
+    if (self->m_mixBuffer.size() < samplesNeeded)
+    {
+        self->m_mixBuffer.resize(samplesNeeded);
+    }
+    self->Mix(self->m_mixBuffer.data(), frames_needed);
+    SDL_PutAudioStreamData(stream, self->m_mixBuffer.data(), total_amount);
 }
 void AudioManager::GetListener(float& lx, float& ly, float& lz, float& rx, float& ry, float& rz) const
 {
-    const auto props = CameraManager::GetInstance().GetActiveCamera().GetProperties();
-    lx = props.position.x();
-    ly = props.position.y();
+    // 只读原子缓存，不跨线程访问 CameraManager（相机状态由模拟线程通过 UpdateListener 喂入）
+    lx = m_listenerX.load(std::memory_order_relaxed);
+    ly = m_listenerY.load(std::memory_order_relaxed);
     lz = 0.0f;
-    const float theta = props.rotation;
+    const float theta = m_listenerRot.load(std::memory_order_relaxed);
     rx = std::cos(theta);
     ry = std::sin(theta);
     rz = 0.0f;

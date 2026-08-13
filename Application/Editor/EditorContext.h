@@ -57,7 +57,7 @@ struct EditorContext
     GraphicsBackend* graphicsBackend = nullptr; 
     Editor* editor = nullptr; 
     sk_sp<RuntimeScene> activeScene = nullptr; 
-    std::vector<RenderPacket> renderQueue; 
+    const std::vector<RenderPacket>* renderQueue = nullptr; ///< 指向 RenderableManager 双缓冲的当前帧渲染包（同帧内有效，避免整帧深拷贝）。
     sk_sp<RuntimeScene> editingScene = nullptr; 
     sk_sp<RuntimeScene> sceneBeforePrefabEdit = nullptr; 
     std::string currentSceneName; 

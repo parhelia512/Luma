@@ -1,6 +1,8 @@
 #ifndef TOOLBARPANEL_H
 #define TOOLBARPANEL_H
+#include <atomic>
 #include <future>
+#include <mutex>
 #include <vector>
 #include <array>
 #include "IEditorPanel.h"
@@ -8,6 +10,42 @@
 #include <filesystem>
 enum class TargetPlatform;
 class ProjectSettings;
+
+/**
+ * @brief 可跨线程读写的状态文本。
+ *
+ * 后台任务（脚本编译/打包）持续写入进度描述，UI 线程每帧读取显示。
+ * std::string 的并发读写是未定义行为，这里用互斥锁封装。
+ */
+class ThreadSafeText
+{
+public:
+    ThreadSafeText() = default;
+    ThreadSafeText& operator=(const std::string& text)
+    {
+        Set(text);
+        return *this;
+    }
+    ThreadSafeText& operator=(const char* text)
+    {
+        Set(text ? std::string(text) : std::string());
+        return *this;
+    }
+    void Set(std::string text)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_text = std::move(text);
+    }
+    std::string Get() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_text;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::string m_text;
+};
 class ToolbarPanel : public IEditorPanel
 {
 public:
@@ -32,10 +70,13 @@ private:
     void drawFpsDisplay();
     void updateFps();
     void rebuildScripts();
-    bool runScriptCompilationLogic(std::string& statusMessage, const std::filesystem::path& outPath = "");
+    void launchScriptCompilation();
+    bool runScriptCompilationLogic(ThreadSafeText& statusMessage, const std::filesystem::path& outPath = "");
     void drawPreferencesPopup();
     void drawScriptCompilationPopup();
     void newScene();
+    void createNewSceneNow();
+    void drawNewSceneConfirmPopup();
     void saveScene();
     void play();
     void pause();
@@ -46,7 +87,7 @@ private:
     void packageGame();
     void handleShortcuts();
     void startPackagingProcess();
-    bool runScriptCompilationLogicForPackaging(std::string& statusMessage, TargetPlatform targetPlatform);
+    bool runScriptCompilationLogicForPackaging(ThreadSafeText& statusMessage, TargetPlatform targetPlatform);
     void updateAndroidGradleProperties(const std::filesystem::path& platformOutputDir, const ProjectSettings& settings);
     std::filesystem::path signAndroidApk(const std::filesystem::path& unsignedApk, const ProjectSettings& settings);
     void refreshKeystoreCandidates(const std::filesystem::path& projectRoot);
@@ -54,18 +95,20 @@ private:
     void drawCreateKeystorePopup();
     void drawCreateAliasPopup();
     SDL_Window* getSDLWindow() const;
-    bool m_isPackaging = false; 
-    std::string m_packagingStatus; 
-    float m_packagingProgress = 0.0f; 
+    std::atomic<bool> m_isPackaging{false};
+    ThreadSafeText m_packagingStatus;
+    std::atomic<float> m_packagingProgress{0.0f};
     bool m_isSettingsWindowVisible; 
-    bool m_isCompilingScripts; 
-    bool m_compilationFinished; 
-    bool m_compilationSuccess; 
-    std::string m_compilationStatus; 
+    std::atomic<bool> m_isCompilingScripts{false};
+    std::atomic<bool> m_compilationFinished{false};
+    std::atomic<bool> m_compilationSuccess{false};
+    std::atomic<bool> m_recompileQueued{false}; ///< 编译期间又有脚本变更时置位，本轮结束后自动补编一轮。
+    float m_compileResultShownAt = -1.0f; ///< 编译结果角标的展示起始时间（UI 线程使用）。
+    ThreadSafeText m_compilationStatus;
     ListenerHandle m_CSharpScriptUpdated; 
     std::future<void> m_packagingFuture; 
     std::future<void> m_compilationFuture; 
-    bool m_packagingSuccess; 
+    std::atomic<bool> m_packagingSuccess{false};
     std::filesystem::path m_lastBuildDirectory; 
     bool m_isTransitioningPlayState = false; 
     bool m_shouldOpenKeystorePicker = false;

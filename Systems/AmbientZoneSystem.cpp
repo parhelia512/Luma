@@ -35,6 +35,15 @@ namespace Systems
 
     void AmbientZoneSystem::OnUpdate(RuntimeScene* scene, float deltaTime, EngineContext& engineCtx)
     {
+        // 幂等重挂：PIE 场景销毁时会把 LightingRenderer 的引用置空，编辑场景实例需重新接管
+        {
+            auto& lightingRenderer = LightingRenderer::GetInstance();
+            if (lightingRenderer.IsInitialized())
+            {
+                lightingRenderer.SetAmbientZoneSystem(this);
+            }
+        }
+
         // 1. 收集所有环境光区域
         CollectAmbientZones(scene);
 

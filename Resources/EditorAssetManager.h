@@ -197,7 +197,7 @@ private:
 
     std::atomic<bool> m_isScanning = false; ///< 指示当前是否正在进行资产扫描。
     float m_rescanTimer = 0.0f; ///< 重新扫描计时器。
-    static constexpr float RESCAN_INTERVAL = 0.f; ///< 重新扫描的时间间隔。
+    static constexpr float RESCAN_INTERVAL = 2.0f; ///< 重新扫描的时间间隔（秒）。文件级变更由 FileWatcher 即时捕获，全量扫描仅作新增/删除兜底。
 
     std::unique_ptr<ScanResult> m_scanResult; ///< 存储最新扫描结果的智能指针。
     std::mutex m_scanResultMutex; ///< 保护扫描结果的互斥锁。

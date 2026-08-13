@@ -73,7 +73,9 @@ public:
      * @brief 调度一个作业到作业系统执行。
      *
      * 作业将被放入队列，等待空闲线程执行。
-     * @param job 指向要调度的作业对象的指针。作业系统会接管其所有权。
+     * @param job 指向要调度的作业对象的指针。作业系统【不】接管其所有权，
+     *            调用方必须保证该对象在作业执行完成前保持存活（典型用法：
+     *            栈上或容器内的作业对象 + JobSystem::Complete 等待完成）。
      * @return 一个 JobHandle，可用于等待作业完成。
      */
     JobHandle Schedule(IJob* job);
@@ -123,6 +125,7 @@ private:
     std::condition_variable m_condition; ///< 用于线程等待新任务的条件变量。
     std::atomic<bool> m_stop = false; ///< 原子标志，指示作业系统是否正在停止。
     std::atomic<int> m_activeJobs = 0; ///< 当前正在执行或等待执行的作业数量。
+    std::atomic<int> m_queuedTasks = 0; ///< 当前仍在队列中等待被取走的任务数量（等待谓词依据）。
 
     std::atomic<unsigned int> m_nextQueueIndex = 0; ///< 用于任务调度的下一个队列索引。
 };

@@ -43,6 +43,18 @@ public:
         std::lock_guard<std::mutex> lock(m_viewportMutex);
         return m_viewport;
     }
+
+    /**
+     * @brief 清除视口（禁用提取端/插值端的视口剔除）。
+     *
+     * 编辑模式下实际渲染视角是编辑器相机而非场景激活相机，用激活相机的视口做剔除
+     * 会把编辑器视野内的对象错误剔掉，因此编辑状态下应清除视口做全量渲染。
+     */
+    void ClearViewport()
+    {
+        std::lock_guard<std::mutex> lock(m_viewportMutex);
+        m_viewport = ViewportBounds{};
+    }
 private:
     std::shared_ptr<RenderableFrame> prevFrame;
     std::shared_ptr<RenderableFrame> currFrame;
@@ -70,9 +82,11 @@ private:
     std::atomic<uint64_t> prevFrameVersion{0};
     std::atomic<uint64_t> currFrameVersion{0};
     std::atomic<float> m_externalAlpha{-1.0f};
+    std::atomic<float> m_lastBuiltAlpha{-1.0f}; ///< 上次重建包时使用的插值 alpha。
     mutable std::mutex m_viewportMutex;
     ViewportBounds m_viewport;
-    bool needsRebuild() const;
-    void updateCacheState();
+    float computeEffectiveAlpha() const;
+    bool needsRebuild(float candidateAlpha) const;
+    void updateCacheState(float alphaUsed);
 };
 #endif 

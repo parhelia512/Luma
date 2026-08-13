@@ -194,8 +194,7 @@ void AssetBrowserPanel::ProcessDoubleClick(const Item& item)
             if (newScene)
             {
                 m_context->activeScene = newScene;
-                m_context->activeScene->AddEssentialSystem<Systems::HydrateResources>();
-                m_context->activeScene->AddEssentialSystem<Systems::TransformSystem>();
+                SceneManager::ConfigureEditorPreviewSystems(m_context->activeScene);
                 m_context->activeScene->Activate(*m_context->engineContext);
                 m_context->selectionType = SelectionType::NA;
                 m_context->selectionList = std::vector<Guid>();
@@ -228,8 +227,7 @@ void AssetBrowserPanel::ProcessDoubleClick(const Item& item)
             m_context->activeScene = sk_make_sp<RuntimeScene>();
             m_context->activeScene->SetName("Prefab编辑模式");
             m_context->activeScene->Instantiate(*prefab, nullptr);
-            m_context->activeScene->AddEssentialSystem<Systems::HydrateResources>();
-            m_context->activeScene->AddEssentialSystem<Systems::TransformSystem>();
+            SceneManager::ConfigureEditorPreviewSystems(m_context->activeScene);
             m_context->activeScene->Activate(*m_context->engineContext);
             SceneManager::GetInstance().SetCurrentScene(m_context->activeScene);
             m_context->selectionList = std::vector<Guid>();

@@ -56,6 +56,15 @@ namespace Systems
         float viewHeight = props.viewport.height() / props.GetEffectiveZoom().y();
         glm::vec2 cameraPos(props.position.x(), props.position.y());
 
+        // 编辑模式下不按激活相机视锥剔除（场景视图实际使用编辑器相机），
+        // 否则编辑预览里视野内的面光源会被错误剔掉
+        if (*engineCtx.appMode == ApplicationMode::Editor)
+        {
+            constexpr float kUnbounded = 1.0e9f;
+            viewWidth = kUnbounded;
+            viewHeight = kUnbounded;
+        }
+
         // 3. 执行视锥剔除
         CullAreaLights(cameraPos, viewWidth, viewHeight);
 

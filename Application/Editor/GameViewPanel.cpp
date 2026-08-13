@@ -112,9 +112,12 @@ void GameViewPanel::Draw()
                 uiCamera.SetProperties(uiCamProps);
                 
                 m_context->graphicsBackend->SetActiveRenderTarget(m_gameViewTarget);
-                for (const auto& packet : m_context->renderQueue)
+                if (m_context->renderQueue)
                 {
-                    m_context->engineContext->renderSystem->Submit(packet);
+                    for (const auto& packet : *m_context->renderQueue)
+                    {
+                        m_context->engineContext->renderSystem->Submit(packet);
+                    }
                 }
                 m_context->engineContext->renderSystem->Flush();
                 m_context->graphicsBackend->Submit();

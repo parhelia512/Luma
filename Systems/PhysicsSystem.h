@@ -173,6 +173,7 @@ namespace Systems
         std::unique_ptr<TaskSystem> m_taskSystem; ///< 任务系统，可能用于异步物理操作。
 
         float m_accumulator = 0.0f; ///< 物理步进累加器。
+        std::vector<entt::entity> m_dirtyEntityScratch; ///< 脏碰撞体收集缓冲（复用，避免每帧堆分配）。
         std::unordered_set<EntityPair, EntityPairHash> m_currentContacts; ///< 当前正在接触的实体对集合。
         std::unordered_set<EntityPair, EntityPairHash> m_currentTriggers; ///< 当前正在触发的实体对集合。
         ListenerHandle m_componentUpdateListener; /// < 组件更新事件的监听器句柄。

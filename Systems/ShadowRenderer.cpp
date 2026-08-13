@@ -53,6 +53,11 @@ namespace Systems
 
     void ShadowRenderer::OnUpdate(RuntimeScene* scene, float deltaTime, EngineContext& engineCtx)
     {
+        // 幂等重挂：PIE 场景销毁时其实例的 OnDestroy 会清空静态指针与 QualityManager 引用，
+        // 编辑场景实例恢复更新后需要重新接管
+        s_instance = this;
+        QualityManager::GetInstance().SetShadowRenderer(this);
+
         if (!m_enabled)
             return;
 

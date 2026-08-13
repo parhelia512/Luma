@@ -2316,22 +2316,8 @@ C# Scripting Example
                     *c->engineContext->appMode = ApplicationMode::PIE;
                     c->editingScene = c->activeScene;
                     sk_sp<RuntimeScene> playScene = c->editingScene->CreatePlayModeCopy();
-                    playScene->AddEssentialSystem<Systems::HydrateResources>();
-                    playScene->AddEssentialSystem<Systems::TransformSystem>();
-                    playScene->AddSystem<Systems::PhysicsSystem>();
-                    playScene->AddSystem<Systems::AudioSystem>();
-                    playScene->AddSystem<Systems::InteractionSystem>();
-                    playScene->AddSystem<Systems::ButtonSystem>();
-                    playScene->AddSystemToMainThread<Systems::InputTextSystem>();
-                    playScene->AddSystem<Systems::CommonUIControlSystem>();
-                    playScene->AddSystem<Systems::ScriptingSystem>();
-                    playScene->AddSystem<Systems::AnimationSystem>();
-                    playScene->AddSystem<Systems::ParticleSystem>();
-                    playScene->AddSystemToMainThread<Systems::AmbientZoneSystem>();
-                    playScene->AddSystemToMainThread<Systems::AreaLightSystem>();
-                    playScene->AddSystemToMainThread<Systems::LightingSystem>();
-                    playScene->AddSystemToMainThread<Systems::ShadowRenderer>();
-                    playScene->AddSystemToMainThread<Systems::IndirectLightingSystem>();
+                    // 与工具栏 PIE / 运行时共用同一份系统注册列表，避免第三份手写清单漂移
+                    SceneManager::ConfigureGameplaySystems(playScene);
                     SceneManager::GetInstance().SetCurrentScene(playScene);
                     playScene->Activate(*c->engineContext);
                     c->activeScene = playScene;

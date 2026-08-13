@@ -8,10 +8,12 @@
 #include "../Resources/Loaders/PhysicsMaterialLoader.h"
 
 
+#include "../Components/ActivityComponent.h"
 #include "../Components/ColliderComponent.h"
 #include "../Components/IDComponent.h"
 #include "../Components/Rigidbody.h"
 #include "../Components/Transform.h"
+#include <algorithm>
 
 
 #include "TaskSystem.h"
@@ -270,7 +272,8 @@ namespace Systems
         }
         auto& registry = scene->GetRegistry();
         {
-            std::unordered_set<entt::entity> dirtyEntities;
+            // 收集脏碰撞体：复用成员缓冲，避免每帧构造 unordered_set（绝大多数帧没有脏实体）
+            m_dirtyEntityScratch.clear();
 
             auto collectDirty = [&](const auto& view)
             {
@@ -278,7 +281,11 @@ namespace Systems
                 {
                     if (component.isDirty)
                     {
-                        dirtyEntities.insert(entity);
+                        if (std::find(m_dirtyEntityScratch.begin(), m_dirtyEntityScratch.end(), entity) ==
+                            m_dirtyEntityScratch.end())
+                        {
+                            m_dirtyEntityScratch.push_back(entity);
+                        }
                     }
                 }
             };
@@ -291,7 +298,7 @@ namespace Systems
             collectDirty(registry.view<ECS::TilemapColliderComponent>());
 
 
-            for (const auto entity : dirtyEntities)
+            for (const auto entity : m_dirtyEntityScratch)
             {
                 if (registry.valid(entity))
                 {
@@ -325,15 +332,20 @@ namespace Systems
         }
 
 
-        auto kinematicView = registry.view<ECS::TransformComponent, ECS::RigidBodyComponent>();
-        for (auto entity : kinematicView)
+        // 单次遍历同步运动学与动态刚体（旧实现对同一视图连续遍历两遍）；
+        // 激活状态直接查组件，避免每实体构造 RuntimeGameObject 包装
+        auto bodyView = registry.view<ECS::TransformComponent, ECS::RigidBodyComponent>();
+        for (auto entity : bodyView)
         {
-            if (!scene->FindGameObjectByEntity(entity).IsActive())
+            if (const auto* activity = registry.try_get<ECS::ActivityComponent>(entity);
+                activity && !activity->isActive)
                 continue;
-            auto [transform, rb] = kinematicView.get<ECS::TransformComponent, ECS::RigidBodyComponent>(entity);
+            auto [transform, rb] = bodyView.get<ECS::TransformComponent, ECS::RigidBodyComponent>(entity);
             if (!rb.Enable)
                 continue;
-            if (rb.bodyType == ECS::BodyType::Kinematic && rb.runtimeBody.index1 != B2_NULL_INDEX)
+            if (rb.runtimeBody.index1 == B2_NULL_INDEX)
+                continue;
+            if (rb.bodyType == ECS::BodyType::Kinematic)
             {
                 b2Vec2 currentPos = b2Body_GetPosition(rb.runtimeBody);
                 b2Vec2 desiredPos = {transform.position.x / PIXELS_PER_METER, -transform.position.y / PIXELS_PER_METER};
@@ -346,18 +358,8 @@ namespace Systems
                 float angleDiff = desiredAngle - currentAngle;
                 b2Body_SetAngularVelocity(rb.runtimeBody, angleDiff / timeStep);
             }
-        }
-
-        
-        {
-            auto dynView = registry.view<ECS::TransformComponent, ECS::RigidBodyComponent>();
-            for (auto entity : dynView)
+            else if (rb.bodyType == ECS::BodyType::Dynamic)
             {
-                if (!scene->FindGameObjectByEntity(entity).IsActive()) continue;
-                auto [transform, rb] = dynView.get<ECS::TransformComponent, ECS::RigidBodyComponent>(entity);
-                if (!rb.Enable) continue;
-                if (rb.bodyType != ECS::BodyType::Dynamic || rb.runtimeBody.index1 == B2_NULL_INDEX) continue;
-
                 b2Vec2 bodyPos = b2Body_GetPosition(rb.runtimeBody);
                 float tx = transform.position.x * METER_PER_PIXEL;
                 float ty = -transform.position.y * METER_PER_PIXEL;
@@ -516,7 +518,8 @@ namespace Systems
         auto dynamicView = registry.view<ECS::TransformComponent, ECS::RigidBodyComponent>();
         for (auto entity : dynamicView)
         {
-            if (!scene->FindGameObjectByEntity(entity).IsActive())
+            if (const auto* activity = registry.try_get<ECS::ActivityComponent>(entity);
+                activity && !activity->isActive)
                 continue;
             auto [transform, rb] = dynamicView.get<ECS::TransformComponent, ECS::RigidBodyComponent>(entity);
             if (!rb.Enable)
@@ -537,7 +540,8 @@ namespace Systems
             auto rbView = registry.view<ECS::RigidBodyComponent>();
             for (auto entity : rbView)
             {
-                if (!scene->FindGameObjectByEntity(entity).IsActive())
+                if (const auto* activity = registry.try_get<ECS::ActivityComponent>(entity);
+                    activity && !activity->isActive)
                     continue;
                 auto& rb = rbView.get<ECS::RigidBodyComponent>(entity);
                 if (!rb.Enable)

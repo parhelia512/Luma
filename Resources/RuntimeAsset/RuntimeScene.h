@@ -270,6 +270,12 @@ public:
     Guid GetGuid() { return m_sourceGuid; }
 
     /**
+     * @brief 设置场景的源GUID（首次保存落盘并导入为资产后回填）。
+     * @param guid 资产GUID。
+     */
+    void SetGuid(const Guid& guid) { m_sourceGuid = guid; }
+
+    /**
      * @brief 将一个游戏对象添加到场景的根对象列表。
      * @param go 要添加的游戏对象。
      */

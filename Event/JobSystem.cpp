@@ -88,9 +88,10 @@ JobHandle JobSystem::Schedule(IJob* job)
         std::lock_guard<std::mutex> lock(m_queueMutexes[queueIndex]);
         m_taskQueues[queueIndex].push_back(std::move(task));
     }
+    m_queuedTasks.fetch_add(1, std::memory_order_release);
 
-
-    m_condition.notify_all();
+    // 只唤醒一个等待线程即可，避免每次调度都惊群
+    m_condition.notify_one();
     return handle;
 }
 
@@ -132,10 +133,12 @@ void JobSystem::workerLoop(int threadIndex)
         }
         else
         {
+            // 以“队列中尚未被取走的任务数”为谓词：其他线程正在执行任务但队列已空时，
+            // 本线程应当休眠，而不是空转轮询（旧实现用 m_activeJobs>0 导致忙等烧 CPU）。
             std::unique_lock<std::mutex> lock(m_globalMutex);
             m_condition.wait(lock, [this]
             {
-                return m_stop.load() || m_activeJobs.load() > 0;
+                return m_stop.load() || m_queuedTasks.load(std::memory_order_acquire) > 0;
             });
         }
     }
@@ -148,6 +151,7 @@ std::packaged_task<void()> JobSystem::tryPopTaskFromLocalQueue()
     {
         auto task = std::move(m_taskQueues[s_threadIndex].back());
         m_taskQueues[s_threadIndex].pop_back();
+        m_queuedTasks.fetch_sub(1, std::memory_order_acq_rel);
         return task;
     }
     return {};
@@ -168,6 +172,7 @@ std::packaged_task<void()> JobSystem::tryStealTaskFromOtherQueues()
         {
             auto task = std::move(m_taskQueues[victimIndex].front());
             m_taskQueues[victimIndex].pop_front();
+            m_queuedTasks.fetch_sub(1, std::memory_order_acq_rel);
             return task;
         }
     }

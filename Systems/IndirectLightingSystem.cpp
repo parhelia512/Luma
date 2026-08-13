@@ -34,6 +34,9 @@ namespace Systems
 
     void IndirectLightingSystem::OnUpdate(RuntimeScene* scene, float deltaTime, EngineContext& engineCtx)
     {
+        // 幂等重挂：PIE 场景销毁会清空静态实例指针，编辑场景实例恢复更新后重新接管
+        s_instance = this;
+
         if (!m_enabled)
             return;
 

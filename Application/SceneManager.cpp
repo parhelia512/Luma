@@ -19,6 +19,9 @@
 #include "TransformSystem.h"
 #include "UILayoutSystem.h"
 #include "../Systems/ParticleSystem.h"
+#include "ProjectSettings.h"
+#include <algorithm>
+#include <chrono>
 #include "../Resources/AssetManager.h"
 #include "../Resources/Managers/RuntimeSceneManager.h"
 #include "../Data/SceneData.h"
@@ -112,14 +115,16 @@ bool SceneManager::SaveScene(sk_sp<RuntimeScene> scene)
     m_markedAsDirty = false;
     if (!scene) return false;
     const AssetMetadata* meta = AssetManager::GetInstance().GetMetadata(scene->GetGuid());
+    const bool isFirstSave = (meta == nullptr);
     std::filesystem::path sceneName;
-    if (!meta)
+    if (isFirstSave)
     {
-        sceneName = "NewScene.scene";
+        std::string baseName = scene->GetName().empty() ? std::string("NewScene") : scene->GetName();
+        sceneName = baseName + ".scene";
         int counter = 1;
         while (std::filesystem::exists(AssetManager::GetInstance().GetAssetsRootPath() / sceneName))
         {
-            sceneName = "NewScene_" + std::to_string(counter++) + ".scene";
+            sceneName = baseName + "_" + std::to_string(counter++) + ".scene";
         }
     }
     else
@@ -128,10 +133,81 @@ bool SceneManager::SaveScene(sk_sp<RuntimeScene> scene)
     }
     Data::SceneData sceneData = scene->SerializeToData();
     YAML::Node sceneNode = YAML::convert<Data::SceneData>::encode(sceneData);
-    std::string targetPath = (AssetManager::GetInstance().GetAssetsRootPath() / sceneName).generic_string();
-    std::ofstream fout(targetPath);
+    std::filesystem::path targetPath = AssetManager::GetInstance().GetAssetsRootPath() / sceneName;
+    std::ofstream fout(targetPath.generic_string());
+    if (!fout.is_open())
+    {
+        LogError("保存场景失败，无法写入文件: {}", targetPath.generic_string());
+        return false;
+    }
     fout << sceneNode;
     fout.close();
+    if (isFirstSave)
+    {
+        // 首次保存：立即导入为资产并把 GUID 回填给场景，
+        // 否则场景一直保持无效 GUID，每次保存都会生成一个新的 NewScene_N.scene。
+        Guid importedGuid = AssetManager::GetInstance().LoadAsset(targetPath);
+        if (importedGuid.Valid())
+        {
+            scene->SetGuid(importedGuid);
+            scene->SetName(sceneName.stem().string());
+            LogInfo("场景首次保存为 {}，GUID: {}", sceneName.generic_string(), importedGuid.ToString());
+        }
+        else
+        {
+            LogWarn("场景已写出到 {}，但导入资产库失败，下次保存可能生成新文件。", targetPath.generic_string());
+        }
+    }
+    return true;
+}
+bool SceneManager::AutoSaveCurrentScene()
+{
+    sk_sp<RuntimeScene> scene;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_currentSceneMutex);
+        scene = m_currentScene;
+    }
+    if (!scene) return false;
+    std::error_code ec;
+    const std::filesystem::path autosaveDir =
+        ProjectSettings::GetInstance().GetProjectRoot() / "Library" / "Autosave";
+    std::filesystem::create_directories(autosaveDir, ec);
+    if (ec)
+    {
+        LogWarn("自动保存目录创建失败: {}", ec.message());
+        return false;
+    }
+    const std::string baseName = scene->GetName().empty() ? std::string("Untitled") : scene->GetName();
+    const auto now = std::chrono::system_clock::now();
+    const auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    const std::filesystem::path target = autosaveDir / (baseName + "_" + std::to_string(timestamp) + ".scene");
+
+    Data::SceneData sceneData = scene->SerializeToData();
+    YAML::Node sceneNode = YAML::convert<Data::SceneData>::encode(sceneData);
+    std::ofstream fout(target.generic_string());
+    if (!fout.is_open()) return false;
+    fout << sceneNode;
+    fout.close();
+
+    // 只保留该场景最近 5 份自动保存
+    std::vector<std::filesystem::path> backups;
+    for (const auto& entry : std::filesystem::directory_iterator(autosaveDir, ec))
+    {
+        if (ec) break;
+        if (entry.is_regular_file() && entry.path().extension() == ".scene" &&
+            entry.path().filename().string().rfind(baseName + "_", 0) == 0)
+        {
+            backups.push_back(entry.path());
+        }
+    }
+    std::sort(backups.begin(), backups.end());
+    constexpr size_t kMaxBackups = 5;
+    while (backups.size() > kMaxBackups)
+    {
+        std::filesystem::remove(backups.front(), ec);
+        backups.erase(backups.begin());
+    }
+    LogInfo("场景已自动保存: {}", target.generic_string());
     return true;
 }
 bool SceneManager::SaveCurrentScene()
@@ -206,6 +282,42 @@ sk_sp<RuntimeScene> SceneManager::loadSceneFromDisk(const Guid& guid)
     }
     return newScene;
 }
+void SceneManager::ConfigureGameplaySystems(const sk_sp<RuntimeScene>& scene)
+{
+    if (!scene) return;
+    scene->AddEssentialSystem<Systems::HydrateResources>();
+    scene->AddEssentialSystem<Systems::TransformSystem>();
+    scene->AddSystem<Systems::PhysicsSystem>();
+    scene->AddSystem<Systems::InteractionSystem>();
+    scene->AddSystem<Systems::AudioSystem>();
+    scene->AddSystem<Systems::ButtonSystem>();
+    scene->AddSystemToMainThread<Systems::InputTextSystem>();
+    scene->AddSystem<Systems::CommonUIControlSystem>();
+    scene->AddSystem<Systems::UILayoutSystem>();
+#if !defined(LUMA_DISABLE_SCRIPTING)
+    scene->AddSystem<Systems::ScriptingSystem>();
+#endif
+    scene->AddSystem<Systems::AnimationSystem>();
+    scene->AddSystem<Systems::ParticleSystem>();
+    scene->AddSystemToMainThread<Systems::AmbientZoneSystem>();
+    scene->AddSystemToMainThread<Systems::AreaLightSystem>();
+    scene->AddSystemToMainThread<Systems::LightingSystem>();
+    scene->AddSystemToMainThread<Systems::ShadowRenderer>();
+    scene->AddSystemToMainThread<Systems::IndirectLightingSystem>();
+    LogInfo("游戏玩法系统已配置完成，场景: {}", scene->GetName());
+}
+void SceneManager::ConfigureEditorPreviewSystems(const sk_sp<RuntimeScene>& scene)
+{
+    if (!scene) return;
+    scene->AddEssentialSystem<Systems::HydrateResources>();
+    scene->AddEssentialSystem<Systems::TransformSystem>();
+    scene->AddSystemToMainThread<Systems::AmbientZoneSystem>();
+    scene->AddSystemToMainThread<Systems::AreaLightSystem>();
+    scene->AddSystemToMainThread<Systems::LightingSystem>();
+    scene->AddSystemToMainThread<Systems::ShadowRenderer>();
+    scene->AddSystemToMainThread<Systems::IndirectLightingSystem>();
+    LogInfo("编辑器预览系统已配置完成，场景: {}", scene->GetName());
+}
 void SceneManager::setupRuntimeSystems(sk_sp<RuntimeScene> scene, EngineContext* context)
 {
     if (!scene)
@@ -215,26 +327,7 @@ void SceneManager::setupRuntimeSystems(sk_sp<RuntimeScene> scene, EngineContext*
     }
     auto setupSystems = [scene]()
     {
-        scene->AddEssentialSystem<Systems::HydrateResources>();
-        scene->AddEssentialSystem<Systems::TransformSystem>();
-        scene->AddSystem<Systems::PhysicsSystem>();
-        scene->AddSystem<Systems::InteractionSystem>();
-        scene->AddSystem<Systems::AudioSystem>();
-        scene->AddSystem<Systems::ButtonSystem>();
-        scene->AddSystemToMainThread<Systems::InputTextSystem>();
-        scene->AddSystem<Systems::CommonUIControlSystem>();
-        scene->AddSystem<Systems::UILayoutSystem>();
-#if !defined(LUMA_DISABLE_SCRIPTING)
-        scene->AddSystem<Systems::ScriptingSystem>();
-#endif
-        scene->AddSystem<Systems::AnimationSystem>();
-        scene->AddSystem<Systems::ParticleSystem>();
-        scene->AddSystemToMainThread<Systems::AmbientZoneSystem>();
-        scene->AddSystemToMainThread<Systems::AreaLightSystem>();
-        scene->AddSystemToMainThread<Systems::LightingSystem>();
-        scene->AddSystemToMainThread<Systems::ShadowRenderer>();
-        scene->AddSystemToMainThread<Systems::IndirectLightingSystem>();
-        LogInfo("运行时系统已配置完成，场景: {}", scene->GetName());
+        ConfigureGameplaySystems(scene);
     };
     if (context)
     {

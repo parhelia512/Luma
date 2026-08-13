@@ -1,8 +1,9 @@
 #ifndef EVENTBUS_H
 #define EVENTBUS_H
 
-#include <any>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <typeindex>
 #include <unordered_map>
 
@@ -14,6 +15,9 @@
  *
  * 这是一个单例模式的事件总线，允许组件之间通过事件进行解耦通信。
  * 任何类型的事件都可以被发布，并且可以有多个监听器订阅特定类型的事件。
+ *
+ * 线程安全：内部表由互斥锁保护，事件对象以 shared_ptr 稳定存储（哈希表扩容不
+ * 影响正在分发的事件对象）；实际分发在锁外进行，由 LumaEvent 自身的锁保证安全。
  */
 class LUMA_API EventBus : public LazySingleton<EventBus>
 {
@@ -44,7 +48,7 @@ public:
     /**
      * @brief 发布一个特定类型的事件。
      *
-     * 所有订阅了该类型事件的监听器都将被调用。
+     * 所有订阅了该类型事件的监听器都将被调用。监听器在调用方线程上同步执行。
      *
      * @tparam TEvent 事件类型。
      * @param event 要发布的事件对象。
@@ -64,46 +68,53 @@ private:
     ~EventBus() override = default;
 
     template <typename TEvent>
-    LumaEvent<const TEvent&>& getEvent();
+    std::shared_ptr<LumaEvent<const TEvent&>> getEventPtr();
 
-    std::unordered_map<std::type_index, std::any> m_events; ///< 存储不同类型的事件对象，按事件类型索引。
-    std::unordered_map<uint64_t, std::function<void()>> m_unsubscribers; ///< 存储取消订阅操作的回调函数，按全局句柄ID索引。
+    mutable std::mutex m_mutex; ///< 保护下方两个表的互斥锁。
+    std::unordered_map<std::type_index, std::shared_ptr<void>> m_events; ///< 各事件类型对应的事件对象（地址稳定）。
+    std::unordered_map<uint64_t, std::function<void()>> m_unsubscribers; ///< 取消订阅回调，按全局句柄ID索引。
     uint64_t m_nextHandleId = 1; ///< 下一个可用的全局监听器句柄ID。
 };
 
 
 template <typename TEvent>
-LumaEvent<const TEvent&>& EventBus::getEvent()
+std::shared_ptr<LumaEvent<const TEvent&>> EventBus::getEventPtr()
 {
-    auto typeId = std::type_index(typeid(TEvent));
-    if (!m_events.contains(typeId))
+    const auto typeId = std::type_index(typeid(TEvent));
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_events.find(typeId);
+    if (it == m_events.end())
     {
-        m_events[typeId] = LumaEvent<const TEvent&>();
+        auto created = std::make_shared<LumaEvent<const TEvent&>>();
+        m_events[typeId] = created;
+        return created;
     }
-    return std::any_cast<LumaEvent<const TEvent&>&>(m_events.at(typeId));
+    return std::static_pointer_cast<LumaEvent<const TEvent&>>(it->second);
 }
 
 template <typename TEvent>
 ListenerHandle EventBus::Subscribe(typename LumaEvent<const TEvent&>::Listener&& listener)
 {
-    auto& specificEvent = getEvent<TEvent>();
+    auto eventPtr = getEventPtr<TEvent>();
 
-
-    const ListenerHandle localHandle = specificEvent.AddListener(std::move(listener));
+    const ListenerHandle localHandle = eventPtr->AddListener(std::move(listener));
     if (!localHandle.IsValid())
     {
         return {};
     }
 
-
+    std::lock_guard<std::mutex> lock(m_mutex);
     const uint64_t globalId = m_nextHandleId++;
 
-
-    m_unsubscribers[globalId] = [this, localHandle]
+    // 捕获事件对象的弱引用，Clear() 后取消订阅调用可安全地成为空操作
+    std::weak_ptr<LumaEvent<const TEvent&>> weakEvent = eventPtr;
+    m_unsubscribers[globalId] = [weakEvent, localHandle]
     {
-        getEvent<TEvent>().RemoveListener(localHandle);
+        if (auto strongEvent = weakEvent.lock())
+        {
+            strongEvent->RemoveListener(localHandle);
+        }
     };
-
 
     return ListenerHandle{globalId};
 }
@@ -116,29 +127,42 @@ inline void EventBus::Unsubscribe(ListenerHandle handle)
         return;
     }
 
-
-    auto it = m_unsubscribers.find(handle.id);
-    if (it != m_unsubscribers.end())
+    std::function<void()> unsubscriber;
     {
-        it->second();
-
-
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_unsubscribers.find(handle.id);
+        if (it == m_unsubscribers.end())
+        {
+            return;
+        }
+        unsubscriber = std::move(it->second);
         m_unsubscribers.erase(it);
     }
+    // 在锁外执行，避免与订阅/分发路径互锁
+    unsubscriber();
 }
 
 template <typename TEvent>
 void EventBus::Publish(const TEvent& event)
 {
-    auto typeId = std::type_index(typeid(TEvent));
-    if (m_events.contains(typeId))
+    std::shared_ptr<LumaEvent<const TEvent&>> eventPtr;
     {
-        getEvent<TEvent>().Invoke(event);
+        const auto typeId = std::type_index(typeid(TEvent));
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_events.find(typeId);
+        if (it == m_events.end())
+        {
+            return;
+        }
+        eventPtr = std::static_pointer_cast<LumaEvent<const TEvent&>>(it->second);
     }
+    // 锁外分发；shared_ptr 保证 Clear() 并发时事件对象仍然存活
+    eventPtr->Invoke(event);
 }
 
 inline void EventBus::Clear()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_events.clear();
     m_unsubscribers.clear();
     m_nextHandleId = 1;

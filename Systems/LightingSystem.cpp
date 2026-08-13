@@ -58,6 +58,17 @@ namespace Systems
 
     void LightingSystem::OnUpdate(RuntimeScene* scene, float deltaTime, EngineContext& engineCtx)
     {
+        // 幂等重挂：PIE 场景销毁时其 LightingSystem::OnDestroy 会把 LightingRenderer 的
+        // 引用置空，编辑场景的实例恢复更新后需要重新接管，否则光照数据无人供给
+        {
+            auto& lightingRenderer = LightingRenderer::GetInstance();
+            if (lightingRenderer.IsInitialized())
+            {
+                lightingRenderer.SetLightingSystem(this);
+            }
+            QualityManager::GetInstance().SetLightingSystem(this);
+        }
+
         // 1. 从场景更新光照设置
         UpdateSettingsFromScene(scene);
 
@@ -72,6 +83,16 @@ namespace Systems
         float viewWidth = props.viewport.width() / props.GetEffectiveZoom().x();
         float viewHeight = props.viewport.height() / props.GetEffectiveZoom().y();
         glm::vec2 cameraPos(props.position.x(), props.position.y());
+
+        // 编辑模式下场景视图使用编辑器相机而非激活相机，按激活相机视锥剔除会把
+        // 编辑器视野内的光源错误剔掉（表现为编辑预览里光照消失），因此不做视锥剔除
+        // （光源仍按优先级排序并受 MAX_LIGHTS_PER_FRAME 限制）
+        if (*engineCtx.appMode == ApplicationMode::Editor)
+        {
+            constexpr float kUnbounded = 1.0e9f;
+            viewWidth = kUnbounded;
+            viewHeight = kUnbounded;
+        }
 
         // 4. 执行视锥剔除
         CullLights(cameraPos, viewWidth, viewHeight);

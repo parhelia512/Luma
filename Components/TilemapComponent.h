@@ -72,6 +72,7 @@ namespace ECS
 
         std::unordered_map<Vector2i, ResolvedTile, Vector2iHash> runtimeTileCache; ///< 运行时瓦片缓存，键为瓦片位置，值为已解析的瓦片信息。
         std::unordered_map<Vector2i, Guid, Vector2iHash> instantiatedPrefabs; ///< 已实例化的预制体映射，键为瓦片位置，值为预制体的全局唯一标识符。
+        uint32_t runtimeCacheVersion = 0; ///< 运行时缓存版本号（不序列化）：每次瓦片水合重建时递增，供渲染提取端做增量缓存失效。
     };
 
     /**

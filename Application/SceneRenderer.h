@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <cstring>
 #include "RenderComponent.h"
+#include "Renderable.h"
 #include "include/core/SkImage.h"
 enum class TextAlignment;
 struct RenderPacket;
@@ -100,7 +101,7 @@ struct FastTextBatchKey
     FastTextBatchKey(SkTypeface* typeface, float fontSize,
                      TextAlignment alignment, const ECS::Color& color, int z)
         : typefacePtr(reinterpret_cast<uintptr_t>(typeface))
-          , fontSizeInt(*reinterpret_cast<const uint32_t*>(&fontSize))
+          , fontSizeInt(floatBits(fontSize))
           , colorValue(packColor(color))
           , alignment(static_cast<uint8_t>(alignment))
           , zIndex(static_cast<int32_t>(z))
@@ -122,6 +123,13 @@ private:
             (static_cast<uint32_t>(color.g * 255) << 16) |
             (static_cast<uint32_t>(color.b * 255) << 8) |
             static_cast<uint32_t>(color.a * 255);
+    }
+    static uint32_t floatBits(float v)
+    {
+        uint32_t bits;
+        static_assert(sizeof(float) == sizeof(uint32_t));
+        std::memcpy(&bits, &v, sizeof(uint32_t));
+        return bits;
     }
     size_t computeHash() const
     {
@@ -185,7 +193,10 @@ public:
             m_data.reserve(total);
         }
     }
-    void Reverse()
+    /**
+     * @brief 重置竞技场（清空本帧分配，保留容量）。
+     */
+    void Reset()
     {
         m_data.clear();
         m_currentIndex = 0;
@@ -196,7 +207,7 @@ class SceneRenderer
 public:
     SceneRenderer() = default;
     void Extract(entt::registry& registry, std::vector<RenderPacket>& outQueue);
-    static void ExtractToRenderableManager(entt::registry& registry);
+    void ExtractToRenderableManager(entt::registry& registry);
     struct BatchGroup
     {
         std::vector<RenderableTransform> transforms; 
@@ -215,6 +226,27 @@ public:
         TextAlignment alignment; 
     };
 private:
+    /**
+     * @brief 单个 Tilemap 的提取缓存。
+     *
+     * 静态瓦片不再每帧重建：缓存里存相对 tilemap 原点的局部 Renderable，
+     * 每帧只需平移到世界位置并做视口剔除。瓦片水合重建（runtimeCacheVersion 递增）
+     * 或影响布局的参数变化时整体重建。
+     */
+    struct TilemapExtractCache
+    {
+        uint32_t version = 0; ///< 对应 TilemapComponent::runtimeCacheVersion。
+        size_t hydratedCount = 0; ///< 已水合精灵瓦片数量（水合进度变化时重建）。
+        const void* material = nullptr; ///< 渲染器材质指针（变更时重建）。
+        int zIndex = 0;
+        ECS::Vector2f cellSize{0.0f, 0.0f};
+        ECS::Vector2f mapScale{1.0f, 1.0f};
+        float mapRotation = 0.0f;
+        ECS::Vector2f mapAnchor{0.5f, 0.5f};
+        std::vector<Renderable> localTiles; ///< transform.position 为相对 tilemap 原点的偏移。
+    };
+    std::unordered_map<entt::entity, TilemapExtractCache> m_tilemapCaches;
+
     std::unique_ptr<FrameArena<RenderableTransform>> m_transformArena = std::make_unique<FrameArena<
         RenderableTransform>>(100000); 
     std::unique_ptr<FrameArena<std::string>> m_textArena = std::make_unique<FrameArena<std::string>>(4096);

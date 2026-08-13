@@ -12,6 +12,8 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <SDL3/SDL_dialog.h>
+#include <SDL3/SDL_messagebox.h>
+#include <sstream>
 #include "Resources/AssetManager.h"
 #include "SceneManager.h"
 #include "Utils/PopupManager.h"
@@ -158,9 +160,45 @@ Editor::Editor(ApplicationConfig config) : ApplicationBase(config)
     });
     m_uiCallbacks->onValueChanged.AddListener([this]()
     {
-        if (m_editorContext.activeScene)
+        if (!m_editorContext.activeScene) return;
+        // 连续编辑（DragFloat 拖拽、文本输入）期间每帧都会触发本回调；
+        // 旧实现每次都做全场景快照：拖一秒 ≈ 60 次序列化并冲光整个撤销历史。
+        // 现在推迟到控件释放（编辑结束）时一次性入栈，见 Render() 末尾的提交逻辑。
+        SceneManager::GetInstance().MarkCurrentSceneDirty();
+        if (ImGui::IsAnyItemActive())
+        {
+            m_undoEditActive = true;
+        }
+        else
+        {
             SceneManager::GetInstance().PushUndoState(m_editorContext.activeScene);
+        }
     });
+}
+
+namespace
+{
+    /// 解析 `dotnet --list-sdks` 输出，检查是否存在主版本号 >= minMajor 的 SDK。
+    /// 旧实现用 find("9.") 匹配子串：.NET 10+ 会被误判为未安装，"19.x" 之类也会误命中。
+    bool HasDotNetSdkAtLeast(const std::string& sdkListOutput, int minMajor)
+    {
+        std::istringstream stream(sdkListOutput);
+        std::string line;
+        while (std::getline(stream, line))
+        {
+            // SDK 列表行以版本号开头（如 "9.0.203 [C:\Program Files\dotnet\sdk]"），其他行跳过
+            if (line.find_first_of("0123456789") != 0) continue;
+            const int major = std::atoi(line.c_str());
+            if (major >= minMajor) return true;
+        }
+        return false;
+    }
+
+    /// 构造期 m_window 尚未创建，直接用 SDL 原生消息框（旧实现调用空指针成员会崩溃）。
+    void ShowStartupErrorBox(const char* title, const char* message)
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, nullptr);
+    }
 }
 
 bool Editor::checkDotNetEnvironment()
@@ -171,24 +209,25 @@ bool Editor::checkDotNetEnvironment()
         versionResult.find("不是内部或外部命令") != std::string::npos ||
         versionResult.find("错误：") != std::string::npos)
     {
-        m_window->ShowMessageBox(PlatformWindow::NoticeLevel::Error, "环境错误",
-                                 "在系统PATH中未找到.NET SDK。\n"
-                                 "脚本功能和构建功能将不可用。\n\n"
-                                 "请从microsoft.com/net下载安装.NET SDK。");
+        ShowStartupErrorBox("环境错误",
+                            "在系统PATH中未找到.NET SDK。\n"
+                            "脚本功能和构建功能将不可用。\n\n"
+                            "请从microsoft.com/net下载安装.NET SDK。");
         LogError("在PATH中未找到.NET SDK。");
         return false;
     }
     std::string sdkListResult = ExecuteAndCapture("dotnet --list-sdks");
-    if (sdkListResult.find("9.") == std::string::npos)
+    constexpr int kMinDotNetMajor = 9;
+    if (!HasDotNetSdkAtLeast(sdkListResult, kMinDotNetMajor))
     {
-        m_window->ShowMessageBox(PlatformWindow::NoticeLevel::Error, "环境错误",
-                                 "未找到所需的.NET 9 SDK。\n"
-                                 "脚本系统和资源打包功能需要.NET 9支持。\n\n"
-                                 "请安装.NET 9 SDK以启用这些功能。");
-        LogError("未找到所需的.NET 9 SDK。已安装的SDK版本：\n{}", sdkListResult);
+        ShowStartupErrorBox("环境错误",
+                            "未找到所需的.NET 9（或更高版本）SDK。\n"
+                            "脚本系统和资源打包功能需要.NET 9+支持。\n\n"
+                            "请安装.NET 9 SDK以启用这些功能。");
+        LogError("未找到 .NET {}+ SDK。已安装的SDK版本：\n{}", kMinDotNetMajor, sdkListResult);
         return false;
     }
-    LogInfo("已检测到.NET 9 SDK。环境检查通过。");
+    LogInfo("已检测到 .NET {}+ SDK。环境检查通过。", kMinDotNetMajor);
     return true;
 }
 
@@ -215,6 +254,19 @@ void Editor::InitializeDerived()
     m_window->OnAnyEvent.AddListener([&](const SDL_Event& e)
     {
         ImGuiRenderer::ProcessEvent(e);
+    });
+    // 拦截窗口关闭：场景有未保存修改时先弹确认，避免直接丢弃修改
+    m_closeRequestListener = m_window->OnCloseRequest.AddListener([this]()
+    {
+        if (m_editorContext.editorState == EditorState::Editing &&
+            SceneManager::GetInstance().IsCurrentSceneDirty())
+        {
+            PopupManager::GetInstance().Open("ExitConfirm");
+        }
+        else
+        {
+            m_window->ForceClose();
+        }
     });
     initializePanels();
     registerPopups();
@@ -284,6 +336,34 @@ void Editor::registerPopups()
     {
         this->drawFileConflictPopupContent();
     }, true, ImGuiWindowFlags_AlwaysAutoResize);
+    popupManager.Register("ExitConfirm", [this]()
+    {
+        this->drawExitConfirmPopupContent();
+    }, true, ImGuiWindowFlags_AlwaysAutoResize);
+}
+
+void Editor::drawExitConfirmPopupContent()
+{
+    ImGui::Text("当前场景有未保存的修改。\n退出前要保存吗？");
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    if (ImGui::Button("保存并退出", ImVec2(110, 0)))
+    {
+        SceneManager::GetInstance().SaveCurrentScene();
+        PopupManager::GetInstance().Close("ExitConfirm");
+        m_window->ForceClose();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("不保存退出", ImVec2(110, 0)))
+    {
+        PopupManager::GetInstance().Close("ExitConfirm");
+        m_window->ForceClose();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消", ImVec2(90, 0)))
+    {
+        PopupManager::GetInstance().Close("ExitConfirm");
+    }
 }
 
 void Editor::loadStartupScene()
@@ -305,8 +385,7 @@ void Editor::loadStartupScene()
     if (m_editorContext.activeScene)
     {
         LogInfo("成功加载场景，GUID: {}", startupSceneGuid.ToString());
-        m_editorContext.activeScene->AddSystem<Systems::HydrateResources>();
-        m_editorContext.activeScene->AddSystem<Systems::TransformSystem>();
+        SceneManager::ConfigureEditorPreviewSystems(m_editorContext.activeScene);
         m_editorContext.activeScene->Activate(*m_editorContext.engineContext);
     }
     else
@@ -317,8 +396,7 @@ void Editor::loadStartupScene()
         }
         m_editorContext.activeScene = sk_make_sp<RuntimeScene>();
         m_editorContext.activeScene->SetName("NewScene");
-        m_editorContext.activeScene->AddSystem<Systems::HydrateResources>();
-        m_editorContext.activeScene->AddSystem<Systems::TransformSystem>();
+        SceneManager::ConfigureEditorPreviewSystems(m_editorContext.activeScene);
         m_editorContext.activeScene->Activate(*m_editorContext.engineContext);
         SceneManager::GetInstance().SetCurrentScene(m_editorContext.activeScene);
         m_editorContext.selectionType = SelectionType::NA;
@@ -330,6 +408,19 @@ void Editor::Update(float fixedDeltaTime)
 {
     PROFILE_FUNCTION();
     updateUps();
+    // 定时自动保存：编辑模式下场景有未保存修改时，周期性写入 Library/Autosave
+    m_autosaveTimer += fixedDeltaTime;
+    constexpr float kAutosaveIntervalSeconds = 180.0f;
+    if (m_autosaveTimer >= kAutosaveIntervalSeconds)
+    {
+        m_autosaveTimer = 0.0f;
+        if (m_editorContext.editorState == EditorState::Editing &&
+            SceneManager::GetInstance().IsCurrentSceneDirty() &&
+            ProjectSettings::GetInstance().IsProjectLoaded())
+        {
+            SceneManager::GetInstance().AutoSaveCurrentScene();
+        }
+    }
     {
         PROFILE_SCOPE("SceneManager::Update");
         SceneManager::GetInstance().Update(*m_editorContext.engineContext);
@@ -359,6 +450,13 @@ void Editor::Update(float fixedDeltaTime)
         }
         m_editorContext.activeScene->UpdateSimulation(fixedDeltaTime, *m_editorContext.engineContext,
                                                       m_editorContext.editorState == EditorState::Paused);
+        if (m_editorContext.editorState == EditorState::Editing)
+        {
+            // 编辑状态：场景视图用的是编辑器相机，而激活相机（场景相机）可能在别处；
+            // 用激活相机视口做剔除会把编辑器视野内的对象错误剔掉，这里清除视口做全量渲染
+            RenderableManager::GetInstance().ClearViewport();
+        }
+        else
         {
             auto& activeCamera = CameraManager::GetInstance().GetActiveCamera();
             auto cp = activeCamera.GetProperties();
@@ -369,7 +467,7 @@ void Editor::Update(float fixedDeltaTime)
                 cp.position.fX, cp.position.fY,
                 cp.viewport.width(), cp.viewport.height(), avgZoom);
         }
-        SceneRenderer::ExtractToRenderableManager(m_editorContext.activeScene->GetRegistry());
+        m_sceneRenderer->ExtractToRenderableManager(m_editorContext.activeScene->GetRegistry());
     }
 }
 
@@ -404,7 +502,8 @@ void Editor::Render()
         PluginManager::GetInstance().UpdateEditorPlugins(1.f / m_context.currentFps);
     }
     RenderableManager::GetInstance().SetExternalAlpha(m_context.interpolationAlpha.load(std::memory_order_relaxed));
-    m_editorContext.renderQueue = RenderableManager::GetInstance().GetInterpolationData();
+    // 直接引用 RenderableManager 的双缓冲结果，同帧内由各面板只读消费，不再整帧深拷贝
+    m_editorContext.renderQueue = &RenderableManager::GetInstance().GetInterpolationData();
     auto currentTime = std::chrono::steady_clock::now();
     float deltaTime = std::chrono::duration<float>(currentTime - m_editorContext.lastFrameTime).count();
     m_editorContext.lastFrameTime = currentTime;
@@ -428,6 +527,15 @@ void Editor::Render()
             }
         }
         PluginManager::GetInstance().DrawEditorPluginPanels();
+    }
+    // 连续编辑结束（控件释放）时提交一次撤销快照，配合 onValueChanged 的合并逻辑
+    if (m_undoEditActive && !ImGui::IsAnyItemActive())
+    {
+        m_undoEditActive = false;
+        if (m_editorContext.activeScene)
+        {
+            SceneManager::GetInstance().PushUndoState(m_editorContext.activeScene);
+        }
     }
     PopupManager::GetInstance().Render();
     m_imguiRenderer->EndFrame(*m_graphicsBackend);
